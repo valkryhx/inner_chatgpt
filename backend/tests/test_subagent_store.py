@@ -47,7 +47,7 @@ def test_run_lifecycle_and_ownership(isolated_db):
     async def flow():
         row = await sub_store.create_run(
             run_id="run_1", ctx_user_id="u1", session_id="s1", message_id="m1",
-            parent_agent_id="root", agent_id="sub:scan", name="scan", role="explore",
+            parent_agent_id="root", agent_id="sub:scan", name="scan", role="general",
             task_message="看看代码",
         )
         assert row["status"] == "running"

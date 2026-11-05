@@ -113,7 +113,7 @@ def test_event_stream_builds_subagent_block(monkeypatch):
         def __init__(self):
             self.buffer = EventBuffer()
             self.buffer.put({"type": "subagent_start", "agent_id": "sub:scan", "name": "scan",
-                             "role": "explore", "task": "看看代码"})
+                             "role": "general", "task": "看看代码"})
             self.buffer.put({"type": "subagent_event", "agent_id": "sub:scan",
                              "event": {"type": "tool_start", "id": "t1", "name": "file_read",
                                        "input": {"path": "a.py"}}})

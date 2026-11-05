@@ -22,7 +22,6 @@ def build_subagent_tools(host: SubagentHost) -> list[Tool]:
             out = await host.spawn(
                 task_name=str(args.get("task_name", "")),
                 message=str(args.get("message", "")),
-                role=str(args.get("role", "general") or "general"),
                 fork_turns=str(args.get("fork_turns", "none") or "none"),
                 background=bool(args.get("background", True)),
                 max_turns=int(args.get("max_turns", 0) or 0),
@@ -54,7 +53,7 @@ def build_subagent_tools(host: SubagentHost) -> list[Tool]:
         out = await host.read_result(target, max_chars=int(args.get("max_output_chars", 20000) or 20000))
         if not out.get("ok"):
             return _err(str(out.get("error") or "读取失败"))
-        header = (f"[子代理结果] {out['name']} role={out['role']} status={out['status']} "
+        header = (f"[子代理结果] {out['name']} status={out['status']} "
                   f"turns={out['turns']}" + (f" error={out['error']}" if out.get("error") else ""))
         if out.get("truncated"):
             header += f"（已截断，共 {out['chars']} 字符）"
@@ -80,14 +79,14 @@ def build_subagent_tools(host: SubagentHost) -> list[Tool]:
         Tool(
             "spawn_agent",
             "派生一个子代理执行自包含的旁路任务。子代理看不到本对话：必须把背景、路径、约束、"
-            "期望输出和「什么算完成」写进 message。派活后需 wait_agent 等待，再 read_agent_result 取结果。",
+            "期望输出和「什么算完成」写进 message。子代理拥有与父代理相同的业务工具（文件读写、"
+            "code_run、Skill、MCP），但不能调用编排工具或再派生子代理。"
+            "派活后需 wait_agent 等待，再 read_agent_result 取结果。",
             {
                 "type": "object",
                 "properties": {
                     "task_name": {"type": "string", "description": "小写字母/数字/下划线，1-32 字符，本会话唯一"},
                     "message": {"type": "string", "description": "自包含任务说明（背景/路径/约束/期望输出/完成标准）"},
-                    "role": {"type": "string", "enum": ["general", "explore", "plan", "review"],
-                             "description": "explore/plan/review 为只读角色，不能写文件"},
                     "fork_turns": {"type": "string", "description": "none(默认,不继承对话) | all | recent:N"},
                     "background": {"type": "boolean", "description": "默认 true"},
                     "max_turns": {"type": "integer", "description": "可选，覆盖默认轮数上限"},

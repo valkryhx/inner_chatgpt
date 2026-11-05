@@ -63,12 +63,13 @@
   `runtime`（子代理 Runtime + 写根隔离）/`host`（spawn/wait/read/list/close 生命周期）/
   `tools`（5 个编排工具）/`prompts`（root + child 提示词）/`session`（每轮派生 TurnRuntime）。
 - 5 个编排工具只注入 root agent；子代理 registry 里**根本不存在它们**（prompt 不是安全边界）。
+  子代理统一继承父代理全部业务工具（file/code_run/Skill/MCP），不再设 explore/plan/review 只读角色。
 - 子代理用**独立侧链 history**，不写 `session_history`，避免主对话被中间产物污染。
 - 子代理事件并入主对话同一条 SSE（`subagent_start` / `subagent_event` / `subagent_end`），
   前端新增可折叠 `SubagentCard`。
 - 停止级联（主 stop → 所有子代理 stop + cancel）、`wait` 超时不杀子、墙钟 `SUBAGENT_TIMEOUT_S`、
   `wait_agent.since_event_seq` 增量事件。
-- 单测 64 项通过（原 42 + 新增 22），前端 `npm run build` 通过，3 次真实 LLM E2E + Playwright UI 验证。
+- 单测 62 项通过（原 42 + 新增 20），前端 `npm run build` 通过，3 次真实 LLM E2E + Playwright UI 验证。
 
 **P3（下一步）：** team / task 工具 → 计划模式 → goal → hooks。浏览器控制暂不做。
 长出来的位置见 `docs/20261105-Subagent调研与设计方案.md` §14。

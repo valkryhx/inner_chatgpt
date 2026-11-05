@@ -84,7 +84,7 @@ def test_spawn_wait_read_close(isolated):
         buf = EventBuffer()
         host = SubagentHost(_ctx(), parent_runtime=FakeParentRuntime(client), buffer=buf)
 
-        out = await host.spawn(task_name="scan", message="看看 x.txt", role="explore")
+        out = await host.spawn(task_name="scan", message="看看 x.txt")
         assert out["status"] == "running"
         assert out["agent_id"] == "sub:scan"
 
@@ -129,7 +129,7 @@ def test_child_registry_has_no_orchestration_tools(isolated):
         # 直接构造 runtime 检查 registry
         from app.subagent.runtime import SubagentRuntime, SubagentSpec
         node_ctx = _ctx().child("probe")
-        spec = SubagentSpec(name="probe", role="general", message="x")
+        spec = SubagentSpec(name="probe", message="x")
         rt = SubagentRuntime(node_ctx, parent_runtime=FakeParentRuntime(client), spec=spec)
         await rt.build()
         captured["names"] = rt.registry.names()
@@ -238,7 +238,7 @@ def test_wait_since_event_seq_incremental(isolated):
         ])
         buf = EventBuffer()
         host = SubagentHost(_ctx(), parent_runtime=FakeParentRuntime(client), buffer=buf)
-        await host.spawn(task_name="seq", message="看 x.txt", role="explore")
+        await host.spawn(task_name="seq", message="看 x.txt")
         first = await host.wait(targets=["seq"], condition="all_terminal", timeout_s=10)
         assert first["timed_out"] is False
         assert first["event_seq"] > 0

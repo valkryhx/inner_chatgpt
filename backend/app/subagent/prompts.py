@@ -1,4 +1,9 @@
-"""子代理提示词（参考 GenericAgent prompts.py，中文化并按 Web 场景收敛）。"""
+"""子代理提示词（参考 GenericAgent prompts.py，中文化并按 Web 场景收敛）。
+
+2026-11-05 简化：不再区分 explore/plan/review 只读角色。
+子代理是「同一用户信任域内的完整工作代理」，可读写、可执行、可用 Skill/MCP；
+唯一的硬边界是不能调用编排工具（不能递归派生）。
+"""
 from __future__ import annotations
 
 ROOT_AGENT_HINT = """
@@ -12,7 +17,8 @@ ROOT_AGENT_HINT = """
 - `wait_agent` 超时**不是失败**：子代理还在跑，先看 remaining_targets 继续等，
   不要因为 timeout 重复 spawn。
 - 结论用完后用 `close_agent` 释放槽位。
-- 只读的侦察/审查类工作，用 role=explore / review（它们不能写文件）。
+- 给子代理的 message 要明确写出「只读侦察」还是「允许修改」；子代理拥有完整工具能力，
+  权限约束必须由任务说明明确，而不是靠角色自动限制。
 """.strip()
 
 SUBAGENT_HINT = """
@@ -25,34 +31,13 @@ SUBAGENT_HINT = """
 - 无法完成时，明确写出 blocker、已验证事实和下一步需要的最小信息，不要空着说"完成"。
 - 你和其他子代理、以及父代理**共享同一个文件系统**：只改分配给你的路径，
   绝不回滚、重写或"顺手修"别人的改动。
+- 你拥有父代理的全部业务工具（文件读写、代码执行、Skill、MCP），但没有编排工具，
+  不能派生新的子代理。任务要求只读时，用工具读完即止，不要写文件或改数据。
 """.strip()
 
-ROLE_SYSTEM_PROMPTS = {
-    "general": (
-        "你是一个能力完整的子代理，可以使用读/写/执行工具完成被委派的任务。"
-        "严格按任务契约交付，最后给出结构化结论。"
-    ),
-    "explore": (
-        "你是侦察型子代理（只读）。任务是摸清一个陌生区域并报告精确发现："
-        "确切的文件路径与行号、关键接口、后续修改必须遵守的约束。"
-        "不要修改任何文件，也不要提出重构方案。"
-    ),
-    "plan": (
-        "你是规划型子代理（只读）。任务是把已收集的上下文转成可执行的实施计划："
-        "有序步骤，每步写明「改哪个文件、改什么、怎么验证」，并列出风险与未决问题。"
-        "不要修改文件。"
-    ),
-    "review": (
-        "你是审查型子代理（只读）。独立复核别人的产出，先给结论（按严重度排序），"
-        "每条带 文件:行号 引用，再给未决问题与残余风险。只报可执行的问题，不要修改文件。"
-    ),
-}
 
-
-def build_child_system_prompt(*, role: str, skill_block: str = "") -> str:
-    role = (role or "general").strip().lower()
-    base = ROLE_SYSTEM_PROMPTS.get(role, ROLE_SYSTEM_PROMPTS["general"])
-    body = base + "\n\n" + SUBAGENT_HINT
+def build_child_system_prompt(*, skill_block: str = "") -> str:
+    body = SUBAGENT_HINT
     if skill_block:
         body += skill_block
     return body

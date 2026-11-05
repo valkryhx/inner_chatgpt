@@ -31,11 +31,9 @@ def _env_int(name: str, default: int) -> int:
 @dataclass
 class SubagentSpec:
     name: str
-    role: str = "general"
     message: str = ""
     fork_turns: str = "none"          # none | all | recent:N（v1 只实现 none/all/recent）
     max_turns: int = 0                # 0 -> 用环境默认
-    allow_delegation: bool = False
 
 
 class SubagentRuntime:
@@ -61,16 +59,12 @@ class SubagentRuntime:
             skill_block = build_skill_prompt(self.ctx.user_id)
         except Exception:
             skill_block = ""
-        self.system_prompt = build_child_system_prompt(role=self.spec.role, skill_block=skill_block)
+        self.system_prompt = build_child_system_prompt(skill_block=skill_block)
 
         # 3) 闭世界工具集：父 registry 按能力裁剪（编排工具在子代理里根本不存在）
         parent_registry = self.parent.registry
         available = parent_registry.names() if parent_registry else []
-        self.profile = build_capability_profile(
-            role=self.spec.role,
-            available_tools=available,
-            allow_delegation=self.spec.allow_delegation,
-        )
+        self.profile = build_capability_profile(available_tools=available)
         child_tools_registry = build_child_registry(parent_registry, self.profile)
 
         # 4) 写类工具隔离到该 run 的产出目录，避免并发互相覆盖（设计文档 §7.2）

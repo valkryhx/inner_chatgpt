@@ -61,7 +61,7 @@ class SubagentHost:
         self._closed = False
 
     # ---------------- spawn ----------------
-    async def spawn(self, *, task_name: str, message: str, role: str = "general",
+    async def spawn(self, *, task_name: str, message: str,
                     fork_turns: str = "none", background: bool = True,
                     max_turns: int = 0) -> dict:
         if self._closed:
@@ -69,7 +69,7 @@ class SubagentHost:
         if not (message or "").strip():
             raise SubagentError("message 不能为空")
 
-        node = self.registry.create_child(self.ctx, task_name, role=(role or "general"))
+        node = self.registry.create_child(self.ctx, task_name)
         node.status = "starting"
         node.run_id = "run_" + uuid.uuid4().hex[:12]
 
@@ -87,7 +87,7 @@ class SubagentHost:
         )
 
         spec = SubagentSpec(
-            name=node.name, role=node.role, message=message,
+            name=node.name, message=message,
             fork_turns=fork_turns or "none", max_turns=max_turns,
         )
         node.task = asyncio.create_task(self._run_child(node, spec))

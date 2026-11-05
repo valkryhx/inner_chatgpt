@@ -104,7 +104,7 @@ class SubagentRegistry:
         return None
 
     # ---------- mutation ----------
-    def create_child(self, parent_ctx: AgentContext, name: str, *, role: str) -> AgentNode:
+    def create_child(self, parent_ctx: AgentContext, name: str) -> AgentNode:
         """校验并注册一个子节点。冲突/越界时抛 SubagentError（不静默改名）。"""
         name = validate_task_name(name)
 
@@ -128,7 +128,7 @@ class SubagentRegistry:
                 )
 
         ctx = parent_ctx.child(name)
-        node = AgentNode(agent_id=ctx.agent_id, name=name, ctx=ctx, role=role)
+        node = AgentNode(agent_id=ctx.agent_id, name=name, ctx=ctx, role="general")
         self._nodes[name] = node
         return node
 

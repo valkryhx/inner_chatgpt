@@ -8,7 +8,6 @@ import pytest
 from app.tools import Tool, ToolRegistry
 from app.subagent.capabilities import (
     ORCHESTRATION_TOOLS,
-    READ_ONLY_TOOLS,
     build_capability_profile,
     build_child_registry,
 )
@@ -29,44 +28,37 @@ def _dummy_registry(names):
 
 
 # ---------------- capabilities ----------------
-def test_general_role_has_no_orchestration_tools():
-    available = ["file_read", "file_write", "code_run", "load_skill",
-                 "spawn_agent", "wait_agent", "list_agents", "close_agent"]
-    p = build_capability_profile(role="general", available_tools=available)
-    assert "spawn_agent" not in p.allowed
-    assert "wait_agent" not in p.allowed
-    assert {"file_read", "file_write", "code_run", "load_skill"} <= set(p.allowed)
+def test_child_keeps_all_business_tools():
+    available = [
+        "file_read", "file_write", "file_patch", "list_files", "code_run", "load_skill",
+        "mcp_sqlbot_query", "mcp_web_search",
+        "spawn_agent", "wait_agent", "read_agent_result", "list_agents", "close_agent",
+    ]
+    p = build_capability_profile(available_tools=available)
+    assert p.allowed == frozenset(available) - ORCHESTRATION_TOOLS
+    # 子代理是完整工作代理：代码执行 / 写文件 / Skill / MCP 都保留
+    assert {"file_write", "code_run", "load_skill", "mcp_sqlbot_query", "mcp_web_search"} <= p.allowed
+    # 唯一硬边界：编排工具不可见
+    assert not (p.allowed & ORCHESTRATION_TOOLS)
 
 
-def test_readonly_roles_only_get_read_tools():
-    available = ["file_read", "file_write", "file_patch", "code_run", "list_files", "load_skill", "spawn_agent"]
-    for role in ("explore", "plan", "review"):
-        p = build_capability_profile(role=role, available_tools=available)
-        assert p.allowed == frozenset(available) & READ_ONLY_TOOLS, role
-        assert "file_write" not in p.allowed
-        assert "code_run" not in p.allowed
-
-
-def test_allow_delegation_only_when_explicit():
-    available = ["file_read", "spawn_agent", "wait_agent"]
-    p = build_capability_profile(role="general", available_tools=available, allow_delegation=True)
-    assert "spawn_agent" in p.allowed
-    p2 = build_capability_profile(role="general", available_tools=available)
-    assert "spawn_agent" not in p2.allowed
-
-
-def test_unknown_role_falls_back_to_general():
-    p = build_capability_profile(role="hacker", available_tools=["file_read"])
-    assert p.role == "general"
-
-
-def test_build_child_registry_filters():
-    parent = _dummy_registry(["file_read", "file_write", "spawn_agent", "code_run"])
-    p = build_capability_profile(role="explore", available_tools=parent.names())
+def test_child_registry_filters_only_orchestration():
+    parent = _dummy_registry([
+        "file_read", "file_write", "code_run", "load_skill", "mcp_demo",
+        "spawn_agent", "wait_agent", "task_create", "team_status",
+    ])
+    p = build_capability_profile(available_tools=parent.names())
     child = build_child_registry(parent, p)
-    assert "file_read" in child.names()
-    assert "file_write" not in child.names()
-    assert "spawn_agent" not in child.names()
+    names = set(child.names())
+    assert {"file_read", "file_write", "code_run", "load_skill", "mcp_demo"} <= names
+    assert not (names & ORCHESTRATION_TOOLS)
+
+
+def test_empty_parent_registry_is_safe():
+    p = build_capability_profile(available_tools=[])
+    assert p.allowed == frozenset()
+    child = build_child_registry(ToolRegistry(), p)
+    assert child.names() == []
 
 
 # ---------------- registry ----------------
@@ -83,44 +75,42 @@ def test_task_name_validation():
 
 def test_depth_limit():
     reg = SubagentRegistry(max_depth=1, max_active=4)
-    c = reg.create_child(_ctx(0), "a", role="general")
+    c = reg.create_child(_ctx(0), "a")
     with pytest.raises(SubagentError, match="最大深度"):
-        reg.create_child(c.ctx, "b", role="general")
+        reg.create_child(c.ctx, "b")
 
 
 def test_name_conflict_while_alive():
     reg = SubagentRegistry(max_depth=2, max_active=4)
-    reg.create_child(_ctx(), "a", role="general")
+    reg.create_child(_ctx(), "a")
     with pytest.raises(SubagentError, match="仍在运行"):
-        reg.create_child(_ctx(), "a", role="general")
+        reg.create_child(_ctx(), "a")
 
 
 def test_same_name_reusable_after_terminal():
     reg = SubagentRegistry(max_depth=2, max_active=4)
-    node = reg.create_child(_ctx(), "a", role="general")
+    node = reg.create_child(_ctx(), "a")
     reg.mark_terminal(node, "completed", result="done")
-    again = reg.create_child(_ctx(), "a", role="general")
+    again = reg.create_child(_ctx(), "a")
     assert again is not node
     assert again.status == "starting"
 
 
 def test_active_slot_limit_and_eviction():
     reg = SubagentRegistry(max_depth=2, max_active=2)
-    a = reg.create_child(_ctx(), "a", role="general")
-    reg.create_child(_ctx(), "b", role="general")
-    # both alive -> third is rejected
+    a = reg.create_child(_ctx(), "a")
+    reg.create_child(_ctx(), "b")
     with pytest.raises(SubagentError, match="上限"):
-        reg.create_child(_ctx(), "c", role="general")
-    # finishing one frees a slot (terminal nodes get evicted when needed)
+        reg.create_child(_ctx(), "c")
     reg.mark_terminal(a, "completed", result="x")
-    c = reg.create_child(_ctx(), "c", role="general")
+    c = reg.create_child(_ctx(), "c")
     assert c.name == "c"
 
 
 def test_notify_waiters():
     async def flow():
         reg = SubagentRegistry()
-        node = reg.create_child(_ctx(), "a", role="general")
+        node = reg.create_child(_ctx(), "a")
         ev = asyncio.Event()
         node.waiters.append(ev)
         reg.mark_terminal(node, "completed", result="ok")
