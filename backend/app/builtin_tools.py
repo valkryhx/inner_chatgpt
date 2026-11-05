@@ -4,7 +4,7 @@ Every tool is a plain ``Tool`` (name + JSON schema + async callable) so it regis
 into the same ``ToolRegistry`` as MCP tools. File access is confined by ``workspace``:
   - read:  workspace + visible skill dirs
   - write: workspace only
-  - run:   cwd fixed to workspace, timeout, output truncation, stdin closed
+  - run:   cwd + Python write audit confined to workspace, timeout, output truncation
 
 Design reference: GenericAgent genericagent/core/handler.py
 (file_read / file_patch / code_run / do_load_skill). Individually reimplemented.
@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .run_guard import WORKSPACE_PYTHON_GUARD, protected_code_reason, workspace_env
 from .skill_store import load_skill_content
 from .tools import Tool
 from .workspace import (
@@ -165,6 +166,9 @@ def _list_impl(user_id: str, path: str = "", max_entries: int = 200, depth: int 
 
 # ---------------- code_run ----------------
 def _run_code_sync(code: str, code_type: str, cwd: Path, timeout: int) -> dict:
+    blocked = protected_code_reason(code)
+    if blocked:
+        return {"status": "error", "msg": blocked}
     tmp_path = None
     try:
         if code_type in ("python", "py"):
@@ -172,7 +176,10 @@ def _run_code_sync(code: str, code_type: str, cwd: Path, timeout: int) -> dict:
             os.close(fd)
             with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(code)
-            cmd = [sys.executable, "-X", "utf8", "-u", tmp_path]
+            cmd = [
+                sys.executable, "-X", "utf8", "-u", "-c",
+                WORKSPACE_PYTHON_GUARD, tmp_path, str(cwd),
+            ]
         elif code_type in ("powershell", "ps1", "pwsh", "bash", "sh", "shell"):
             if os.name == "nt":
                 cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", code]
@@ -186,6 +193,7 @@ def _run_code_sync(code: str, code_type: str, cwd: Path, timeout: int) -> dict:
             cmd, cwd=str(cwd), stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=timeout, creationflags=creationflags,
+            env=workspace_env(cwd),
         )
         out = proc.stdout.decode("utf-8", errors="replace")
         return {"status": "success" if proc.returncode == 0 else "error",

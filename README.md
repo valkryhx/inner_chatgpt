@@ -6,7 +6,7 @@ APIKey（模型端点）与 MCP 配置，互不可见。
 技术栈：**FastAPI（自研 Agent 内核）+ React**，**不依赖 LangChain / LangGraph**。
 能力包含：登录/注册 + 会话按用户隔离 + 会话级模型切换 + 用户级 APIKey / MCP 配置 +
 Web 前端 + Agent 后端（自研 LLM 客户端 + 工具调用循环）+ SQLite 会话持久化 / resume / 删除 +
-上下文压缩 + FastMCP（标准 mcp.json）工具接入 + **Skill 模块**（SKILL.md 渐进披露） + **内置本地工具**（file_read / file_write / file_patch / list_files / code_run / load_skill） + **子代理（Subagent）**（进程内 asyncio 运行时：spawn / wait / read / list / close 五个编排工具；子代理继承全部业务工具与 MCP，但不能再派生子代理；事件合并进同一 SSE，前端可折叠卡片）；Markdown 图片 `![](...)` 支持 workspace 本地路径（带鉴权读取）与远程 URL。
+上下文压缩 + FastMCP（标准 mcp.json）工具接入 + **Skill 模块**（SKILL.md 渐进披露） + **内置本地工具**（file_read / file_write / file_patch / list_files / code_run / load_skill） + **子代理（Subagent）**（进程内 asyncio 运行时：spawn / wait / read / list / close 五个编排工具；子代理继承全部业务工具与 MCP，但不能再派生子代理；事件合并进同一 SSE，前端可折叠卡片）；Markdown 图片 `![](...)` 与原生 `<img>` 支持 workspace 本地路径（相对 / Windows 绝对 / `file:` URI，带鉴权读取）与远程 URL；输出图片必须留在个人 workspace，`code_run` 会拒绝写入 `frontend/dist`、`frontend/src` 或 workspace 外路径。
 
 > 界面示意：同一个会话内 Agent 先查数（工具卡片）再画图（ECharts 渲染，可「下载 PNG」），
 > 多轮对话与图表一起按会话持久化；左侧会话列表按用户隔离。

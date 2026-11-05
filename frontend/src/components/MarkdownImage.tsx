@@ -16,19 +16,17 @@ export function isWorkspaceImage(src: string): boolean {
   const s = (src || '').trim()
   if (!s) return false
   if (s.startsWith('//')) return false
-  try {
-    const u = new URL(s, window.location.origin)
-    if (REMOTE_PROTOCOLS.has(u.protocol) && u.protocol !== 'blob:') return true
-  } catch {
-    // continue with path heuristics
+  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(s)?.[1]?.toLowerCase()
+  if (scheme) {
+    if (REMOTE_PROTOCOLS.has(scheme + ':')) return false
+    if (scheme === 'file') return true
   }
-  if (/^file:/i.test(s)) return true
   if (WINDOWS_ABS_RE.test(s)) return true
   if (LOCAL_PREFIXES.some((p) => s.startsWith(p))) return true
   // 以 / 开头但不是 // 的路径，按 workspace 相对路径处理（与后端一致）。
   if (s.startsWith('/')) return true
-  // 其余普通相对路径。
-  return !/^[a-z][a-z0-9+.-]*:/i.test(s)
+  // 其余普通相对路径；未知协议不交给后端。
+  return !scheme
 }
 
 /** 把 workspace 路径归一成后端可解析的字符串（保留盘符与原始信息）。 */
@@ -70,6 +68,8 @@ interface Props {
   src: string
   alt?: string
   title?: string
+  width?: string | number
+  height?: string | number
 }
 
 /**
@@ -80,7 +80,7 @@ interface Props {
  * 直接给 <img src="/workspace/x.png"> 在 SPA 下会拿到 index.html，
  * 且 <img> 无法携带 Authorization，因此必须走这里。
  */
-export default function MarkdownImage({ src, alt, title }: Props) {
+export default function MarkdownImage({ src, alt, title, width, height }: Props) {
   const local = isWorkspaceImage(src)
   const [resolved, setResolved] = useState(local ? '' : src)
   const [error, setError] = useState('')
@@ -133,7 +133,7 @@ export default function MarkdownImage({ src, alt, title }: Props) {
   }
   return (
     <span className="md-image">
-      <img src={resolved} alt={alt || ''} title={title} loading="lazy" />
+      <img src={resolved} alt={alt || ''} title={title} width={width} height={height} loading="lazy" />
     </span>
   )
 }

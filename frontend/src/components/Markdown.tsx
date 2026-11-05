@@ -1,4 +1,6 @@
 import ReactMarkdown from 'react-markdown'
+import rehypeRaw from 'rehype-raw'
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import remarkGfm from 'remark-gfm'
 import MarkdownImage from './MarkdownImage'
 
@@ -7,6 +9,10 @@ interface Props {
 }
 
 const SAFE_PROTOCOLS = new Set(['http:', 'https:', 'data:', 'mailto:', 'blob:'])
+const DRIVE_PROTOCOLS = [
+  ...'abcdefghijklmnopqrstuvwxyz'.split(''),
+  ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split(''),
+]
 
 function safeUrl(url?: string): string {
   if (!url) return ''
@@ -32,11 +38,36 @@ function safeMarkdownUrl(url?: string): string {
   if (/^file:/i.test(s)) return s
   if (/^[A-Za-z]:[\/]/.test(s)) return s
   if (s.startsWith('/') || s.startsWith('./') || s.startsWith('../')) return s
-  if (/^[a-z][a-z0-9+.-]*:/i.test(s)) {
-    const safe = safeUrl(s)
-    return safe
-  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(s)) return safeUrl(s)
   return s
+}
+
+/**
+ * 模型经常直接写原生 HTML <img>（尤其从别的平台迁移过来的习惯）。
+ * 默认 react-markdown 会丢掉原始 HTML，所以这里：
+ * 1) rehype-raw 把 HTML 解析成节点；
+ * 2) rehype-sanitize 只保留安全子集；
+ * 3) 额外放行图片所需的 src/alt/title/宽高，以及 details/summary。
+ *
+ * 脚本、事件属性、iframe、style/class 等仍被剔除，安全边界不降级。
+ */
+const schema = {
+  ...defaultSchema,
+  tagNames: [
+    ...(defaultSchema.tagNames || []),
+    'img', 'figure', 'figcaption', 'details', 'summary', 'kbd', 'mark',
+  ],
+  attributes: {
+    ...defaultSchema.attributes,
+    img: [...(defaultSchema.attributes?.img || []), 'src', 'alt', 'title', 'width', 'height'],
+    a: [...(defaultSchema.attributes?.a || []), 'href', 'title'],
+    details: ['open'],
+  },
+  protocols: {
+    ...defaultSchema.protocols,
+    // 单字母协议只用于 Windows 盘符（D:/...）；javascript/vbscript 等仍被拒绝。
+    src: ['http', 'https', 'data', 'file', 'blob', ...DRIVE_PROTOCOLS],
+  },
 }
 
 export default function Markdown({ text }: Props) {
@@ -44,6 +75,7 @@ export default function Markdown({ text }: Props) {
     <div className="markdown-body">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeRaw, [rehypeSanitize, schema]]}
         urlTransform={safeMarkdownUrl}
         components={{
           a: ({ href, children, ...rest }) => {
@@ -55,10 +87,10 @@ export default function Markdown({ text }: Props) {
               </a>
             )
           },
-          img: ({ src, alt, title }) => {
+          img: ({ src, alt, title, width, height }) => {
             const raw = typeof src === 'string' ? src : ''
             if (!raw) return <span className="md-img-blocked">[图片地址为空] {alt}</span>
-            return <MarkdownImage src={raw} alt={alt} title={title} />
+            return <MarkdownImage src={raw} alt={alt} title={title} width={width} height={height} />
           },
         }}
       >

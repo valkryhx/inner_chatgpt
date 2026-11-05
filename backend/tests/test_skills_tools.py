@@ -144,6 +144,32 @@ def test_code_run_python(tmp_path, monkeypatch):
     assert "exit=0" in out and "5" in out
 
 
+def test_code_run_rejects_workspace_escape(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    from app.builtin_tools import build_builtin_tools
+
+    tools = {t.name: t for t in build_builtin_tools("u1")}
+    outside = tmp_path / "outside.txt"
+    code = (
+        "from pathlib import Path\n"
+        f"Path({str(outside)!r}).write_text('bad', encoding='utf-8')\n"
+    )
+    out = run(tools["code_run"].call({"code": code, "type": "python"}))
+    assert "PermissionError" in out or "越界" in out
+    assert not outside.exists()
+
+
+def test_code_run_blocks_source_and_build_dirs(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    from app.builtin_tools import build_builtin_tools
+
+    tools = {t.name: t for t in build_builtin_tools("u1")}
+    for marker in ("frontend/dist", "frontend/src"):
+        code = f"print({marker!r})\n"
+        out = run(tools["code_run"].call({"code": code, "type": "python"}))
+        assert out.startswith("[工具执行错误]") and marker in out
+
+
 def test_load_skill_tool(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     from app.builtin_tools import build_builtin_tools
