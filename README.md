@@ -6,7 +6,7 @@ APIKey（模型端点）与 MCP 配置，互不可见。
 技术栈：**FastAPI（自研 Agent 内核）+ React**，**不依赖 LangChain / LangGraph**。
 能力包含：登录/注册 + 会话按用户隔离 + 会话级模型切换 + 用户级 APIKey / MCP 配置 +
 Web 前端 + Agent 后端（自研 LLM 客户端 + 工具调用循环）+ SQLite 会话持久化 / resume / 删除 +
-上下文压缩 + FastMCP（标准 mcp.json）工具接入 + **Skill 模块**（SKILL.md 渐进披露） + **内置本地工具**（file_read / file_write / file_patch / list_files / code_run / load_skill）。
+上下文压缩 + FastMCP（标准 mcp.json）工具接入 + **Skill 模块**（SKILL.md 渐进披露） + **内置本地工具**（file_read / file_write / file_patch / list_files / code_run / load_skill） + **子代理（Subagent）**（进程内 asyncio 运行时：spawn / wait / read / list / close 五个编排工具，子代理事件合并进同一 SSE，前端可折叠卡片）。
 
 > 界面示意：同一个会话内 Agent 先查数（工具卡片）再画图（ECharts 渲染，可「下载 PNG」），
 > 多轮对话与图表一起按会话持久化；左侧会话列表按用户隔离。
@@ -28,6 +28,8 @@ Web 前端 + Agent 后端（自研 LLM 客户端 + 工具调用循环）+ SQLite
   - `builtin_tools.py`：内置工具 file_read / file_write / file_patch / list_files / code_run / load_skill
   - `skill_store.py`：文件系统 Skill（SKILL.md）解析 / 渐进披露 / 用户私有 CRUD
   - `workspace.py`：每用户 workspace + 路径安全（读写均限定在个人目录内）
+  - `subagent/`：进程内 asyncio 子代理运行时（context / store / events / capabilities /
+    registry / runtime / host / tools / prompts / session），不引入 langchain/langgraph、不 import GA
 - 认证：邮箱+密码（bcrypt）+ JWT access token + HttpOnly refresh cookie（旋转）
 - 多用户：会话/消息/AI 配置全部按 `user_id` 隔离；每用户可配置自己的模型端点与 MCP 服务器
 - 会话级模型：每个会话可在顶栏「模型」下拉切换（`sessions.model_id`），支持同一用户多模型（如 deepseek / glm）
@@ -268,7 +270,8 @@ backend/
     tools.py        # 自研工具抽象 Tool / ToolRegistry
     builtin_tools.py# 内置工具：file_read/file_write/file_patch/list_files/code_run/load_skill
     skill_store.py  # Skill（SKILL.md）解析/发现/加载 + 用户私有 CRUD
-    workspace.py    # 每用户 workspace + 路径安全
+    workspace.py    # 每用户 workspace + 路径安全（支持子代理写根隔离）
+    subagent/       # 进程内 asyncio 子代理运行时（编排工具 / 侧链表 / 事件扇出）
     agent_loop.py   # 自研 Agent 主循环（while + tool dispatch + 事件 yield）
     history_store.py# 会话历史单表读写（替代 checkpoint，表 session_history）
     mcp_client.py   # fastmcp.Client -> 自研工具
@@ -292,11 +295,12 @@ backend/
   tests/
     test_kernel.py  # 自研内核单元测试
     test_skills_tools.py  # Skill + 内置工具单元测试
+    test_subagent_*.py    # 子代理 store/capabilities/host/chat 单元测试
   run.py            # 启动入口
 frontend/
   src/
     App.tsx / api.ts / types.ts
-    components/Sidebar.tsx MessageList.tsx Composer.tsx LoginPage.tsx SettingsModal.tsx
+    components/Sidebar.tsx MessageList.tsx Composer.tsx LoginPage.tsx SettingsModal.tsx SubagentCard.tsx
 ```
 
 ## API 概览
