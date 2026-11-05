@@ -375,6 +375,10 @@ function SkillsSection() {
   const [editing, setEditing] = useState<string | null>(null)
   const [form, setForm] = useState({ name: '', description: '', content: '' })
   const [busy, setBusy] = useState(false)
+  const [readonlyView, setReadonlyView] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [overwrite, setOverwrite] = useState(false)
+  const fileRef = useRef<HTMLInputElement | null>(null)
 
   const load = () => api.listSkills().then(setList).catch((e) => setError(String(e)))
   useEffect(() => {
@@ -383,11 +387,16 @@ function SkillsSection() {
 
   const reset = () => {
     setEditing(null)
+    setReadonlyView(false)
     setForm({ name: '', description: '', content: '' })
   }
 
+  const sourceLabel = (s: Skill) =>
+    s.source === 'user' ? '我的' : s.source === 'shared' ? '公用' : '内置'
+
   const edit = async (s: Skill) => {
     setEditing(s.name)
+    setReadonlyView(s.source !== 'user')
     setForm({ name: s.name, description: s.description, content: '' })
     try {
       const detail = await api.getSkill(s.name)
@@ -432,19 +441,69 @@ function SkillsSection() {
     }
   }
 
+  // 上传 zip 技能包（可含多个 Skill 目录及 scripts / references 等附属文件）
+  const upload = async (file: File | null | undefined) => {
+    if (!file) return
+    setError(null)
+    setNotice(null)
+    setUploading(true)
+    try {
+      const r = await api.importSkillZip(file, overwrite)
+      setNotice(`已导入 ${r.installed.length} 个 Skill：${r.installed.join('、')}`)
+      await load()
+    } catch (e: any) {
+      setError(e?.message || String(e))
+    } finally {
+      setUploading(false)
+      if (fileRef.current) fileRef.current.value = ''
+    }
+  }
+
   return (
     <div className="settings-section">
       <p className="hint">
-        Skill 是可复用的操作手册（SKILL.md）。系统会把 Skill 名称与描述注入模型，
+        Skill 是可复用的操作手册（<code>SKILL.md</code>）。系统会把 Skill 名称与描述注入模型，
         模型在任务匹配时会自动调用 <code>load_skill</code> 加载完整说明。
-        内置 Skill 只读；同名的「我的 Skill」会覆盖内置版本。
+        「公用 / 内置」只读；同名的「我的 Skill」会覆盖它们。
       </p>
+
+      {/* ---- zip 技能包导入 ---- */}
+      <div className="skill-drop">
+        <div className="skill-drop-main">
+          <b>导入技能包（.zip）</b>
+          <div className="hint" style={{ margin: '2px 0 0' }}>
+            支持完整目录结构：可含 <code>scripts/</code>、<code>references/</code>、模板等附属文件。
+            zip 根目录放 <code>SKILL.md</code>，或每个一级子目录各放一个。
+          </div>
+        </div>
+        <div className="skill-drop-actions">
+          <label className="skill-overwrite">
+            <input type="checkbox" checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)} />
+            覆盖同名
+          </label>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".zip,application/zip"
+            style={{ display: 'none' }}
+            onChange={(e) => upload(e.target.files?.[0])}
+          />
+          <button className="new-btn small" disabled={uploading} onClick={() => fileRef.current?.click()}>
+            {uploading ? '导入中…' : '选择 zip 导入'}
+          </button>
+        </div>
+      </div>
+
       <div className="cfg-list">
         {list.length === 0 && <div className="hint">暂无 Skill</div>}
         {list.map((s) => (
           <div className="cfg-item" key={`${s.source}:${s.name}`}>
             <div>
-              <b>{s.name}</b> <span className="tag">{s.source === 'builtin' ? '内置' : '我的'}</span>
+              <b>{s.name}</b>{' '}
+              <span className={'tag ' + (s.source === 'user' ? 'tag-user' : 'tag-ro')}>{sourceLabel(s)}</span>
+              {!!s.files && s.files > 1 && (
+                <span className="tag tag-files">{s.files} 个文件</span>
+              )}
               <div className="cfg-meta">
                 {s.description || '（无描述）'} · {s.chars} 字符
               </div>
@@ -460,10 +519,16 @@ function SkillsSection() {
                   </button>
                 </>
               )}
+              {s.source !== 'user' && (
+                <button className="ghost-btn" onClick={() => edit(s)}>
+                  查看
+                </button>
+              )}
             </div>
           </div>
         ))}
       </div>
+
       <div className="form-grid">
         <label>
           <span>名称（小写字母/数字/-/_/.)</span>
@@ -471,7 +536,7 @@ function SkillsSection() {
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
             placeholder="如 pdf-report"
-            disabled={!!editing}
+            disabled={!!editing || readonlyView}
           />
         </label>
         <label>
@@ -480,28 +545,41 @@ function SkillsSection() {
             value={form.description}
             onChange={(e) => setForm({ ...form, description: e.target.value })}
             placeholder="如 把数据整理成 PDF 报告"
+            disabled={readonlyView}
           />
         </label>
         <label className="full">
-          <span>SKILL.md 正文（Markdown，不含 frontmatter）</span>
+          <span>
+            SKILL.md 正文（Markdown，不含 frontmatter）
+            {editing && form.name !== editing ? '' : ''}
+          </span>
           <textarea
             className="mcp-json"
             value={form.content}
             spellCheck={false}
+            disabled={readonlyView}
+            readOnly={readonlyView}
             onChange={(e) => setForm({ ...form, content: e.target.value })}
-            placeholder={'# 步骤\n1. ...\n2. ...'}
+            placeholder={'# 步骤 / 1. ... / 2. ...'}
           />
         </label>
       </div>
       {error && <div className="auth-error">{error}</div>}
       {notice && <div className="mcp-notice">{notice}</div>}
+      {readonlyView && (
+        <div className="skill-readonly-note">
+          这是只读 Skill。如需修改，请在下方以相同名称「新增 Skill」，你的私有版本会覆盖它。
+        </div>
+      )}
       <div className="form-actions">
-        <button className="new-btn small" onClick={save} disabled={busy}>
-          {busy ? '保存中…' : editing ? '保存修改' : '新增 Skill'}
-        </button>
+        {!readonlyView && (
+          <button className="new-btn small" onClick={save} disabled={busy}>
+            {busy ? '保存中…' : editing ? '保存修改' : '新增 Skill'}
+          </button>
+        )}
         {editing && (
           <button className="ghost-btn" onClick={reset}>
-            取消
+            {readonlyView ? '关闭' : '取消'}
           </button>
         )}
       </div>

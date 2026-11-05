@@ -230,7 +230,11 @@ class SkillUpdate(BaseModel):
 class SkillOut(BaseModel):
     name: str
     description: str = ""
-    source: str = "user"       # builtin | user
+    source: str = "user"       # builtin | shared | user
     chars: int = 0
     updated_at: int = 0
     model_invocable: bool = True
+    # Number of files in the skill directory (SKILL.md + bundled resources).
+    # >1 means the skill ships extra reference/script files under ${SKILL_DIR}.
+    files: int = 0
+    readonly: bool = False

@@ -71,6 +71,7 @@ subagent / team / task 工具 → 计划模式 → goal → hooks。浏览器控
 | `docs/20261105-changelog-前端批次1.md` | **前端批次 1 已完成**：Token 层替换（暖纸+陶土）、四档位回归通过、两个响应式缺陷修复 |
 | `docs/20261105-changelog-前端批次2.md` | **前端批次 2 已完成**：文本去气泡（assistant 零容器 / user 保留输入容器）、工具改步骤行 StepGroup、思考默认折叠、`--measure` 宽度自适应 |
 | `docs/20261105-changelog-侧栏身份区与设置弹窗.md` | **侧栏身份区重做 + 设置弹窗定高**：全名替字母头像、整行可点进设置、登出降级为次要动作；modal 固定高度，切 tab 不跳尺寸 |
+| `docs/20261105-Skill目录包导入与公用技能设计与实施.md` | **Skill 目录包导入 + 公用技能层**：三层模型 builtin/shared/user、zip 安全解压（穿越/软链/炸弹防护）、`backend/skills_shared/` 公用目录、已导入 2 个 Codex 技能 |
 
 ### 0.3 目录约定（写文件前先确认放在哪个目录）
 

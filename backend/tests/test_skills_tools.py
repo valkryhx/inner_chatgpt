@@ -14,9 +14,11 @@ def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(workspace, "SKILLS_DIR", tmp_path / "skills")
     monkeypatch.setattr(workspace, "WORKSPACES_DIR", tmp_path / "workspaces")
     monkeypatch.setattr(workspace, "BUILTIN_SKILLS_DIR", tmp_path / "builtin")
+    monkeypatch.setattr(workspace, "SHARED_SKILLS_DIR", tmp_path / "shared")
     (tmp_path / "skills").mkdir()
     (tmp_path / "workspaces").mkdir()
     (tmp_path / "builtin").mkdir()
+    (tmp_path / "shared").mkdir()
 
 
 def test_parse_skill_markdown_frontmatter():
@@ -163,3 +165,137 @@ def test_skill_prompt_listing(tmp_path, monkeypatch):
     save_user_skill("u1", "one", "第一个", "body")
     prompt = build_skill_prompt("u1")
     assert "[Available Skills]" in prompt and "- one: 第一个" in prompt
+
+
+# ---------------- skill bundle (zip) import ----------------
+
+def _zip_bytes(entries):
+    """Build an in-memory zip from {name: bytes|str}."""
+    import io as _io
+    import zipfile
+
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, content in entries.items():
+            data = content.encode("utf-8") if isinstance(content, str) else content
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def test_import_single_skill_at_root(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    from app.skill_store import get_skill, install_user_skill_bundle
+
+    data = _zip_bytes({
+        "SKILL.md": "---\nname: 技术报告\ndescription: 写报告\n---\n# body\n用 ${SKILL_DIR}",
+        "REFERENCE.md": "ref",
+        "scripts/run.py": "print(1)",
+    })
+    # Chinese frontmatter name + no wrapper dir -> slug passed by the caller.
+    names = install_user_skill_bundle("u1", data, default_name="tech-report")
+    assert names == ["tech-report"]
+    # frontmatter name was normalised to a loadable slug
+    spec = get_skill("u1", "tech-report")
+    assert spec is not None
+    assert "name: tech-report" in (spec.root / "SKILL.md").read_text(encoding="utf-8")
+    assert (spec.root / "REFERENCE.md").is_file()
+    assert (spec.root / "scripts" / "run.py").is_file()
+
+
+def test_import_multi_skill_dirs(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    from app.skill_store import list_skills, install_user_skill_bundle
+
+    data = _zip_bytes({
+        "alpha/SKILL.md": "---\nname: alpha\ndescription: A\n---\nA body",
+        "alpha/ref.md": "a-ref",
+        "beta/SKILL.md": "---\nname: beta\ndescription: B\n---\nB body",
+    })
+    names = install_user_skill_bundle("u1", data)
+    assert sorted(names) == ["alpha", "beta"]
+    found = {s.name: s for s in list_skills("u1")}
+    assert "alpha" in found and "beta" in found
+    assert (found["alpha"].root / "ref.md").is_file()
+
+
+def test_import_rejects_traversal(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    from app.skill_store import BundleError, install_user_skill_bundle
+
+    data = _zip_bytes({"SKILL.md": "---\nname: ok\n---\nx", "../evil.txt": "boom"})
+    try:
+        install_user_skill_bundle("u1", data)
+        assert False, "should reject traversal"
+    except BundleError as e:
+        assert "非法路径" in str(e) or "越界" in str(e)
+
+
+def test_import_requires_skill_md(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    from app.skill_store import BundleError, install_user_skill_bundle
+
+    try:
+        install_user_skill_bundle("u1", _zip_bytes({"readme.txt": "no skill here"}))
+        assert False
+    except BundleError as e:
+        assert "SKILL.md" in str(e)
+
+
+def test_import_rejects_bad_zip(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    from app.skill_store import BundleError, install_user_skill_bundle
+
+    try:
+        install_user_skill_bundle("u1", b"not a zip at all")
+        assert False
+    except BundleError as e:
+        assert "zip" in str(e)
+
+
+def test_import_same_name_requires_overwrite(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    from app.skill_store import BundleError, get_skill, install_user_skill_bundle
+
+    data = _zip_bytes({"demo/SKILL.md": "---\nname: demo\n---\nfirst"})
+    install_user_skill_bundle("u1", data)
+    try:
+        install_user_skill_bundle("u1", data)
+        assert False, "should collide"
+    except BundleError as e:
+        assert "已存在同名" in str(e)
+
+    data2 = _zip_bytes({"demo/SKILL.md": "---\nname: demo\n---\nsecond"})
+    install_user_skill_bundle("u1", data2, overwrite=True)
+    assert "second" in get_skill("u1", "demo").body
+
+
+def test_shared_skill_visible_and_overridable(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    from app.skill_store import install_shared_skill_bundle, list_skills, save_user_skill
+
+    install_shared_skill_bundle(_zip_bytes({
+        "pub/SKILL.md": "---\nname: pub\ndescription: public\n---\npublic body",
+    }))
+    skills = {s.name: s for s in list_skills("u1")}
+    assert skills["pub"].source == "shared"
+    assert "public body" in skills["pub"].body
+
+    save_user_skill("u1", "pub", "mine", "private body")
+    skills = {s.name: s for s in list_skills("u1")}
+    assert skills["pub"].source == "user"
+    assert "private body" in skills["pub"].body
+
+
+def test_shared_skill_readable_by_file_read(tmp_path, monkeypatch):
+    """Bundled files in a shared skill must be readable via file_read path safety."""
+    _isolate(tmp_path, monkeypatch)
+    from app.builtin_tools import build_builtin_tools
+    from app.skill_store import install_shared_skill_bundle
+
+    install_shared_skill_bundle(_zip_bytes({
+        "pub/SKILL.md": "---\nname: pub\n---\nbody",
+        "pub/references/guide.md": "GUIDE-CONTENT",
+    }))
+    tools = {t.name: t for t in build_builtin_tools("u1")}
+    out = run(tools["file_read"].call({"path": str(tmp_path / "shared" / "pub" / "references" / "guide.md")}))
+    assert "GUIDE-CONTENT" in out

@@ -27,6 +27,7 @@ from typing import Iterable, Optional
 from .workspace import (
     PathSecurityError,
     builtin_skills_root,
+    shared_skills_root,
     user_skills_root,
     validate_skill_name,
 )
@@ -169,14 +170,26 @@ def _scan(root: Path, source: str) -> dict[str, SkillSpec]:
 
 
 def list_skills(user_id: str) -> list[SkillSpec]:
-    """All skills visible to a user: builtin first, user overrides on top."""
+    """All skills visible to a user.
+
+    Precedence (later wins): builtin -> shared -> user.
+    """
     merged: dict[str, SkillSpec] = _scan(builtin_skills_root(), "builtin")
+    merged.update(_scan(shared_skills_root(), "shared"))
     merged.update(_scan(user_skills_root(user_id), "user"))
     return sorted(merged.values(), key=lambda s: s.name.lower())
 
 
 def list_builtin_skills() -> list[SkillSpec]:
     return sorted(_scan(builtin_skills_root(), "builtin").values(), key=lambda s: s.name.lower())
+
+
+def list_shared_skills() -> list[SkillSpec]:
+    return sorted(_scan(shared_skills_root(), "shared").values(), key=lambda s: s.name.lower())
+
+
+def _readonly_roots() -> tuple[Path, ...]:
+    return (shared_skills_root(), builtin_skills_root())
 
 
 def get_skill(user_id: str, name: str) -> Optional[SkillSpec]:
@@ -190,9 +203,10 @@ def get_skill(user_id: str, name: str) -> Optional[SkillSpec]:
         f = user_root / key / "SKILL.md"
         if f.is_file():
             return _read_spec(f, "user")
-    f = builtin_skills_root() / key / "SKILL.md"
-    if f.is_file():
-        return _read_spec(f, "builtin")
+    for root, source in ((shared_skills_root(), "shared"), (builtin_skills_root(), "builtin")):
+        f = root / key / "SKILL.md"
+        if f.is_file():
+            return _read_spec(f, source)
     return None
 
 
@@ -285,9 +299,190 @@ def delete_user_skill(user_id: str, name: str) -> bool:
     return True
 
 
+# ---------------- skill bundle import (zip) ----------------
+
+MAX_BUNDLE_BYTES = 20 * 1024 * 1024          # compressed upload cap
+MAX_BUNDLE_UNCOMPRESSED = 60 * 1024 * 1024   # zip-bomb guard
+MAX_BUNDLE_FILES = 500
+
+
+class BundleError(ValueError):
+    """Raised when an uploaded skill bundle is invalid or unsafe."""
+
+
+def _safe_extract_zip(data: bytes, dest: Path) -> None:
+    """Extract a zip into ``dest`` with traversal / symlink / bomb guards.
+
+    Rejects: absolute member paths, ``..`` segments, symlink members, too many
+    files, and an uncompressed total above ``MAX_BUNDLE_UNCOMPRESSED``.
+    """
+    import io as _io
+    import zipfile
+
+    if len(data) > MAX_BUNDLE_BYTES:
+        raise BundleError(f"压缩包过大（上限 {MAX_BUNDLE_BYTES // (1024 * 1024)}MB）")
+    try:
+        zf = zipfile.ZipFile(_io.BytesIO(data))
+    except zipfile.BadZipFile as e:
+        raise BundleError("不是有效的 zip 文件") from e
+
+    infos = [i for i in zf.infolist() if not i.is_dir()]
+    if len(infos) > MAX_BUNDLE_FILES:
+        raise BundleError(f"文件数过多（上限 {MAX_BUNDLE_FILES}）")
+    total = sum(i.file_size for i in infos)
+    if total > MAX_BUNDLE_UNCOMPRESSED:
+        raise BundleError("解压后体积过大，疑似 zip 炸弹")
+
+    dest_r = dest.resolve()
+    for info in infos:
+        raw = info.filename.replace(chr(92), "/")
+        # symlink: unix mode high bits 0o120000
+        if (info.external_attr >> 16) & 0o170000 == 0o120000:
+            raise BundleError(f"包含符号链接，拒绝导入: {raw}")
+        parts = [p for p in raw.split("/") if p not in ("", ".")]
+        if not parts or any(p == ".." for p in parts):
+            raise BundleError(f"包含非法路径: {raw}")
+        target = dest_r.joinpath(*parts)
+        if target != dest_r and dest_r not in target.resolve().parents:
+            raise BundleError(f"路径越界: {raw}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as src, open(target, "wb") as out:
+            while True:
+                chunk = src.read(65536)
+                if not chunk:
+                    break
+                out.write(chunk)
+
+
+def _locate_skill_dirs(root: Path) -> list[Path]:
+    """Find skill directories inside an extracted bundle.
+
+    Accepts either a single skill at the archive root, or one-or-more skills as
+    immediate subdirectories (the common multi-skill bundle layout).
+    """
+    if (root / "SKILL.md").is_file():
+        return [root]
+    found: list[Path] = []
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if child.is_dir() and (child / "SKILL.md").is_file():
+            found.append(child)
+    if found:
+        return found
+    # Fall back to a bounded deep search (git archives sometimes nest one level).
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir():
+            continue
+        for grand in sorted(child.iterdir(), key=lambda p: p.name.lower()):
+            if grand.is_dir() and (grand / "SKILL.md").is_file():
+                found.append(grand)
+    return found
+
+
+def _normalize_skill_frontmatter(skill_dir: Path, dir_name: str) -> None:
+    """Make the frontmatter ``name`` a valid, loadable skill name.
+
+    Imported skills often have a human-readable (e.g. Chinese) ``name:`` in the
+    frontmatter while the directory is slug-shaped. The loader validates names
+    against ``[a-z0-9._-]``, so a Chinese name would be listed but unloadable.
+    Rewrite just that one line to the directory slug and keep everything else.
+    """
+    f = skill_dir / "SKILL.md"
+    try:
+        text = f.read_text(encoding="utf-8")
+    except OSError:
+        return
+    m = FRONTMATTER_RE.match(text)
+    if not m:
+        return
+    fm = m.group(1)
+    lines = fm.splitlines()
+    changed = False
+    for i, line in enumerate(lines):
+        kv = _NAME_RE.match(line)
+        if kv and kv.group(1).replace("-", "_") == "name":
+            if _parse_scalar(kv.group(2)) != dir_name:
+                lines[i] = f"name: {dir_name}"
+                changed = True
+            break
+    if not changed:
+        return
+    NL = chr(10)
+    new_text = "---" + NL + NL.join(lines) + NL + "---" + NL + text[m.end():]
+    with open(f, "w", encoding="utf-8", newline=NL) as fh:
+        fh.write(new_text)
+
+
+def import_skill_bundle(data: bytes, target_root: Path, *, overwrite: bool = False,
+                        default_name: str = "") -> list[str]:
+    """Install a zip of one or more skill directories into ``target_root``.
+
+    ``default_name`` names the skill when the archive root itself is the skill
+    (no wrapping folder); the API passes the uploaded filename stem for that.
+
+    Returns the list of installed skill directory names. Raises ``BundleError``
+    for unsafe/invalid archives. Existing skills are only replaced when
+    ``overwrite`` is True.
+    """
+    import shutil
+    import tempfile
+
+    target_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="skillbundle_"))
+    try:
+        _safe_extract_zip(data, tmp)
+        dirs = _locate_skill_dirs(tmp)
+        if not dirs:
+            raise BundleError("压缩包里没有找到 SKILL.md（需位于根目录或一级子目录）")
+        installed: list[str] = []
+        seen: set[str] = set()
+        for d in dirs:
+            raw_name = d.name if d != tmp else (default_name or "skill")
+            try:
+                name = validate_skill_name(raw_name)
+            except ValueError as e:
+                raise BundleError(f"Skill 目录名不合法（{raw_name}）：{e}") from e
+            if name in seen:
+                raise BundleError(f"压缩包里有重名 Skill: {name}")
+            seen.add(name)
+            dest = target_root / name
+            if dest.exists():
+                if not overwrite:
+                    raise BundleError(f"已存在同名 Skill: {name}（如需替换请选择覆盖）")
+                shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(d, dest)
+            # Normalise AFTER copying so a root-level SKILL.md is covered too.
+            _normalize_skill_frontmatter(dest, name)
+            installed.append(name)
+        return installed
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def install_user_skill_bundle(user_id: str, data: bytes, *, overwrite: bool = False,
+                             default_name: str = "") -> list[str]:
+    return import_skill_bundle(data, user_skills_root(user_id, create=True),
+                               overwrite=overwrite, default_name=default_name)
+
+
+def install_shared_skill_bundle(data: bytes, *, overwrite: bool = False,
+                                default_name: str = "") -> list[str]:
+    """Install into the repo-shipped shared skills root (operator action)."""
+    return import_skill_bundle(data, shared_skills_root(), overwrite=overwrite,
+                               default_name=default_name)
+
+
 def is_builtin_skill(name: str) -> bool:
+    """True when the name exists in a read-only root (builtin or shared).
+
+    Despite the historical name this now also covers the shared/public root,
+    because both are read-only through the API: a user must create a private
+    skill of the same name to override them.
+    """
     safe = validate_skill_name(name)
-    return (builtin_skills_root() / safe / "SKILL.md").is_file()
+    for root in _readonly_roots():
+        if (root / safe / "SKILL.md").is_file():
+            return True
+    return False
 
 
 def format_skill_listing(skills: Iterable[SkillSpec], char_budget: int = 8000) -> str:

@@ -7,14 +7,15 @@ always ``resolve()`` then verify containment under the allowed root.
 Layout:
     backend/data/workspaces/<user_id>/      # read + write sandbox
     backend/data/skills/<user_id>/<name>/   # user's private skills (read via skill tools)
-    backend/skills_builtin/<name>/          # bundled read-only skills
+    backend/skills_builtin/<name>/          # bundled read-only skills (repo)
+    backend/skills_shared/<name>/           # shared public skills (imported bundles, repo)
 """
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
-from .config import BUILTIN_SKILLS_DIR, SKILLS_DIR, WORKSPACES_DIR
+from .config import BUILTIN_SKILLS_DIR, SHARED_SKILLS_DIR, SKILLS_DIR, WORKSPACES_DIR
 
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -56,6 +57,11 @@ def builtin_skills_root() -> Path:
     return BUILTIN_SKILLS_DIR
 
 
+def shared_skills_root() -> Path:
+    """Public skills every user can use (never edited through the API)."""
+    return SHARED_SKILLS_DIR
+
+
 def safe_workspace_path(user_id: str, rel_path: str) -> Path:
     """Resolve a model-supplied path inside the user's workspace.
 
@@ -74,7 +80,7 @@ def safe_workspace_path(user_id: str, rel_path: str) -> Path:
 def safe_read_roots(user_id: str) -> list[Path]:
     """Roots the user may READ from (workspace + all visible skill dirs)."""
     roots = [user_workspace(user_id).resolve()]
-    for base in (user_skills_root(user_id), builtin_skills_root()):
+    for base in (user_skills_root(user_id), builtin_skills_root(), shared_skills_root()):
         try:
             if base.exists():
                 roots.append(base.resolve())

@@ -152,8 +152,12 @@ export interface MCPServer {
 export interface Skill {
   name: string
   description: string
-  source: 'builtin' | 'user' | string
+  source: 'builtin' | 'shared' | 'user' | string
   chars: number
   updated_at: number
   model_invocable: boolean
+  /** 文件数：>1 表示该 Skill 带参考资料/脚本等附属文件 */
+  files?: number
+  /** 内置/公用 Skill 只读 */
+  readonly?: boolean
 }

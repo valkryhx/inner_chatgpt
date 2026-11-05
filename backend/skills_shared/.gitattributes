@@ -1,0 +1,10 @@
+# 导入的技能包里可能带 PNG/SVG 等二进制或需原样保留的资源。
+# 文本仍走仓库根 .gitattributes 的 LF 规范化，这里只把二进制标记出来。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.zip binary
+*.pdf binary

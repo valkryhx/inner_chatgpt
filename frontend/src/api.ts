@@ -180,6 +180,15 @@ export const api = {
   getSkill: (name: string) =>
     request<Skill & { content: string }>(`/me/skills/${encodeURIComponent(name)}`),
   listBuiltinSkills: () => request<Skill[]>('/skills'),
+  listSharedSkills: () => request<Skill[]>('/skills/shared'),
+  importSkillZip: (file: File, overwrite = false) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return request<{ ok: boolean; installed: string[] }>(
+      `/me/skills/import?overwrite=${overwrite ? 'true' : 'false'}`,
+      { method: 'POST', body: fd },
+    )
+  },
   createSkill: (body: { name: string; description?: string; content?: string; document?: string }) =>
     request<Skill>('/me/skills', {
       method: 'POST',

@@ -29,6 +29,10 @@ SKILLS_DIR = DATA_DIR / "skills"
 WORKSPACES_DIR = DATA_DIR / "workspaces"
 # Read-only skills shipped with the repository (available to every user).
 BUILTIN_SKILLS_DIR = ROOT_DIR / "backend" / "skills_builtin"
+# Shared / public skills: repo-shipped (or operator-imported) directory that every
+# user can use but nobody can edit from the UI. This is where third-party skill
+# bundles (e.g. imported Codex skills) live. A user skill with the same name wins.
+SHARED_SKILLS_DIR = ROOT_DIR / "backend" / "skills_shared"
 
 _ENV_PAT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
