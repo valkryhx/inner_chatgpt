@@ -6,6 +6,7 @@ import type {
   Session,
   SessionDetail,
   Message,
+  StopResult,
   StreamEvent,
   User,
   Skill,
@@ -118,11 +119,11 @@ export const api = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(opts || {}),
     }),
-  stop: (id: string, generationId?: string) =>
-    request<{ ok: boolean }>(`/sessions/${id}/stop`, {
+  stop: (id: string, generationId?: string, messageId?: string) =>
+    request<StopResult>(`/sessions/${id}/stop`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ generation_id: generationId }),
+      body: JSON.stringify({ generation_id: generationId, message_id: messageId }),
     }),
   mcpTools: () => request<{ tools: { name: string; description: string }[] }>('/mcp/tools'),
 

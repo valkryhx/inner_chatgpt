@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from .. import db
 from ..auth import get_current_user
 from ..runtime import get_hub, register_generation, request_stop, unregister_generation
-from ..schemas import CompactResult, SendMessageIn, StopIn
+from ..schemas import CompactResult, MessageOut, SendMessageIn, StopIn, StopResult
 from ..sse import run_agent_stream, sse_frame
 from ..subagent.context import AgentContext
 from ..subagent.session import build_turn_runtime
@@ -133,7 +133,9 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     # 工具/图表在出现的位置插入。这样刷新后顺序与流式时一致。
     blocks: list[dict[str, Any]] = []
     event_id = 0
-    persisted = False
+    persist_lock = asyncio.Lock()
+    last_persist_at = 0.0
+    terminal_status: str | None = None
 
     def _append_text(chunk: str) -> None:
         if blocks and blocks[-1].get("type") == "text":
@@ -154,17 +156,21 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
         event_id += 1
         return sse_frame(etype, data, event_id)
 
-    async def _persist(status: str) -> None:
-        nonlocal persisted
-        if persisted:
+    async def _persist(status: str, *, force: bool = False) -> None:
+        nonlocal last_persist_at
+        now = asyncio.get_running_loop().time()
+        if not force and now - last_persist_at < 0.25:
             return
-        persisted = True
-        content = "".join(buffer)
-        try:
-            await db.update_message(message_id, content=content, reasoning="".join(reasoning_buf),
-                                    blocks=blocks, status=status)
-        except Exception:
-            pass
+        async with persist_lock:
+            last_persist_at = now
+            content = "".join(buffer)
+            reasoning = "".join(reasoning_buf)
+            snapshot = [dict(b) for b in blocks]
+            try:
+                await db.update_message(message_id, content=content, reasoning=reasoning,
+                                        blocks=snapshot, status=status)
+            except Exception:
+                pass
 
     yield frame("message_start", {"message_id": message_id})
 
@@ -202,31 +208,37 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
             if et == "text_delta":
                 buffer.append(ev["text"])
                 _append_text(ev["text"])
+                await _persist("streaming")
                 yield frame("text_delta", {"text": ev["text"]})
             elif et == "thinking_delta":
                 reasoning_buf.append(ev["text"])
                 _append_reasoning(ev["text"])
+                await _persist("streaming")
                 yield frame("thinking_delta", {"text": ev["text"]})
             elif et == "tool_start":
                 step = {"type": "tool", "id": ev.get("id"), "name": ev.get("name"),
                         "input": ev.get("input")}
                 tool_steps.append(step)
                 blocks.append(step)
+                await _persist("streaming")
                 yield frame("tool_start", {"id": ev.get("id"), "name": ev.get("name"),
                                            "input": ev.get("input")})
             elif et == "chart":
                 blocks.append({"type": "chart", "spec": ev["spec"]})
+                await _persist("streaming")
                 yield frame("chart", {"spec": ev["spec"]})
             elif et == "tool_result":
                 for st in tool_steps:
                     if st["id"] == ev.get("id"):
                         st["result"] = ev.get("content")
+                await _persist("streaming")
                 yield frame("tool_result", {"id": ev.get("id"), "name": ev.get("name"),
                                             "content": ev.get("content"),
                                             "is_error": ev.get("is_error", False)})
             elif et == "subagent_start":
                 b = _sub_block(ev.get("agent_id", ""), ev.get("name", ""), ev.get("role", ""))
                 b["task"] = ev.get("task", "")
+                await _persist("streaming")
                 yield frame("subagent_start", {"agent_id": ev.get("agent_id"), "name": ev.get("name"),
                                                "role": ev.get("role"), "task": ev.get("task")})
             elif et == "subagent_event":
@@ -244,6 +256,7 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                     b["events"].append({"kind": "tool_result", "id": inner.get("id"),
                                         "name": inner.get("name"), "result": inner.get("content"),
                                         "is_error": inner.get("is_error", False)})
+                await _persist("streaming")
                 yield frame("subagent_event", {"agent_id": aid, "event": inner})
             elif et == "subagent_end":
                 aid = ev.get("agent_id", "")
@@ -253,20 +266,29 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                 b["turns"] = ev.get("turns", 0)
                 if ev.get("error"):
                     b["error"] = ev.get("error")
+                await _persist("streaming")
                 yield frame("subagent_end", {"agent_id": aid, "name": ev.get("name"),
                                              "status": ev.get("status"), "result": ev.get("result", ""),
                                              "turns": ev.get("turns", 0), "error": ev.get("error", "")})
             elif et == "error":
+                terminal_status = "error"
                 yield frame("error", {"error": ev.get("error", "unknown error")})
+            elif et == "done":
+                upstream_status = ev.get("status")
+                if upstream_status in ("complete", "stopped"):
+                    terminal_status = upstream_status
 
-        status = "stopped" if stop_event.is_set() else "complete"
-        await _persist(status)
+        status = terminal_status or ("stopped" if stop_event.is_set() else "complete")
+        terminal_status = status
+        await _persist(status, force=True)
         yield frame("done", {"message_id": message_id, "status": status, "model": ur.model.model_name})
     except asyncio.CancelledError:
-        await _persist("stopped")
+        terminal_status = "stopped"
+        await _persist(terminal_status, force=True)
         raise
     except Exception as e:  # noqa: BLE001
-        await _persist("error")
+        terminal_status = "error"
+        await _persist(terminal_status, force=True)
         yield frame("error", {"error": f"{type(e).__name__}: {e}"})
     finally:
         if turn is not None:
@@ -278,7 +300,9 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                 hub.unregister_subagent_host(session_id, generation_id)
             except Exception:
                 pass
-        await _persist("stopped")
+        if terminal_status is None:
+            terminal_status = "stopped"
+            await _persist(terminal_status, force=True)
         unregister_generation(session_id, generation_id)
 
 
@@ -301,7 +325,7 @@ async def send_message(session_id: str, body: SendMessageIn, user: dict = Depend
     )
 
 
-@router.post("/sessions/{session_id}/stop")
+@router.post("/sessions/{session_id}/stop", response_model=StopResult)
 async def stop_generation(session_id: str, body: StopIn, user: dict = Depends(get_current_user)):
     sess = await db.get_session(session_id, user["id"])
     if not sess:
@@ -315,7 +339,23 @@ async def stop_generation(session_id: str, body: StopIn, user: dict = Depends(ge
             subs = await hub.stop_subagent_generation(session_id, body.generation_id)
     except Exception:
         pass
-    return {"ok": True, "stopped": n, "subagents_stopped": subs}
+
+    # 停止是异步信号：SSE 生成器可能还没写 `done`。等待一个短窗口，让生成器
+    # finally 落库后直接把快照返回给前端，避免 abort 后立刻 GET 历史拿到空占位。
+    stop_result = StopResult(ok=True, stopped=n, subagents_stopped=subs)
+    if body.message_id:
+        for _ in range(12):  # up to ~1.2s
+            try:
+                msgs = await db.list_messages(session_id)
+                msg = next((m for m in msgs if m["id"] == body.message_id), None)
+                if msg and msg.get("status") in ("stopped", "complete", "error"):
+                    stop_result.message = MessageOut(**msg)
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+    return stop_result
+
 
 
 from pydantic import BaseModel

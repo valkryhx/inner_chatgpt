@@ -197,6 +197,6 @@ def test_stop_endpoint_cascades_to_subagents(monkeypatch):
 
     from app.schemas import StopIn
     out = run(chat.stop_generation("s1", StopIn(generation_id="g1"), {"id": "u1"}))
-    assert out["ok"] is True
-    assert out["subagents_stopped"] == 2
+    assert out.ok is True
+    assert out.subagents_stopped == 2
     assert hub.calls == [("s1", "g1")]

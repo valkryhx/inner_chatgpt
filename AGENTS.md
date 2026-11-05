@@ -81,6 +81,7 @@
 |---|---|
 | `docs/20261105-changelog-SubagentP2.md` | **P2 已完成清单 + 自测（最新，先读这份）** |
 | `docs/20261105-Markdown图片渲染修复.md` | **Markdown / 原生 `<img>` 图片修复**：workspace 鉴权接口、Windows 路径、HTML 清洗白名单、`code_run` 产物边界 |
+| `docs/20261105-changelog-停止生成内容保留.md` | **停止生成内容保留**：SSE 增量快照、stop 返回消息快照、前端停止态合并与空态判断 |
 | `docs/20261105-changelog-SkillP1.md` | **P1 已完成清单 + Skill/基础工具自测（先读这份）** |
 | `docs/20261105-Skill与基础工具设计与实施.md` | P1 设计：存储/隔离/渐进披露/工具边界/测试 |
 | `docs/20261105-changelog-P0.md` | P0 已完成清单 + 如何自测 |

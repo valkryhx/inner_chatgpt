@@ -112,7 +112,19 @@ export default function App() {
       const d = await api.getSession(id)
       // 若该会话正在本端流式生成，勿用服务器历史覆盖乐观渲染的消息
       if (streamSidRef.current === id) return
-      setMessages(d.messages)
+      setMessages((prev) => {
+        // 刚停止时服务端可能稍晚写入快照；若历史版本仍为空，而本地已有
+        // 同一 message_id 的可见内容，就保留本地，避免“停止后内容消失”。
+        return d.messages.map((serverMsg) => {
+          const localMsg = prev.find((m) => m.id === serverMsg.id)
+          if (!localMsg) return serverMsg
+          const serverHasVisible =
+            !!serverMsg.content || !!serverMsg.reasoning || (serverMsg.blocks || []).length > 0
+          const localHasVisible =
+            !!localMsg.content || !!localMsg.reasoning || (localMsg.blocks || []).length > 0
+          return !serverHasVisible && localHasVisible ? localMsg : serverMsg
+        })
+      })
     } catch (e) {
       setError(String(e))
     }
@@ -219,10 +231,20 @@ export default function App() {
 
   const stop = async () => {
     if (!activeId) return
+    const messageId = activeStreamMsgId || undefined
+    // 先把“用户已看到的本地消息”保留下来。stop 接口返回服务端已落库快照；
+    // 若服务端还来不及写，本地 snapshot 仍会显示，待重新加载时再与服务端合并。
+    let stoppedMsg: Message | null = null
     try {
-      await api.stop(activeId, genIdRef.current)
+      const r = await api.stop(activeId, genIdRef.current, messageId || undefined)
+      if (r.message) stoppedMsg = r.message
     } catch {
       /* ignore */
+    }
+    if (stoppedMsg) {
+      setMessages((prev) => prev.map((m) => (m.id === stoppedMsg!.id ? { ...stoppedMsg!, status: 'stopped' } : m)))
+    } else {
+      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, status: 'stopped' } : m)))
     }
     abortRef.current?.abort()
   }
@@ -356,7 +378,8 @@ export default function App() {
       } else if (ev.type === 'compaction') {
         setAutoCompacted((n) => n + 1)
       } else if (ev.type === 'done') {
-        patch(withSummaries({ ...assistantMsg, status: ev.status === 'stopped' ? 'stopped' : 'complete' }))
+        const status = ev.status === 'stopped' ? 'stopped' : ev.status === 'error' ? 'error' : 'complete'
+        patch(withSummaries({ ...assistantMsg, status }))
       } else if (ev.type === 'error') {
         setError(ev.error)
         patch({ ...assistantMsg, status: 'error' })
@@ -372,7 +395,13 @@ export default function App() {
       setActiveStreamMsgId(null)
       streamSidRef.current = null
       abortRef.current = null
-      setTimeout(() => loadMessages(sid!), 150)
+      // 停止是“用户主动结束”而不是失败：本地已经显示的文本/工具/图片必须保留。
+      // 等 stop 端点把快照写入 DB 后，再做一次合并式刷新。
+      if (ctrl.signal.aborted) {
+        setTimeout(() => loadMessages(sid!), 350)
+      } else {
+        setTimeout(() => loadMessages(sid!), 150)
+      }
       loadSessions()
     }
   }

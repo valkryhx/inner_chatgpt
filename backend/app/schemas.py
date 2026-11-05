@@ -68,6 +68,13 @@ class StopIn(BaseModel):
     generation_id: Optional[str] = None
 
 
+class StopResult(BaseModel):
+    ok: bool = True
+    stopped: int = 0
+    subagents_stopped: int = 0
+    message: Optional[MessageOut] = None
+
+
 class CompactResult(BaseModel):
     compacted: bool
     trigger: str = "manual"

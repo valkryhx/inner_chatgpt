@@ -114,6 +114,14 @@ export interface SessionDetail {
   messages: Message[]
 }
 
+/** stop 接口返回的已落库 assistant 快照，用于避免 abort 后历史覆盖本地内容。 */
+export interface StopResult {
+  ok: boolean
+  stopped: number
+  subagents_stopped: number
+  message?: Message | null
+}
+
 // 流式事件
 export type StreamEvent =
   | { type: 'message_start'; message_id: string }
@@ -127,7 +135,7 @@ export type StreamEvent =
   | { type: 'subagent_event'; agent_id: string; event: StreamEvent }
   | { type: 'subagent_end'; agent_id: string; name?: string; status: string; result?: string; turns?: number; error?: string }
   | { type: 'compaction'; summary_tokens: number; kept_messages: number; trigger?: string }
-  | { type: 'done'; message_id: string; status: string }
+  | { type: 'done'; message_id: string; status: 'complete' | 'stopped' | 'error' }
   | { type: 'error'; error: string }
 
 

@@ -225,14 +225,24 @@ function MessageRow({ msg }: { msg: Message }) {
   const hasReasoningBlocks = blocks.some((b) => b.type === 'reasoning')
   const isActiveStream = msg.status === 'streaming'
   const hasReasoning = !!msg.reasoning
+  const hasVisibleBlocks = blocks.some((b) => {
+    if (b.type === 'text' || b.type === 'reasoning') return !!b.text
+    if (b.type === 'tool') return true
+    if (b.type === 'chart' || b.type === 'summary') return true
+    if (b.type === 'subagent') {
+      const s = b as SubagentBlock
+      return !!(s.task || s.status || s.result || (s.events && s.events.length))
+    }
+    return false
+  })
+  // 空态判断必须覆盖所有可见块类型，不能只看 text/content；
+  // stopped 用单独的结束提示，避免同时闪烁“可能已中断”和“已停止”。
+  const hasVisibleContent = !!msg.content || hasReasoning || hasVisibleBlocks
   const isEmptyNoLive =
     !isUser &&
     msg.status !== 'streaming' &&
-    !msg.content &&
-    !hasReasoning &&
-    toolBlocks.length === 0 &&
-    summaryBlocks.length === 0 &&
-    chartBlocks.length === 0
+    msg.status !== 'stopped' &&
+    !hasVisibleContent
   return (
     <div className={'msg ' + (isUser ? 'user' : 'assistant') + (msg.status === 'error' ? ' has-error' : '')}>
       <div className="bubble-col">
@@ -256,7 +266,10 @@ function MessageRow({ msg }: { msg: Message }) {
             {msg.status === 'error' ? '（生成失败）' : '（未生成回复，可能已中断）'}
           </div>
         )}
-        {msg.status === 'stopped' && msg.content && <div className="session-meta">（已停止）</div>}
+        {msg.status === 'stopped' && hasVisibleContent && <div className="session-meta">（已停止）</div>}
+        {msg.status === 'stopped' && !hasVisibleContent && (
+          <div className="session-meta">（已停止，未生成内容）</div>
+        )}
       </div>
     </div>
   )
