@@ -1,0 +1,510 @@
+import { useEffect, useRef, useState } from 'react'
+import { api } from '../api'
+import type { LLMConfig, MCPServer, Skill } from '../types'
+
+interface Props {
+  onClose: () => void
+  onLlmChanged?: () => void
+}
+
+const emptyLlm = {
+  label: '',
+  wire_api: 'openai_responses',
+  base_url: 'https://api.deepseek.com',
+  api_key: '',
+  model: 'deepseek-v4.1-flash',
+  context_window: 128000,
+  max_tokens: 8192,
+  auto_compact_tokens: null as number | null,
+  hard_limit_tokens: null as number | null,
+  reasoning_effort: '',
+  is_default: true,
+}
+
+
+export default function SettingsModal({ onClose, onLlmChanged }: Props) {
+  const [tab, setTab] = useState<'llm' | 'mcp' | 'skills'>('llm')
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h2>我的设置</h2>
+          <button className="ghost-btn" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+        <div className="modal-tabs">
+          <button className={tab === 'llm' ? 'active' : ''} onClick={() => setTab('llm')}>
+            我的 APIKey
+          </button>
+          <button className={tab === 'mcp' ? 'active' : ''} onClick={() => setTab('mcp')}>
+            我的 MCP
+          </button>
+          <button className={tab === 'skills' ? 'active' : ''} onClick={() => setTab('skills')}>
+            我的 Skills
+          </button>
+        </div>
+        <div className="modal-body">
+          {tab === 'llm' ? (
+            <LlmSection onChanged={onLlmChanged} />
+          ) : tab === 'mcp' ? (
+            <McpSection />
+          ) : (
+            <SkillsSection />
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function LlmSection({ onChanged }: { onChanged?: () => void }) {
+  const [list, setList] = useState<LLMConfig[]>([])
+  const [form, setForm] = useState<{ [k: string]: any }>({ ...emptyLlm })
+  const [error, setError] = useState<string | null>(null)
+  const [editingId, setEditingId] = useState<string | null>(null)
+
+  const load = () => api.listLlmConfigs().then(setList).catch((e) => setError(String(e)))
+  useEffect(() => {
+    load()
+  }, [])
+
+  const reset = () => {
+    setForm({ ...emptyLlm })
+    setEditingId(null)
+  }
+
+  const save = async () => {
+    setError(null)
+    try {
+      const body: any = { ...form }
+      if (!body.api_key) delete body.api_key
+      if (editingId) await api.updateLlmConfig(editingId, body)
+      else await api.createLlmConfig(body)
+      reset()
+      await load()
+      onChanged?.()
+    } catch (e: any) {
+      setError(e?.message || String(e))
+    }
+  }
+
+  const edit = (c: LLMConfig) => {
+    setEditingId(c.id)
+    setForm({
+      label: c.label,
+      wire_api: c.wire_api,
+      base_url: c.base_url,
+      api_key: '',
+      model: c.model,
+      context_window: c.context_window,
+      max_tokens: c.max_tokens,
+      auto_compact_tokens: c.auto_compact_tokens ?? null,
+      hard_limit_tokens: c.hard_limit_tokens ?? null,
+      reasoning_effort: c.reasoning_effort,
+      is_default: c.is_default,
+    })
+  }
+
+  const del = async (id: string) => {
+    if (!confirm('删除该配置？')) return
+    await api.deleteLlmConfig(id)
+    await load()
+    onChanged?.()
+  }
+
+  const setF = (k: string, v: any) => setForm((f) => ({ ...f, [k]: v }))
+
+  return (
+    <div className="settings-section">
+      <p className="hint">配置你自己的模型端点。留空 api_key 表示编辑时不修改；默认配置将用于你的会话，未配置则回退系统默认模型。</p>
+      <div className="cfg-list">
+        {list.length === 0 && <div className="hint">尚未配置（将回退到系统默认模型）</div>}
+        {list.map((c) => (
+          <div className="cfg-item" key={c.id}>
+            <div>
+              <b>{c.label || c.model}</b> {c.is_default && <span className="tag">默认</span>}
+              <div className="cfg-meta">
+                {c.wire_api} · {c.model} · key {c.has_api_key ? c.api_key_masked : '未设置'}
+              </div>
+            </div>
+            <div className="cfg-actions">
+              <button className="ghost-btn" onClick={() => edit(c)}>
+                编辑
+              </button>
+              <button className="ghost-btn danger" onClick={() => del(c.id)}>
+                删除
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="form-grid">
+        <label>
+          <span>标签</span>
+          <input value={form.label} onChange={(e) => setF('label', e.target.value)} placeholder="如 我的DeepSeek" />
+        </label>
+        <label>
+          <span>协议</span>
+          <select value={form.wire_api} onChange={(e) => setF('wire_api', e.target.value)}>
+            <option value="openai_responses">openai_responses</option>
+            <option value="openai_chat">openai_chat</option>
+          </select>
+        </label>
+        <label className="full">
+          <span>Base URL</span>
+          <input value={form.base_url} onChange={(e) => setF('base_url', e.target.value)} />
+        </label>
+        <label className="full">
+          <span>API Key（{editingId ? '留空不改' : '必填'}）</span>
+          <input
+            type="password"
+            value={form.api_key}
+            onChange={(e) => setF('api_key', e.target.value)}
+            placeholder="sk-..."
+          />
+        </label>
+        <label>
+          <span>模型名</span>
+          <input value={form.model} onChange={(e) => setF('model', e.target.value)} />
+        </label>
+        <label>
+          <span>上下文窗口</span>
+          <input
+            type="number"
+            value={form.context_window}
+            onChange={(e) => setF('context_window', parseInt(e.target.value || '0'))}
+          />
+        </label>
+        <label>
+          <span>max_tokens</span>
+          <input type="number" value={form.max_tokens} onChange={(e) => setF('max_tokens', parseInt(e.target.value || '0'))} />
+        </label>
+        <label>
+          <span>自动压缩阈值 tokens（空=按窗口×0.90）</span>
+          <input
+            type="number"
+            value={form.auto_compact_tokens ?? ''}
+            placeholder={'派生 ' + Math.round((form.context_window || 0) * 0.9)}
+            onChange={(e) => setF('auto_compact_tokens', e.target.value === '' ? null : parseInt(e.target.value || '0'))}
+          />
+        </label>
+        <label>
+          <span>硬线阈值 tokens（空=按窗口×0.95）</span>
+          <input
+            type="number"
+            value={form.hard_limit_tokens ?? ''}
+            placeholder={'派生 ' + Math.round((form.context_window || 0) * 0.95)}
+            onChange={(e) => setF('hard_limit_tokens', e.target.value === '' ? null : parseInt(e.target.value || '0'))}
+          />
+        </label>
+        <label>
+          <span>reasoning_effort</span>
+          <input value={form.reasoning_effort} onChange={(e) => setF('reasoning_effort', e.target.value)} placeholder="可空" />
+        </label>
+        <label className="checkbox">
+          <input type="checkbox" checked={form.is_default} onChange={(e) => setF('is_default', e.target.checked)} />
+          <span>设为默认</span>
+        </label>
+      </div>
+      {error && <div className="auth-error">{error}</div>}
+      <div className="form-actions">
+        <button className="new-btn small" onClick={save}>
+          {editingId ? '保存修改' : '新增配置'}
+        </button>
+        {editingId && (
+          <button className="ghost-btn" onClick={reset}>
+            取消
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function McpSection() {
+  const [list, setList] = useState<MCPServer[]>([])
+  const [error, setError] = useState<string | null>(null)
+  const [effective, setEffective] = useState<string[]>([])
+  const [jsonText, setJsonText] = useState('')
+  const [notice, setNotice] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  // 用户一旦编辑，就不再被异步的“导出回显”覆盖（否则会清空刚粘贴的内容）
+  const dirtyRef = useRef(false)
+
+  const load = (syncText = false) => {
+    api.listMcpServers().then(setList).catch((e) => setError(String(e)))
+    api.mcpEffective().then((r) => setEffective(r.tools)).catch(() => {})
+    api
+      .mcpExport()
+      .then((r) => {
+        if (syncText || !dirtyRef.current) {
+          setJsonText(r.json)
+          dirtyRef.current = false
+        }
+      })
+      .catch(() => {})
+  }
+  useEffect(() => {
+    load(true)
+  }, [])
+
+  const formatJson = () => {
+    try {
+      setJsonText(JSON.stringify(JSON.parse(jsonText), null, 2))
+      setError(null)
+    } catch (e: any) {
+      setError('JSON 格式错误：' + (e?.message || String(e)))
+    }
+  }
+
+  const saveJson = async () => {
+    setError(null)
+    setNotice(null)
+    setBusy(true)
+    try {
+      const r = await api.mcpImport(jsonText)
+      setNotice(r.message || '导入完成')
+      dirtyRef.current = false
+      await load(true)
+    } catch (e: any) {
+      setError('导入失败：' + (e?.message || String(e)))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const del = async (id: string) => {
+    if (!confirm('删除该 MCP 服务器？')) return
+    await api.deleteMcpServer(id)
+    await load()
+  }
+
+  const EXAMPLE = `{
+  "mcpServers": {
+    "fetch": { "type": "stdio", "command": "npx", "args": ["-y", "mcp-fetch-server"] },
+    "tavily": { "type": "http", "url": "https://mcp.tavily.com/mcp/?tavilyApiKey=YOUR_KEY" }
+  }
+}`
+
+  return (
+    <div className="settings-section">
+      <p className="hint">
+        按业界标准 <code>mcp.json</code>（<code>mcpServers</code>）直接粘贴配置即可。
+        保存时按 <b>name</b> 增量合并：同名覆盖、新名新增，<b>不会清空</b>你已有的其它 MCP。
+        当前生效工具：<b>{effective.length ? effective.join(', ') : '无'}</b>
+        （无配置时默认使用内置 demo 工具集）
+      </p>
+
+      <div className="cfg-list">
+        {list.length === 0 && <div className="hint">尚未配置（使用内置 demo 工具）</div>}
+        {list.map((m) => (
+          <div className="cfg-item" key={m.id}>
+            <div>
+              <b>{m.name || m.transport}</b> <span className="tag">{m.transport}</span>
+              <div className="cfg-meta">
+                {m.transport === 'builtin_demo'
+                  ? '内置 demo 工具'
+                  : m.transport === 'stdio'
+                  ? [m.command, ...(m.args || [])].filter(Boolean).join(' ')
+                  : m.url}
+                {' · '}
+                {m.enabled ? '启用' : '停用'}
+              </div>
+            </div>
+            <div className="cfg-actions">
+              <button className="ghost-btn" onClick={() => api.updateMcpServer(m.id, { enabled: !m.enabled }).then(() => load())}>
+                {m.enabled ? '停用' : '启用'}
+              </button>
+              <button className="ghost-btn danger" onClick={() => del(m.id)}>
+                删除
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="form-grid">
+        <label className="full">
+          <span>mcp.json 配置（标准 mcpServers 格式）</span>
+          <textarea
+            className="mcp-json"
+            value={jsonText}
+            spellCheck={false}
+            onChange={(e) => {
+              dirtyRef.current = true
+              setJsonText(e.target.value)
+            }}
+            placeholder={EXAMPLE}
+          />
+        </label>
+      </div>
+      {error && <div className="auth-error">{error}</div>}
+      {notice && <div className="mcp-notice">{notice}</div>}
+      <div className="form-actions">
+        <button className="new-btn small" onClick={saveJson} disabled={busy}>
+          {busy ? '保存中…' : '保存（按 name 合并）'}
+        </button>
+        <button className="ghost-btn" onClick={formatJson}>
+          格式化
+        </button>
+        <button className="ghost-btn" onClick={() => setJsonText(EXAMPLE)}>
+          填入示例
+        </button>
+        <button
+          className="ghost-btn"
+          onClick={() => {
+            dirtyRef.current = false
+            load(true)
+          }}
+        >
+          重新载入当前配置
+        </button>
+      </div>
+    </div>
+  )
+}
+
+
+
+function SkillsSection() {
+  const [list, setList] = useState<Skill[]>([])
+  const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [editing, setEditing] = useState<string | null>(null)
+  const [form, setForm] = useState({ name: '', description: '', content: '' })
+  const [busy, setBusy] = useState(false)
+
+  const load = () => api.listSkills().then(setList).catch((e) => setError(String(e)))
+  useEffect(() => {
+    load()
+  }, [])
+
+  const reset = () => {
+    setEditing(null)
+    setForm({ name: '', description: '', content: '' })
+  }
+
+  const edit = async (s: Skill) => {
+    setEditing(s.name)
+    setForm({ name: s.name, description: s.description, content: '' })
+    try {
+      const detail = await api.getSkill(s.name)
+      setForm({ name: detail.name, description: detail.description, content: detail.content })
+    } catch (e: any) {
+      setError(e?.message || String(e))
+    }
+  }
+
+  const save = async () => {
+    setError(null)
+    setNotice(null)
+    if (!form.name.trim()) {
+      setError('Skill 名称不能为空')
+      return
+    }
+    setBusy(true)
+    try {
+      if (editing) {
+        const body: any = { name: form.name, description: form.description }
+        if (form.content) body.content = form.content
+        await api.updateSkill(editing, body)
+      } else {
+        await api.createSkill({ name: form.name, description: form.description, content: form.content })
+      }
+      reset()
+      await load()
+    } catch (e: any) {
+      setError(e?.message || String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const del = async (name: string) => {
+    if (!confirm(`删除 Skill「${name}」？`)) return
+    try {
+      await api.deleteSkill(name)
+      await load()
+    } catch (e: any) {
+      setError(e?.message || String(e))
+    }
+  }
+
+  return (
+    <div className="settings-section">
+      <p className="hint">
+        Skill 是可复用的操作手册（SKILL.md）。系统会把 Skill 名称与描述注入模型，
+        模型在任务匹配时会自动调用 <code>load_skill</code> 加载完整说明。
+        内置 Skill 只读；同名的「我的 Skill」会覆盖内置版本。
+      </p>
+      <div className="cfg-list">
+        {list.length === 0 && <div className="hint">暂无 Skill</div>}
+        {list.map((s) => (
+          <div className="cfg-item" key={`${s.source}:${s.name}`}>
+            <div>
+              <b>{s.name}</b> <span className="tag">{s.source === 'builtin' ? '内置' : '我的'}</span>
+              <div className="cfg-meta">
+                {s.description || '（无描述）'} · {s.chars} 字符
+              </div>
+            </div>
+            <div className="cfg-actions">
+              {s.source === 'user' && (
+                <>
+                  <button className="ghost-btn" onClick={() => edit(s)}>
+                    编辑
+                  </button>
+                  <button className="ghost-btn danger" onClick={() => del(s.name)}>
+                    删除
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="form-grid">
+        <label>
+          <span>名称（小写字母/数字/-/_/.)</span>
+          <input
+            value={form.name}
+            onChange={(e) => setForm({ ...form, name: e.target.value })}
+            placeholder="如 pdf-report"
+            disabled={!!editing}
+          />
+        </label>
+        <label>
+          <span>描述（一句话，决定模型是否选用它）</span>
+          <input
+            value={form.description}
+            onChange={(e) => setForm({ ...form, description: e.target.value })}
+            placeholder="如 把数据整理成 PDF 报告"
+          />
+        </label>
+        <label className="full">
+          <span>SKILL.md 正文（Markdown，不含 frontmatter）</span>
+          <textarea
+            className="mcp-json"
+            value={form.content}
+            spellCheck={false}
+            onChange={(e) => setForm({ ...form, content: e.target.value })}
+            placeholder={'# 步骤\n1. ...\n2. ...'}
+          />
+        </label>
+      </div>
+      {error && <div className="auth-error">{error}</div>}
+      {notice && <div className="mcp-notice">{notice}</div>}
+      <div className="form-actions">
+        <button className="new-btn small" onClick={save} disabled={busy}>
+          {busy ? '保存中…' : editing ? '保存修改' : '新增 Skill'}
+        </button>
+        {editing && (
+          <button className="ghost-btn" onClick={reset}>
+            取消
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}

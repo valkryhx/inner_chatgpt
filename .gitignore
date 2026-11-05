@@ -1,0 +1,37 @@
+# secrets
+llm.yaml
+llm.yaml.example.local
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# runtime data (SQLite + backups)
+backend/data/
+*.db
+*.db-wal
+*.db-shm
+*.db.premigrate.*
+
+# node / frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+pnpm-debug.log*
+
+# misc
+.DS_Store
+Thumbs.db
+
+# work / 临时测试产物
+work/
+
+# 文档与零碎资料：仅本地保留，不入 GitHub 仓库（内网资料）
+docs/
+misc/

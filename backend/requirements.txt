@@ -1,0 +1,28 @@
+# ============================================================
+# Backend dependencies (versions PINNED to the environment
+# verified on 2026-11-05). Install: pip install -r backend/requirements.txt
+# This project uses a self-built agent kernel (no LangChain / LangGraph).
+# Keep this file ASCII-only: pip decodes it with the OS locale,
+# so non-ASCII comments break `pip install -r` on GBK/Windows.
+# ============================================================
+
+# Web / API
+fastapi==0.135.1
+uvicorn[standard]==0.41.0
+python-multipart==0.0.20
+
+# HTTP client for the self-built LLM client (chat/responses wires)
+httpx==0.28.1
+
+# MCP
+fastmcp==2.14.4
+mcp==1.26.0
+
+# config / db
+pyyaml==6.0.3
+aiosqlite==0.22.0
+pydantic==2.14.1
+
+# auth
+pyjwt==2.12.1
+bcrypt==5.0.0
