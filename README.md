@@ -115,6 +115,10 @@ npm run build        # 生成 frontend/dist
 | `AGENT_HARD_LIMIT` | 覆盖硬线裁剪的 token 阈值 | 取该用户模型的 `hard_limit_tokens`，否则 95% 上下文窗口 |
 | `AGENT_MAX_TURNS` | 单轮请求内 Agent 循环的最大模型轮数（防死循环） | 48 |
 | `MCP_CONNECT_TIMEOUT` | 单个用户 MCP server 的连接超时（秒），超时/失败自动跳过 | 12 |
+| `SUBAGENT_MAX_DEPTH` | 子代理最大派生深度（防止无限套娃） | 2 |
+| `SUBAGENT_MAX_ACTIVE` | 每个会话同时存活的子代理上限（每会话，非全局） | 4 |
+| `SUBAGENT_TIMEOUT_S` | 单个子代理的墙钟超时（秒），超时置 stopped | 300 |
+| `SUBAGENT_MAX_TURNS` | 单个子代理的模型轮数上限 | 24 |
 
 示例：`AGENT_SOFT_LIMIT=200 python run.py`（可快速演示自动压缩）。
 
