@@ -581,6 +581,19 @@ textarea, input { caret-color: var(--clay); }
 .markdown-body a:hover { text-decoration: underline; }
 .markdown-body table td { font-variant-numeric: tabular-nums; }
 .markdown-body img { max-width: 100%; border-radius: var(--r-md); }
+.md-image { display: block; margin: 12px 0; }
+.md-image img {
+  display: block; max-width: 100%; height: auto; border-radius: var(--r-md);
+  border: 1px solid var(--line); background: var(--surface);
+}
+.md-image-loading, .md-image-blocked { display: block; margin: 12px 0; }
+.md-image-placeholder {
+  display: inline-flex; align-items: center; min-height: 48px; padding: 8px 12px;
+  color: var(--muted); font-size: 12.5px; background: var(--surface);
+  border: 1px dashed var(--line-strong); border-radius: var(--r-md);
+}
+.md-image-blocked { color: var(--muted); font-size: 12.5px; }
+.md-image-error { display: block; margin-top: 2px; color: var(--danger); font-size: 12px; }
 .markdown-body hr { border: none; border-top: 1px solid var(--line); margin: 18px 0; }
 .md-img-blocked { color: var(--muted); font-size: 12.5px; }
 

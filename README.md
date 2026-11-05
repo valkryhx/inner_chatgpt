@@ -6,7 +6,7 @@ APIKey（模型端点）与 MCP 配置，互不可见。
 技术栈：**FastAPI（自研 Agent 内核）+ React**，**不依赖 LangChain / LangGraph**。
 能力包含：登录/注册 + 会话按用户隔离 + 会话级模型切换 + 用户级 APIKey / MCP 配置 +
 Web 前端 + Agent 后端（自研 LLM 客户端 + 工具调用循环）+ SQLite 会话持久化 / resume / 删除 +
-上下文压缩 + FastMCP（标准 mcp.json）工具接入 + **Skill 模块**（SKILL.md 渐进披露） + **内置本地工具**（file_read / file_write / file_patch / list_files / code_run / load_skill） + **子代理（Subagent）**（进程内 asyncio 运行时：spawn / wait / read / list / close 五个编排工具；子代理继承全部业务工具与 MCP，但不能再派生子代理；事件合并进同一 SSE，前端可折叠卡片）。
+上下文压缩 + FastMCP（标准 mcp.json）工具接入 + **Skill 模块**（SKILL.md 渐进披露） + **内置本地工具**（file_read / file_write / file_patch / list_files / code_run / load_skill） + **子代理（Subagent）**（进程内 asyncio 运行时：spawn / wait / read / list / close 五个编排工具；子代理继承全部业务工具与 MCP，但不能再派生子代理；事件合并进同一 SSE，前端可折叠卡片）；Markdown 图片 `![](...)` 支持 workspace 本地路径（带鉴权读取）与远程 URL。
 
 > 界面示意：同一个会话内 Agent 先查数（工具卡片）再画图（ECharts 渲染，可「下载 PNG」），
 > 多轮对话与图表一起按会话持久化；左侧会话列表按用户隔离。
@@ -288,6 +288,7 @@ backend/
       auth.py       # /api/auth register/login/logout/me/refresh
       me.py         # /api/me 用户级 LLM 配置 + MCP 服务器
       skills.py     # /api/me/skills CRUD + /api/skills 内置列表
+      media.py      # /api/me/workspace-image：Markdown 图片鉴权读取
       sessions.py   # /api/sessions CRUD（按 user_id 隔离）
       chat.py       # /api/sessions/{id}/messages(SSE) /stop /compact /mcp/tools
   mcp_server/
@@ -304,7 +305,8 @@ backend/
 frontend/
   src/
     App.tsx / api.ts / types.ts
-    components/Sidebar.tsx MessageList.tsx Composer.tsx LoginPage.tsx SettingsModal.tsx SubagentCard.tsx
+    components/Sidebar.tsx MessageList.tsx Composer.tsx LoginPage.tsx SettingsModal.tsx
+               SubagentCard.tsx Markdown.tsx MarkdownImage.tsx
 ```
 
 ## API 概览
