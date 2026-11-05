@@ -46,9 +46,9 @@ export default function LoginPage({ onAuthed }: Props) {
     <div className="auth-page">
       <div className="auth-card">
         <div className="auth-brand">
-          <div className="auth-logo">WA</div>
-          <h1>Web Agent</h1>
-          <p>多用户 Agent 工作台</p>
+          <div className="auth-logo">H</div>
+          <h1>Hlaudz</h1>
+          <p>HX 的智能 Agent 工作台</p>
         </div>
         <div className="auth-tabs">
           <button className={mode === 'login' ? 'active' : ''} onClick={() => setMode('login')}>

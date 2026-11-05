@@ -473,7 +473,7 @@ export default function App() {
       />
       <div className="main">
         <div className="main-header">
-          <div className="title">{activeSession?.title || 'Web Agent'}</div>
+          <div className="title">{activeSession?.title || 'Hlaudz'}</div>
           {/* 模型选择器始终可见：没有会话时也能选，选中的值作为「新会话的默认模型」。
               之前只在 activeSession 存在时渲染，导致刚配置完模型、还没发消息时完全看不到下拉框。 */}
           <label className="model-picker" title={activeSession ? '切换本会话使用的模型（会话级）' : '新会话将使用该模型'}>

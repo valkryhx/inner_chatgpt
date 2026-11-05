@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI):
         set_hub(None)
 
 
-app = FastAPI(title="Multi-User Web Agent (self-built kernel)", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Hlaudz (self-built agent kernel)", version="0.3.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

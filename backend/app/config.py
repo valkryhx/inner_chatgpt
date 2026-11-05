@@ -73,7 +73,7 @@ class LLMSettings:
 def llm_yaml_available() -> bool:
     """仓库内 llm.yaml 是否存在。
 
-    本项目定位为多用户 Web Agent：每个用户在自己的「设置 -> 我的模型」里配置
+    本项目定位为多用户 Hlaudz：每个用户在自己的「设置 -> 我的模型」里配置
     base_url / api_key / model，因此 llm.yaml **不是必需文件**，也不入库。
     它仅作为本机可选的兜底 profile 存在。
     """
