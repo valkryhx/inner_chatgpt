@@ -20,6 +20,7 @@ from .agent_loop import AgentLoop
 from .history_store import get_history_store
 from .builtin_tools import build_builtin_tools
 from .skill_store import build_skill_prompt
+from .subagent.prompts import ROOT_AGENT_HINT
 
 SYSTEM_PROMPT = "你是一个中文智能助手，运行在多用户 Web Agent 平台中，可以调用工具完成任务。回答简洁、准确、直接；需要事实或计算时优先使用工具，不要臆测。\n\n## 工具使用与自纠（重要）\n- 工具的参数定义以系统实际提供的为准；不要凭记忆编造参数名。不确定就先调用能列信息/查结构的工具。\n- 工具调用失败或返回错误是正常现象：先读懂错误信息，再决定下一步，不要直接放弃。\n- 失败升级策略：第 1 次失败→读错误、理解原因并改对参数；仍失败→换等价工具或换思路（换一个能达成同一目标的工具）；再失败→把问题如实告诉用户并说明已尝试的方案。禁止原样重复同一个失败调用。\n- 多步任务边做边核对上一步结果是否符合预期，再继续下一步；不确定就用工具探测，而不是猜测。\n- 能用一步确定性工具解决的，不要绕远；工具给出结构化结果时，以结果为准作答。\n- 若某工具返回的是可直接渲染的结果（例如含 type 字段的图表规格），该结果已由前端展示；正文只做文字解读与结论，不要重复粘贴原始 JSON 或代码块。\n\n## 本地工作区与 Skill\n- 你有 file_read / file_write / file_patch / list_files / code_run 等本地工具，文件读写都被限制在你的个人 workspace 内。\n- 需要计算、跑脚本或验证结果时优先用 code_run（Python 优先），不要凭空心算大数或假设代码能跑通。\n- 系统提示若列出 [Available Skills]，当任务与某个 Skill 匹配时先调用 load_skill 加载其完整说明，再按说明执行。"
 
@@ -121,7 +122,9 @@ class UserRuntime:
             skill_block = build_skill_prompt(user_id)
         except Exception:
             skill_block = ""
-        system_prompt = SYSTEM_PROMPT + skill_block
+        # 子代理编排规则只进 root agent 的 system prompt；子代理自己走
+        # subagent.prompts.build_child_system_prompt()，不会看到这段。
+        system_prompt = SYSTEM_PROMPT + skill_block + "\n\n" + ROOT_AGENT_HINT
         self.model = await build_user_model(user_id, llm_config_id, system_prompt=system_prompt)
         self.toolset = await build_user_toolset(user_id)
         # Built-in tools first so MCP tools can never shadow file_read / load_skill etc.

@@ -62,19 +62,34 @@ def shared_skills_root() -> Path:
     return SHARED_SKILLS_DIR
 
 
-def safe_workspace_path(user_id: str, rel_path: str) -> Path:
-    """Resolve a model-supplied path inside the user's workspace.
+def write_root_for(user_id: str, root: str = "") -> Path:
+    """Resolve (and create) the effective WRITE root inside a user's workspace.
+
+    ``root`` 为空 -> 用户 workspace 根；否则是该根下的一个相对子目录
+    （如 ``.subagents/<session>/<agent>``），用于把子代理产物隔离。
+    任何越界都会抛 PathSecurityError。
+    """
+    base = user_workspace(user_id)
+    if not (root or "").strip():
+        return base
+    target = _resolve_under(base, base / root.strip())
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def safe_workspace_path(user_id: str, rel_path: str, *, root: str = "") -> Path:
+    """Resolve a model-supplied path inside the user's workspace (or a sub-root).
 
     Accepts relative paths (``a/b.txt``) and absolute paths that already point
-    inside the workspace; anything else is rejected.
+    inside the effective root; anything else is rejected.
     """
-    root = user_workspace(user_id)
+    base = write_root_for(user_id, root)
     raw = (rel_path or "").strip()
     if not raw:
         raise PathSecurityError("path 不能为空")
     p = Path(raw)
-    candidate = p if p.is_absolute() else (root / p)
-    return _resolve_under(root, candidate)
+    candidate = p if p.is_absolute() else (base / p)
+    return _resolve_under(base, candidate)
 
 
 def safe_read_roots(user_id: str) -> list[Path]:

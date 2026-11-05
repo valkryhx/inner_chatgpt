@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { ChartBlock, Message, MessageBlock, SummaryBlock, ToolBlock } from '../types'
+import type { ChartBlock, Message, MessageBlock, SubagentBlock, SummaryBlock, ToolBlock } from '../types'
 import ChartView from './ChartView'
 import Markdown from './Markdown'
+import SubagentCard from './SubagentCard'
 
 interface Props {
   messages: Message[]
@@ -185,6 +186,8 @@ function renderBlocks(blocks: MessageBlock[], isUser: boolean, streaming: boolea
       out.push(<ReasoningSection key={'reason_' + i} text={block.text} live={i === liveIdx} />)
     } else if (block.type === 'chart') {
       out.push(<ChartView key={'chart_' + i} spec={block.spec} />)
+    } else if (block.type === 'subagent') {
+      out.push(<SubagentCard key={'sub_' + i + '_' + (block as SubagentBlock).agent_id} block={block} />)
     } else if (block.type === 'text') {
       const text = block.text || ''
       if (text) {

@@ -18,6 +18,13 @@ from .schemas import HealthOut
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_db()
+    # 子代理侧链表：幂等建表 + 把上次进程遗留的 running 收敛为 errored
+    try:
+        from .subagent import store as subagent_store
+        await subagent_store.init_tables()
+        await subagent_store.mark_stale_running_as_errored("server restart")
+    except Exception:
+        pass
     hub = RuntimeHub()
     await hub.startup()
     set_hub(hub)

@@ -326,6 +326,33 @@ export default function App() {
       } else if (ev.type === 'chart') {
         blocks = appendBlock(blocks, { type: 'chart', spec: ev.spec })
         patch({ ...assistantMsg, blocks: [...blocks] })
+      } else if (ev.type === 'subagent_start') {
+        blocks = appendBlock(blocks, {
+          type: 'subagent', agent_id: ev.agent_id, name: ev.name, role: ev.role,
+          status: 'running', task: ev.task, events: [], result: '', turns: 0,
+        })
+        patch({ ...assistantMsg, blocks: [...blocks] })
+      } else if (ev.type === 'subagent_event') {
+        const inner: any = ev.event
+        blocks = blocks.map((b: any) => {
+          if (b.type !== 'subagent' || b.agent_id !== ev.agent_id) return b
+          const events = [...(b.events || [])]
+          if (inner.type === 'text_delta') events.push({ kind: 'text', text: inner.text })
+          else if (inner.type === 'thinking_delta') events.push({ kind: 'reasoning', text: inner.text })
+          else if (inner.type === 'tool_start')
+            events.push({ kind: 'tool_start', id: inner.id, name: inner.name, input: inner.input })
+          else if (inner.type === 'tool_result')
+            events.push({ kind: 'tool_result', id: inner.id, name: inner.name, result: inner.content, is_error: inner.is_error })
+          return { ...b, events }
+        })
+        patch({ ...assistantMsg, blocks: [...blocks] })
+      } else if (ev.type === 'subagent_end') {
+        blocks = blocks.map((b: any) =>
+          b.type === 'subagent' && b.agent_id === ev.agent_id
+            ? { ...b, status: ev.status, result: ev.result || b.result, turns: ev.turns ?? b.turns, error: ev.error || b.error }
+            : b,
+        )
+        patch({ ...assistantMsg, blocks: [...blocks] })
       } else if (ev.type === 'compaction') {
         setAutoCompacted((n) => n + 1)
       } else if (ev.type === 'done') {

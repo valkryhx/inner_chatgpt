@@ -53,14 +53,32 @@
 - 单测 23 项通过（原 12 + 新增 11），前端 `npm run build` 通过，真实 LLM E2E 验证
   `load_skill → file_write → code_run` 全链路。
 
-**P2（下一步，尚未开始）：** 继续增强内核，优先级建议
-subagent / team / task 工具 → 计划模式 → goal → hooks。浏览器控制暂不做。
+**P2：Subagent（进程内 asyncio 子代理运行时）—— 已完成（2026-11-05）。**
+
+已完成内容（详见 `docs/20261105-changelog-SubagentP2.md`）：
+
+- 新包 `backend/app/subagent/`：`context`（AgentContext 多租户身份贯穿）/`store`（subagent_runs +
+  subagent_messages 侧链表）/`events`（StopSignal + EventBuffer 单队列）/
+  `capabilities`（闭世界工具裁剪）/`registry`（深度/槽位/重名/淘汰护栏）/
+  `runtime`（子代理 Runtime + 写根隔离）/`host`（spawn/wait/read/list/close 生命周期）/
+  `tools`（5 个编排工具）/`prompts`（root + child 提示词）/`session`（每轮派生 TurnRuntime）。
+- 5 个编排工具只注入 root agent；子代理 registry 里**根本不存在它们**（prompt 不是安全边界）。
+- 子代理用**独立侧链 history**，不写 `session_history`，避免主对话被中间产物污染。
+- 子代理事件并入主对话同一条 SSE（`subagent_start` / `subagent_event` / `subagent_end`），
+  前端新增可折叠 `SubagentCard`。
+- 停止级联（主 stop → 所有子代理 stop + cancel）、`wait` 超时不杀子、墙钟 `SUBAGENT_TIMEOUT_S`、
+  `wait_agent.since_event_seq` 增量事件。
+- 单测 64 项通过（原 42 + 新增 22），前端 `npm run build` 通过，3 次真实 LLM E2E + Playwright UI 验证。
+
+**P3（下一步）：** team / task 工具 → 计划模式 → goal → hooks。浏览器控制暂不做。
+长出来的位置见 `docs/20261105-Subagent调研与设计方案.md` §14。
 路线图见 `docs/20261105-去LangChain依赖-决策记录.md`。
 
 ### 0.2 必读文档（按顺序）
 
 | 文档 | 用途 |
 |---|---|
+| `docs/20261105-changelog-SubagentP2.md` | **P2 已完成清单 + 自测（最新，先读这份）** |
 | `docs/20261105-changelog-SkillP1.md` | **P1 已完成清单 + Skill/基础工具自测（先读这份）** |
 | `docs/20261105-Skill与基础工具设计与实施.md` | P1 设计：存储/隔离/渐进披露/工具边界/测试 |
 | `docs/20261105-changelog-P0.md` | P0 已完成清单 + 如何自测 |
@@ -72,6 +90,7 @@ subagent / team / task 工具 → 计划模式 → goal → hooks。浏览器控
 | `docs/20261105-changelog-前端批次2.md` | **前端批次 2 已完成**：文本去气泡（assistant 零容器 / user 保留输入容器）、工具改步骤行 StepGroup、思考默认折叠、`--measure` 宽度自适应 |
 | `docs/20261105-changelog-侧栏身份区与设置弹窗.md` | **侧栏身份区重做 + 设置弹窗定高**：全名替字母头像、整行可点进设置、登出降级为次要动作；modal 固定高度，切 tab 不跳尺寸 |
 | `docs/20261105-Skill目录包导入与公用技能设计与实施.md` | **Skill 目录包导入 + 公用技能层**：三层模型 builtin/shared/user、zip 安全解压（穿越/软链/炸弹防护）、`backend/skills_shared/` 公用目录、已导入 2 个 Codex 技能 |
+| `docs/20261105-Subagent调研与设计方案.md` | **P2 设计文档（已实施）**：GA 进程树 vs Aivory 子任务 的调研对比、进程内 asyncio subagent 架构、`AgentContext` 多租户贯穿、5 个编排工具契约、停止/超时/失败语义、前端 subagent block、6 阶段实施蓝本与测试计划 |
 
 ### 0.3 目录约定（写文件前先确认放在哪个目录）
 

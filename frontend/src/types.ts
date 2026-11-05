@@ -65,7 +65,38 @@ export interface ReasoningBlock {
   text: string
 }
 
-export type MessageBlock = TextBlock | ToolBlock | SummaryBlock | ChartBlock | ReasoningBlock
+/** 子代理过程事件（卡片内时间线用） */
+export interface SubagentEventItem {
+  kind: 'text' | 'reasoning' | 'tool_start' | 'tool_result'
+  id?: string
+  name?: string
+  text?: string
+  input?: unknown
+  result?: string
+  is_error?: boolean
+}
+
+/** 子代理卡片：一次 spawn 对应一张卡 */
+export interface SubagentBlock {
+  type: 'subagent'
+  agent_id: string
+  name: string
+  role: string
+  status: 'running' | 'completed' | 'errored' | 'stopped' | 'closed'
+  task: string
+  events: SubagentEventItem[]
+  result?: string
+  turns?: number
+  error?: string
+}
+
+export type MessageBlock =
+  | TextBlock
+  | ToolBlock
+  | SummaryBlock
+  | ChartBlock
+  | ReasoningBlock
+  | SubagentBlock
 
 export interface Message {
   id: string
@@ -92,6 +123,9 @@ export type StreamEvent =
   | { type: 'tool_input'; id: string; partial_json: string }
   | { type: 'tool_result'; id: string; name: string; content: string; is_error?: boolean }
   | { type: 'chart'; spec: ChartSpec }
+  | { type: 'subagent_start'; agent_id: string; name: string; role: string; task: string }
+  | { type: 'subagent_event'; agent_id: string; event: StreamEvent }
+  | { type: 'subagent_end'; agent_id: string; name?: string; status: string; result?: string; turns?: number; error?: string }
   | { type: 'compaction'; summary_tokens: number; kept_messages: number; trigger?: string }
   | { type: 'done'; message_id: string; status: string }
   | { type: 'error'; error: string }

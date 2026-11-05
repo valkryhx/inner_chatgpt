@@ -25,12 +25,43 @@ class RuntimeHub:
         # key = (user_id, model_key); model_key = session's LLM config id ("" = follow default)
         self._runtimes: dict[tuple[str, str], UserRuntime] = {}
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # 活跃的子代理宿主：key = (session_id, generation_id)
+        # 用途：用户点「停止」时级联停止所有子代理；一次生成结束后清理。
+        self._subagent_hosts: dict[tuple[str, str], "object"] = {}
+
+    # ---------------- subagent hosts ----------------
+    def register_subagent_host(self, session_id: str, generation_id: str, host: "object") -> None:
+        self._subagent_hosts[(session_id, generation_id)] = host
+
+    def unregister_subagent_host(self, session_id: str, generation_id: str) -> None:
+        self._subagent_hosts.pop((session_id, generation_id), None)
+
+    def get_subagent_host(self, session_id: str, generation_id: str):
+        return self._subagent_hosts.get((session_id, generation_id))
+
+    async def stop_subagent_generation(self, session_id: str, generation_id: str) -> int:
+        """级联停止：把该代所有子代理标记停止（异步取消）。"""
+        host = self._subagent_hosts.get((session_id, generation_id))
+        if host is None:
+            return 0
+        try:
+            n = len(host.list_agents())
+            await host.stop_all()
+            return n
+        except Exception:
+            return 0
 
     async def startup(self) -> None:
         self.store = get_history_store()
         await self.store.init()
 
     async def shutdown(self) -> None:
+        for host in list(self._subagent_hosts.values()):
+            try:
+                await host.close_all()
+            except Exception:
+                pass
+        self._subagent_hosts.clear()
         for key in list(self._runtimes.keys()):
             await self._runtimes[key].close()
         self._runtimes.clear()

@@ -26,6 +26,7 @@ from .workspace import (
     safe_read_path,
     safe_workspace_path,
     user_workspace,
+    write_root_for,
 )
 
 DEFAULT_READ_LINES = 200
@@ -78,9 +79,10 @@ def _read_impl(user_id: str, path: str, start: int = 1, count: int = DEFAULT_REA
 
 
 # ---------------- file_write ----------------
-def _write_impl(user_id: str, path: str, content: str, mode: str = "overwrite") -> str:
+def _write_impl(user_id: str, path: str, content: str, mode: str = "overwrite",
+                *, root: str = "") -> str:
     try:
-        target = safe_workspace_path(user_id, path)
+        target = safe_workspace_path(user_id, path, root=root)
     except PathSecurityError as e:
         return _err(str(e))
     mode = (mode or "overwrite").lower()
@@ -106,9 +108,10 @@ def _write_impl(user_id: str, path: str, content: str, mode: str = "overwrite") 
 
 
 # ---------------- file_patch ----------------
-def _patch_impl(user_id: str, path: str, old_content: str, new_content: str) -> str:
+def _patch_impl(user_id: str, path: str, old_content: str, new_content: str,
+                *, root: str = "") -> str:
     try:
-        target = safe_workspace_path(user_id, path)
+        target = safe_workspace_path(user_id, path, root=root)
     except PathSecurityError as e:
         return _err(str(e))
     if not target.is_file():
@@ -200,8 +203,8 @@ def _run_code_sync(code: str, code_type: str, cwd: Path, timeout: int) -> dict:
 
 
 async def _run_code_impl(user_id: str, code: str, code_type: str = "python",
-                         timeout: int = DEFAULT_TIMEOUT) -> str:
-    cwd = user_workspace(user_id)
+                         timeout: int = DEFAULT_TIMEOUT, *, root: str = "") -> str:
+    cwd = write_root_for(user_id, root)
     timeout = max(1, min(int(timeout or DEFAULT_TIMEOUT), MAX_TIMEOUT))
     result = await asyncio.to_thread(_run_code_sync, code, (code_type or "python").lower(), cwd, timeout)
     if result.get("status") == "error" and "output" not in result:
@@ -222,8 +225,14 @@ def _load_skill_impl(user_id: str, skill: str, args: str = "") -> str:
     return info["content"]
 
 
-def build_builtin_tools(user_id: str) -> list[Tool]:
-    """Create the built-in tool set bound to one user (closures capture user_id)."""
+def build_builtin_tools(user_id: str, *, write_root: str | None = None) -> list[Tool]:
+    """Create the built-in tool set bound to one user (closures capture user_id).
+
+    ``write_root`` 可选：限定「写」类工具（file_write / file_patch / code_run）的根目录。
+    subagent 用它把自己的产物隔离到 ``.subagents/<session>/<agent>`` 下，
+    避免多个子代理并发写同一个 workspace 互相覆盖（设计文档 §7.2）。
+    """
+    root = write_root or ""
 
     async def file_read(args: dict) -> str:
         return _read_impl(
@@ -241,6 +250,7 @@ def build_builtin_tools(user_id: str) -> list[Tool]:
             str(args.get("path", "")),
             args.get("content", ""),
             str(args.get("mode", "overwrite") or "overwrite"),
+            root=root,
         )
 
     async def file_patch(args: dict) -> str:
@@ -249,6 +259,7 @@ def build_builtin_tools(user_id: str) -> list[Tool]:
             str(args.get("path", "")),
             str(args.get("old_content", "")),
             str(args.get("new_content", "")),
+            root=root,
         )
 
     async def list_files(args: dict) -> str:
@@ -265,6 +276,7 @@ def build_builtin_tools(user_id: str) -> list[Tool]:
             str(args.get("code", "")),
             str(args.get("type", "python") or "python"),
             int(args.get("timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
+            root=root,
         )
 
     async def load_skill(args: dict) -> str:
