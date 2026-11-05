@@ -8,13 +8,11 @@ APIKey（模型端点）与 MCP 配置，互不可见。
 Web 前端 + Agent 后端（自研 LLM 客户端 + 工具调用循环）+ SQLite 会话持久化 / resume / 删除 +
 上下文压缩 + FastMCP（标准 mcp.json）工具接入 + **Skill 模块**（SKILL.md 渐进披露） + **内置本地工具**（file_read / file_write / file_patch / list_files / code_run / load_skill）。
 
-![界面演示](misc/demo_1.png)
-
-> 上图：同一个会话内 Agent 先查数（工具卡片）再画图（ECharts 渲染，可「下载 PNG」），
+> 界面示意：同一个会话内 Agent 先查数（工具卡片）再画图（ECharts 渲染，可「下载 PNG」），
 > 多轮对话与图表一起按会话持久化；左侧会话列表按用户隔离。
 
 > 本项目由 `jiakuan_langchain` 快照演化而来，现已去除 LangChain / LangGraph，改为借鉴
-> `D:\git_codes\GenericAgent` 设计、在本项目自研实现 Agent 内核（详见 `docs/20261105-去LangChain依赖-*`）。
+> `D:\git_codes\GenericAgent` 设计、在本项目自研实现 Agent 内核。
 > 本 README 只讲怎么跑。
 
 ---
@@ -299,11 +297,6 @@ frontend/
   src/
     App.tsx / api.ts / types.ts
     components/Sidebar.tsx MessageList.tsx Composer.tsx LoginPage.tsx SettingsModal.tsx
-docs/
-  20261105-changelog-P0.md              # P0 已完成清单 + 自测方法（先读）
-  20261105-去LangChain依赖-决策记录.md   # 决策 + P0~P8 路线图
-  20261105-去LangChain依赖-实施文档.md   # P0 实施蓝本
-  20261105-LangChain-LangGraph依赖审计.md # 旧代码审计
 ```
 
 ## API 概览
