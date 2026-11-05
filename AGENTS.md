@@ -69,6 +69,7 @@ subagent / team / task 工具 → 计划模式 → goal → hooks。浏览器控
 | `docs/20261105-LangChain-LangGraph依赖审计.md` | 旧代码审计（用在哪、如何替换） |
 | `docs/20261105-前端审美提升设计.md` | **前端审美提升方案（Design System v2）**：现状诊断、暖纸+陶土配色 token、去气泡消息流、配色对比度实测、分批实施与验收清单 |
 | `docs/20261105-changelog-前端批次1.md` | **前端批次 1 已完成**：Token 层替换（暖纸+陶土）、四档位回归通过、两个响应式缺陷修复 |
+| `docs/20261105-changelog-前端批次2.md` | **前端批次 2 已完成**：文本去气泡（assistant 零容器 / user 保留输入容器）、工具改步骤行 StepGroup、思考默认折叠、`--measure` 宽度自适应 |
 
 ### 0.3 目录约定（写文件前先确认放在哪个目录）
 
