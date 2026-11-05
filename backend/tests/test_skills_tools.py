@@ -299,3 +299,57 @@ def test_shared_skill_readable_by_file_read(tmp_path, monkeypatch):
     tools = {t.name: t for t in build_builtin_tools("u1")}
     out = run(tools["file_read"].call({"path": str(tmp_path / "shared" / "pub" / "references" / "guide.md")}))
     assert "GUIDE-CONTENT" in out
+
+
+# ---------------- runtime cache invalidation ----------------
+
+def test_runtime_invalidate_all_drops_every_user():
+    """Imported shared skills must invalidate ALL cached runtimes, not one user."""
+    from app.runtime import RuntimeHub
+
+    class FakeRuntime:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    async def scenario():
+        hub = RuntimeHub()
+        a, b, c = FakeRuntime(), FakeRuntime(), FakeRuntime()
+        hub._runtimes[("u1", "")] = a
+        hub._runtimes[("u1", "llm_x")] = b
+        hub._runtimes[("u2", "")] = c
+
+        dropped = await hub.invalidate_all()
+        assert dropped == 3
+        assert hub._runtimes == {}
+        assert a.closed and b.closed and c.closed
+
+        # 幂等：再调一次不会报错，也没什么可删
+        assert await hub.invalidate_all() == 0
+
+    run(scenario())
+
+
+def test_runtime_invalidate_scoped_to_user():
+    from app.runtime import RuntimeHub
+
+    class FakeRuntime:
+        def __init__(self):
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    async def scenario():
+        hub = RuntimeHub()
+        a, b = FakeRuntime(), FakeRuntime()
+        hub._runtimes[("u1", "")] = a
+        hub._runtimes[("u2", "")] = b
+        await hub.invalidate("u1")
+        assert ("u1", "") not in hub._runtimes
+        assert ("u2", "") in hub._runtimes
+        assert a.closed and not b.closed
+
+    run(scenario())

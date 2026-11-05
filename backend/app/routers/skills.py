@@ -147,8 +147,17 @@ async def import_shared_skill(
         raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    # 公用技能对所有用户可见，逐用户失效太贵，这里只提示需要重启/下一轮生效。
-    return {"ok": True, "installed": names}
+    # 公用技能影响所有用户：L1 索引在 UserRuntime.build() 时烤进各自 system prompt，
+    # 必须清空全部运行中的 Runtime，否则已登录用户看不到新技能（直到重启）。
+    dropped = 0
+    try:
+        from ..runtime import get_hub
+        hub = get_hub()
+        if hub:
+            dropped = await hub.invalidate_all()
+    except Exception:
+        pass
+    return {"ok": True, "installed": names, "runtimes_invalidated": dropped}
 
 
 @router.get("/me/skills", response_model=list[SkillOut])

@@ -59,6 +59,25 @@ class RuntimeHub:
                 if ur is not None:
                     await ur.close()
 
+    async def invalidate_all(self) -> int:
+        """Drop every cached runtime so the next turn rebuilds system prompts.
+
+        Needed after a change that affects ALL users — chiefly importing a
+        shared/public skill, whose L1 index is baked into each user's system
+        prompt at build time. Returns how many runtimes were dropped.
+        """
+        keys = list(self._runtimes.keys())
+        dropped = 0
+        for key in keys:
+            ur = self._runtimes.pop(key, None)
+            if ur is not None:
+                dropped += 1
+                try:
+                    await ur.close()
+                except Exception:
+                    pass
+        return dropped
+
 
 # ---------------- stop registry ----------------
 _stop_events: dict[str, dict[str, asyncio.Event]] = {}
