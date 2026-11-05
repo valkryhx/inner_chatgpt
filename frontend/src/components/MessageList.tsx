@@ -160,8 +160,11 @@ function SummaryCard({ block }: { block: SummaryBlock }) {
 
 /* ---------- 按 blocks 顺序渲染（连续 tool 合并成组，但绝不跨 text/reasoning 重排） ---------- */
 
-function renderBlocks(blocks: MessageBlock[], isUser: boolean, live: boolean): ReactNode[] {
+function renderBlocks(blocks: MessageBlock[], isUser: boolean, streaming: boolean): ReactNode[] {
   const out: ReactNode[] = []
+  // 只有“最后一个块 + 消息仍在流式”才算真正进行中；
+  // 否则同一轮里较早的思考块会被误判为 live，凭空长出橘色光标。
+  const liveIdx = streaming ? blocks.length - 1 : -1
   let i = 0
   while (i < blocks.length) {
     const block = blocks[i]
@@ -179,7 +182,7 @@ function renderBlocks(blocks: MessageBlock[], isUser: boolean, live: boolean): R
     if (block.type === 'summary') {
       out.push(<SummaryCard key={'sum_' + i} block={block} />)
     } else if (block.type === 'reasoning') {
-      out.push(<ReasoningSection key={'reason_' + i} text={block.text} live={live} />)
+      out.push(<ReasoningSection key={'reason_' + i} text={block.text} live={i === liveIdx} />)
     } else if (block.type === 'chart') {
       out.push(<ChartView key={'chart_' + i} spec={block.spec} />)
     } else if (block.type === 'text') {
@@ -241,7 +244,8 @@ function MessageRow({ msg }: { msg: Message }) {
             </div>
           )
         )}
-        {isActiveStream && !msg.content && !hasReasoning && chartBlocks.length === 0 && (
+        {/* 已有 live 思考块/思考内容时不再追加一个「正在思考」，避免同一状态重复出现 */}
+        {isActiveStream && !msg.content && !hasReasoning && !hasReasoningBlocks && chartBlocks.length === 0 && (
           <div className="typing">正在思考</div>
         )}
         {isEmptyNoLive && (
