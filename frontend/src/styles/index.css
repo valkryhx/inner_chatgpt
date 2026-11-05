@@ -336,20 +336,53 @@ textarea, input { caret-color: var(--clay); }
 }
 
 /* ===== 多用户：侧栏用户区 ===== */
-.sidebar-footer { display: flex; flex-direction: column; gap: 10px; }
+.sidebar-footer { display: flex; flex-direction: column; gap: 8px; }
 .foot-status { display: flex; align-items: center; }
 .user-bar {
-  display: flex; flex-direction: column; gap: 8px; padding-top: 10px;
+  display: flex; align-items: center; gap: 6px; padding-top: 10px;
   border-top: 1px solid var(--line);
 }
-.user-info { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.avatar {
+
+/* 身份区：整行是按钮（点名字=进设置），全名做主标识，不用单字母缩写 */
+.user-chip {
+  display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+  padding: 6px 8px; border: none; border-radius: var(--r-md);
+  background: transparent; text-align: left;
+  transition: background-color 140ms var(--ease);
+}
+.user-chip:hover { background: var(--surface-2); }
+.user-chip:active { background: var(--surface); }
+.user-icon {
   width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
-  background: var(--clay-soft); color: var(--btn); font-weight: 700; font-size: 12px;
+  background: var(--clay-soft); color: var(--btn);
 }
-.user-name { font-size: 12px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.user-actions { display: flex; gap: 6px; }
+.user-chip:hover .user-icon { color: var(--press); }
+.user-meta { display: flex; flex-direction: column; min-width: 0; line-height: 1.35; }
+.user-display {
+  font-size: 13px; font-weight: 600; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.user-email {
+  font-size: 11px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.user-gear {
+  margin-left: auto; flex-shrink: 0; display: flex; color: var(--muted);
+  opacity: .38; transition: opacity 140ms var(--ease), color 140ms var(--ease);
+}
+.user-chip:hover .user-gear,
+.user-chip:focus-visible .user-gear { opacity: 1; color: var(--ink-2); }
+
+/* 登出：仅在 hover 时显色，平时保持安静的次要动作 */
+.user-logout {
+  display: flex; align-items: center; gap: 4px; flex-shrink: 0;
+  padding: 6px 8px; border: none; border-radius: var(--r-md);
+  background: transparent; color: var(--muted); font-size: 12px;
+  transition: background-color 140ms var(--ease), color 140ms var(--ease);
+}
+.user-logout:hover { background: #fbeeec; color: var(--danger); }
+
 .ghost-btn.small { padding: 4px 10px; font-size: 12px; }
 .ghost-btn.danger { color: var(--danger); border-color: #e8c9c5; }
 .ghost-btn.danger:hover { background: #fbeeec; }
@@ -360,9 +393,11 @@ textarea, input { caret-color: var(--clay); }
   display: flex; align-items: center; justify-content: center; z-index: 50; padding: 24px;
 }
 .modal {
-  width: 720px; max-width: 100%; max-height: 88vh; background: var(--canvas);
+  width: 720px; max-width: 100%; background: var(--canvas);
   border-radius: var(--r-xl); box-shadow: var(--shadow-2);
   display: flex; flex-direction: column; overflow: hidden;
+  /* 固定高度：切 tab 时弹窗尺寸不随内容变化，避免忽大忽小 */
+  height: min(86vh, 760px); max-height: calc(100vh - 48px);
 }
 .modal-head {
   display: flex; align-items: center; justify-content: space-between;
@@ -375,7 +410,9 @@ textarea, input { caret-color: var(--clay); }
   font-size: 13px; color: var(--muted); font-weight: 600; border-bottom: 2px solid transparent;
 }
 .modal-tabs button.active { color: var(--btn); border-bottom-color: var(--btn); }
-.modal-body { padding: 18px 20px 22px; overflow-y: auto; }
+/* head / tabs 固定，body 吃掉剩余高度并内部滚动 */
+.modal-head, .modal-tabs { flex-shrink: 0; }
+.modal-body { flex: 1 1 auto; min-height: 0; padding: 18px 20px 22px; overflow-y: auto; }
 .settings-section { display: flex; flex-direction: column; gap: 14px; }
 .hint { font-size: 12px; color: var(--muted); margin: 0; line-height: 1.6; }
 .cfg-list { display: flex; flex-direction: column; gap: 8px; }
@@ -539,7 +576,15 @@ textarea, input { caret-color: var(--clay); }
   }
   .sidebar-header { padding: 10px 12px; }
   .session-list { max-height: 17vh; }
-  .sidebar-footer { display: none; }
+  /* 小屏不再整块隐藏身份区：否则手机上没有入口进设置/登出。
+     改为只保留「身份 + 登出」这一行，隐藏模型/工具状态行。 */
+  .sidebar-footer { display: flex; padding: 6px 8px; gap: 0; }
+  .foot-status { display: none; }
+  .user-bar { padding-top: 0; border-top: none; }
+  .user-chip { padding: 4px 6px; }
+  .user-email { display: none; }
+  .user-logout span { display: none; }
+  .user-logout { padding: 6px; }
   .main { flex: 1; min-height: 0; }
   .main-header { padding: 0 12px; gap: 8px; height: 48px; }
   .main-header .title { font-size: 13px; }
@@ -550,7 +595,7 @@ textarea, input { caret-color: var(--clay); }
   .msg.user .bubble-col { max-width: 88%; }
   .composer-wrap { padding: 10px 12px 12px; }
   .composer-hint { display: none; }
-  .modal { width: 100%; max-height: 92vh; }
+  .modal { width: 100%; height: 92vh; max-height: 92vh; }
   .modal-mask { padding: 12px; align-items: flex-end; }
   .form-grid { grid-template-columns: 1fr; }
   .auth-card { padding: 24px 20px; }
@@ -582,4 +627,5 @@ textarea, input { caret-color: var(--clay); }
   .model-picker-label { display: none; }
   .model-picker select { max-width: 190px; }
   .messages-inner { padding: 0 16px; }
+  .user-email { display: none; }
 }
