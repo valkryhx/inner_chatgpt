@@ -531,6 +531,7 @@ export default function App() {
           streaming={streaming}
           autoCompacted={autoCompacted}
           activeStreamMsgId={activeStreamMsgId}
+          sessionKey={activeId}
         />
         <Composer streaming={streaming} onSend={send} onStop={stop} onCompact={doCompact} />
       </div>

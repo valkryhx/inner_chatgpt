@@ -6,6 +6,7 @@ import MarkdownImage from './MarkdownImage'
 
 interface Props {
   text: string
+  onImageSettled?: () => void
 }
 
 const SAFE_PROTOCOLS = new Set(['http:', 'https:', 'data:', 'mailto:', 'blob:'])
@@ -70,7 +71,7 @@ const schema = {
   },
 }
 
-export default function Markdown({ text }: Props) {
+export default function Markdown({ text, onImageSettled }: Props) {
   return (
     <div className="markdown-body">
       <ReactMarkdown
@@ -90,7 +91,16 @@ export default function Markdown({ text }: Props) {
           img: ({ src, alt, title, width, height }) => {
             const raw = typeof src === 'string' ? src : ''
             if (!raw) return <span className="md-img-blocked">[图片地址为空] {alt}</span>
-            return <MarkdownImage src={raw} alt={alt} title={title} width={width} height={height} />
+            return (
+              <MarkdownImage
+                src={raw}
+                alt={alt}
+                title={title}
+                width={width}
+                height={height}
+                onSettled={onImageSettled}
+              />
+            )
           },
         }}
       >

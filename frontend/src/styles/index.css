@@ -146,7 +146,12 @@ textarea, input { caret-color: var(--clay); }
 .ghost-btn:hover { background: var(--surface-2); border-color: var(--line-strong); }
 .ghost-btn:disabled { opacity: .45; cursor: default; }
 
-.messages { flex: 1; overflow-y: auto; padding: 32px 0 24px; }
+.messages {
+  flex: 1; overflow-y: auto; padding: 32px 0 24px;
+  /* 禁用浏览器“猜测锚点”的自动滚动；由 active 状态显式吸附底部。 */
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+}
 .messages-inner { width: 100%; max-width: calc(var(--measure) + 40px); margin: 0 auto; padding: 0 20px; display: flex; flex-direction: column; gap: 26px; }
 .empty {
   flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;

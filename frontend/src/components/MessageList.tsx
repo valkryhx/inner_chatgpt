@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import type { ReactNode, WheelEvent } from 'react'
 import type { ChartBlock, Message, MessageBlock, SubagentBlock, SummaryBlock, ToolBlock } from '../types'
 import ChartView from './ChartView'
 import Markdown from './Markdown'
@@ -10,6 +10,8 @@ interface Props {
   streaming: boolean
   autoCompacted: number
   activeStreamMsgId?: string | null
+  /** 会话切换时重置滚动跟随状态。 */
+  sessionKey?: string | null
 }
 
 /* ---------- 工具步骤行（L2 过程层）：单行 + 状态点 + 点击展开 ---------- */
@@ -161,7 +163,12 @@ function SummaryCard({ block }: { block: SummaryBlock }) {
 
 /* ---------- 按 blocks 顺序渲染（连续 tool 合并成组，但绝不跨 text/reasoning 重排） ---------- */
 
-function renderBlocks(blocks: MessageBlock[], isUser: boolean, streaming: boolean): ReactNode[] {
+function renderBlocks(
+  blocks: MessageBlock[],
+  isUser: boolean,
+  streaming: boolean,
+  onImageSettled: () => void,
+): ReactNode[] {
   const out: ReactNode[] = []
   // 只有“最后一个块 + 消息仍在流式”才算真正进行中；
   // 否则同一轮里较早的思考块会被误判为 live，凭空长出橘色光标。
@@ -200,7 +207,7 @@ function renderBlocks(blocks: MessageBlock[], isUser: boolean, streaming: boolea
         } else {
           out.push(
             <div className="answer" key={'text_' + i}>
-              <Markdown text={text} />
+              <Markdown text={text} onImageSettled={onImageSettled} />
             </div>,
           )
         }
@@ -211,7 +218,7 @@ function renderBlocks(blocks: MessageBlock[], isUser: boolean, streaming: boolea
   return out
 }
 
-function MessageRow({ msg }: { msg: Message }) {
+function MessageRow({ msg, onImageSettled }: { msg: Message; onImageSettled: () => void }) {
   const isUser = msg.role === 'user'
   const blocks = msg.blocks || []
   const toolBlocks = blocks.filter((b): b is ToolBlock => b.type === 'tool')
@@ -247,13 +254,13 @@ function MessageRow({ msg }: { msg: Message }) {
     <div className={'msg ' + (isUser ? 'user' : 'assistant') + (msg.status === 'error' ? ' has-error' : '')}>
       <div className="bubble-col">
         {hasReasoning && !hasReasoningBlocks && <ReasoningSection text={msg.reasoning} live={isActiveStream} />}
-        {renderBlocks(blocks, isUser, isActiveStream)}
+        {renderBlocks(blocks, isUser, isActiveStream, onImageSettled)}
         {!hasTextBlocks && msg.content && (
           isUser ? (
             <div className="bubble">{msg.content}</div>
           ) : (
             <div className="answer">
-              <Markdown text={msg.content} />
+              <Markdown text={msg.content} onImageSettled={onImageSettled} />
             </div>
           )
         )}
@@ -275,11 +282,127 @@ function MessageRow({ msg }: { msg: Message }) {
   )
 }
 
-export default function MessageList({ messages, streaming, autoCompacted }: Props) {
-  const endRef = useRef<HTMLDivElement>(null)
+/** 距离底部多少像素以内，仍视为“用户想跟随新内容”。 */
+const FOLLOW_THRESHOLD_PX = 96
+
+export default function MessageList({ messages, streaming, autoCompacted, sessionKey }: Props) {
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const innerRef = useRef<HTMLDivElement>(null)
+  const followRef = useRef(true)
+  const frameRef = useRef<number | null>(null)
+  const lastScrollTopRef = useRef(0)
+  const programmaticUntilRef = useRef(0)
+
+  const pinToBottom = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    // 流式阶段必须瞬时贴底；平滑滚动追不上 token 增量，也会与图片高度变化打架。
+    el.scrollTop = el.scrollHeight
+    lastScrollTopRef.current = el.scrollTop
+    programmaticUntilRef.current = performance.now() + 100
+  }, [])
+
+  const schedulePinToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
+    if (frameRef.current !== null) return
+    programmaticUntilRef.current = performance.now() + (behavior === 'smooth' ? 500 : 100)
+    frameRef.current = requestAnimationFrame(() => {
+      frameRef.current = null
+      const el = scrollRef.current
+      if (!el) return
+      if (behavior === 'smooth') el.scrollTo({ top: el.scrollHeight, behavior })
+      else el.scrollTop = el.scrollHeight
+      lastScrollTopRef.current = el.scrollTop
+    })
+  }, [])
+
+  const isNearBottom = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return true
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_THRESHOLD_PX
+  }, [])
+
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const top = el.scrollTop
+    const movedUp = top + 1 < lastScrollTopRef.current
+    lastScrollTopRef.current = top
+
+    // 用户滚轮上翻的意图必须在程序滚动保护之前记录，否则无法浏览历史。
+    if (movedUp) {
+      followRef.current = false
+      return
+    }
+    if (performance.now() < programmaticUntilRef.current) {
+      if (isNearBottom()) followRef.current = true
+      return
+    }
+    // 用户主动滚回底部后恢复跟随；这比只看“是否发生上滚”更符合预期。
+    followRef.current = isNearBottom()
+  }, [isNearBottom])
+
+  const onWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
+    if (event.deltaY < 0) followRef.current = false
+  }, [])
+
+  // 切换会话后重新默认跟随底部，不能继承上一个会话的浏览位置。
+  useLayoutEffect(() => {
+    followRef.current = true
+    lastScrollTopRef.current = 0
+    schedulePinToBottom('auto')
+  }, [sessionKey, schedulePinToBottom])
+
+  // 每次 DOM 提交后、绘制前贴底。流式阶段每个 delta 都执行，
+  // 图片/长文本撑开高度也发生在同一轮布局中，避免下一 tick 才补滚。
+  useLayoutEffect(() => {
+    if (!followRef.current) return
+    if (streaming) pinToBottom()
+    else schedulePinToBottom('smooth')
+  }, [messages, streaming, pinToBottom, schedulePinToBottom])
+
+  // 异步图片尺寸（尤其 blob 图片）可能在 React 提交之外改变高度。
+  // MutationObserver 捕获 Markdown 节点替换，ResizeObserver 捕获图片撑高；
+  // 两者都在下一帧前同步贴底，避免流式 token 与图片加载竞争。
+  const hasList = messages.length > 0 || streaming
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, streaming])
+    if (!hasList) return
+    const inner = innerRef.current
+    const el = scrollRef.current
+    if (!inner || !el) return
+    const syncBottom = () => {
+      if (!followRef.current) return
+      el.scrollTop = el.scrollHeight
+      lastScrollTopRef.current = el.scrollTop
+    }
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(syncBottom) : null
+    ro?.observe(inner)
+    const mo = typeof MutationObserver !== 'undefined' ? new MutationObserver(syncBottom) : null
+    mo?.observe(inner, { childList: true, subtree: true, characterData: true })
+    const onLoad = (event: Event) => {
+      if ((event.target as Element)?.tagName === 'IMG') syncBottom()
+    }
+    inner.addEventListener('load', onLoad, true)
+    inner.addEventListener('error', onLoad, true)
+    return () => {
+      ro?.disconnect()
+      mo?.disconnect()
+      inner.removeEventListener('load', onLoad, true)
+      inner.removeEventListener('error', onLoad, true)
+    }
+  }, [hasList])
+
+  const handleImageSettled = useCallback(() => {
+    if (!followRef.current) return
+    requestAnimationFrame(() => {
+      if (followRef.current) pinToBottom()
+    })
+  }, [pinToBottom])
+
+  useEffect(() => {
+    return () => {
+      if (frameRef.current !== null) cancelAnimationFrame(frameRef.current)
+    }
+  }, [])
 
   if (messages.length === 0 && !streaming) {
     return (
@@ -294,15 +417,14 @@ export default function MessageList({ messages, streaming, autoCompacted }: Prop
   }
 
   return (
-    <div className="messages">
-      <div className="messages-inner">
+    <div className="messages" ref={scrollRef} onScroll={onScroll} onWheel={onWheel}>
+      <div className="messages-inner" ref={innerRef}>
         {autoCompacted > 0 && (
           <div className="compaction-banner">上下文已压缩 {autoCompacted} 次（较早对话已摘要）</div>
         )}
         {messages.map((m) => (
-          <MessageRow key={m.id} msg={m} />
+          <MessageRow key={m.id} msg={m} onImageSettled={handleImageSettled} />
         ))}
-        <div ref={endRef} />
       </div>
     </div>
   )
