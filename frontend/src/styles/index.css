@@ -941,3 +941,106 @@ textarea, input { caret-color: var(--clay); }
 @media (max-width: 720px) {
   .team-panel { display: none; }
 }
+
+/* ===== 任意格式文件：胶囊 / 步骤下载 / 工作区面板 ===== */
+.file-chip { display: inline; }
+.file-chip-btn {
+  display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  margin: 0 2px; padding: 2px 8px; vertical-align: baseline;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--ink-2); font-size: 13px; cursor: pointer;
+}
+.file-chip-btn:hover { background: var(--surface-2); border-color: var(--line-strong); color: var(--ink); }
+.file-chip-btn:disabled { opacity: .6; cursor: default; }
+.file-ico {
+  flex-shrink: 0; padding: 0 4px; border-radius: 3px;
+  background: var(--clay-soft); color: var(--btn);
+  font-size: 9.5px; font-weight: 700; letter-spacing: .02em; line-height: 1.7;
+}
+.file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-action { flex-shrink: 0; color: var(--btn); font-size: 12px; }
+.file-chip-error { display: block; margin: 2px 0 0 2px; color: var(--danger); font-size: 11.5px; }
+.kind-doc .file-ico { background: #e8eefb; color: #3156a6; }
+.kind-sheet .file-ico { background: #e7f4ec; color: #22794a; }
+.kind-slide .file-ico { background: #fbeee2; color: #a2551a; }
+.kind-pdf .file-ico { background: #fbeeec; color: var(--danger); }
+.kind-img .file-ico { background: #e6f2f7; color: #1c6a86; }
+.kind-zip .file-ico { background: #f0ecfa; color: #5b43a8; }
+.kind-code .file-ico { background: var(--surface-2); color: var(--ink-2); }
+
+.step-dl {
+  flex-shrink: 0; margin-left: 4px; padding: 1px 8px;
+  border: 1px solid var(--line); border-radius: 999px;
+  background: var(--canvas); color: var(--ink-2); font-size: 11px; line-height: 1.7;
+}
+.step-dl:hover { border-color: var(--line-strong); background: var(--surface-2); }
+.step-dl:disabled { opacity: .5; cursor: default; }
+.step-dl-error {
+  flex: 1 1 100%; margin-left: 15px; color: var(--danger); font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.ws-mask {
+  position: fixed; inset: 0; z-index: 46;
+  background: rgba(26, 25, 24, .28);
+  display: flex; justify-content: flex-end;
+}
+.ws-panel {
+  width: 380px; max-width: 92vw; height: 100%;
+  background: var(--canvas); border-left: 1px solid var(--line);
+  box-shadow: var(--shadow-2); display: flex; flex-direction: column;
+}
+.ws-head {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 10px; padding: 16px 16px 10px; border-bottom: 1px solid var(--line);
+}
+.ws-kicker { font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); font-weight: 700; }
+.ws-title h2 { margin: 3px 0 0; font-size: 16px; }
+.ws-head-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.ws-crumbs {
+  display: flex; flex-wrap: wrap; align-items: center;
+  padding: 8px 14px; border-bottom: 1px solid var(--line); font-size: 12px;
+}
+.ws-crumb { background: none; border: none; padding: 2px; color: var(--btn); font-size: 12px; }
+.ws-crumb:disabled { color: var(--muted); cursor: default; }
+.ws-crumb-sep { margin: 0 3px; color: var(--line-strong); }
+.ws-body {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 8px 10px 16px; display: flex; flex-direction: column; gap: 4px;
+}
+.ws-row { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: var(--r-md); }
+.ws-row:hover { background: var(--surface); }
+.ws-file.is-selected { background: var(--clay-soft); }
+.ws-dir { border: none; background: transparent; text-align: left; cursor: pointer; color: var(--ink); }
+.ws-file-main {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px;
+  border: none; background: transparent; padding: 0; text-align: left; cursor: pointer; color: var(--ink);
+}
+.ws-check { accent-color: var(--btn); flex-shrink: 0; }
+.ws-ico {
+  flex-shrink: 0; min-width: 34px; padding: 1px 4px; border-radius: 4px;
+  background: var(--surface-2); color: var(--muted);
+  font-size: 9px; font-weight: 700; text-align: center;
+}
+.ws-ico-dir { background: var(--clay-soft); color: var(--btn); }
+.ws-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.ws-meta { flex-shrink: 0; color: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.ws-dl { flex-shrink: 0; color: var(--btn); font-size: 12px; }
+.ws-empty {
+  padding: 28px 14px; text-align: center; color: var(--muted);
+  font-size: 12px; line-height: 1.7;
+  border: 1px dashed var(--line-strong); border-radius: var(--r-md);
+}
+.ws-error { margin: 0 0 6px; }
+.ws-foot {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; border-top: 1px solid var(--line);
+}
+.ws-count { margin-left: auto; color: var(--muted); font-size: 12px; }
+.ws-open-btn { flex-shrink: 0; }
+
+@media (max-width: 720px) {
+  .ws-panel { width: 100%; max-width: 100%; }
+  .ws-open-btn { padding: 4px 8px; font-size: 11px; }
+  .file-chip-btn { font-size: 12px; }
+}

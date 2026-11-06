@@ -7,6 +7,7 @@ import Composer from './components/Composer'
 import LoginPage from './components/LoginPage'
 import SettingsModal from './components/SettingsModal'
 import TeamPanel from './components/TeamPanel'
+import WorkspacePanel from './components/WorkspacePanel'
 
 // 面板展开状态按用户隔离：同一浏览器换账号登录时不应继承上一个人的偏好。
 const TEAM_OPEN_KEY = 'team_panel_open'
@@ -116,6 +117,7 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null)
   const [booting, setBooting] = useState(true)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [sessions, setSessions] = useState<Session[]>([])
   const [activeId, setActiveId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -701,6 +703,14 @@ export default function App() {
       <div className="main">
         <div className="main-header">
           <div className="title">{activeSession?.title || 'Hlaudz'}</div>
+          <button
+            type="button"
+            className="ghost-btn ws-open-btn"
+            onClick={() => setWorkspaceOpen(true)}
+            title="浏览、下载 workspace 中的任意文件"
+          >
+            文件
+          </button>
           {/* 模型选择器始终可见：没有会话时也能选，选中的值作为「新会话的默认模型」。
               之前只在 activeSession 存在时渲染，导致刚配置完模型、还没发消息时完全看不到下拉框。 */}
           <label className="model-picker" title={activeSession ? '切换本会话使用的模型（会话级）' : '新会话将使用该模型'}>
@@ -760,6 +770,7 @@ export default function App() {
           activeStreamMsgId={activeStreamMsgId}
           sessionKey={activeId}
           sendPulse={sendPulse}
+          onOpenWorkspace={() => setWorkspaceOpen(true)}
         />
         <Composer
           streaming={streaming}
@@ -778,6 +789,9 @@ export default function App() {
         onToggle={() => setTeamOpen((v) => !v)}
         onStop={stop}
       />
+      {workspaceOpen && (
+        <WorkspacePanel open={workspaceOpen} onClose={() => setWorkspaceOpen(false)} />
+      )}
       {settingsOpen && (
         <SettingsModal
           onLlmChanged={loadModels}

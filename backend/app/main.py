@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import db
 from .config import ROOT_DIR, llm_yaml_available, load_llm_settings
-from .routers import auth, chat, me, media, sessions, skills, team
+from .routers import auth, chat, me, media, sessions, skills, team, workspace_files
 from .runtime import RuntimeHub, set_hub
 from .schemas import HealthOut
 
@@ -57,6 +57,7 @@ app.include_router(sessions.router)
 app.include_router(chat.router)
 app.include_router(skills.router)
 app.include_router(media.router)
+app.include_router(workspace_files.router)
 app.include_router(team.router)
 
 

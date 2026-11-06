@@ -4,6 +4,7 @@ import type { ChartBlock, Message, MessageBlock, SubagentBlock, SummaryBlock, To
 import ChartView from './ChartView'
 import Markdown from './Markdown'
 import SubagentCard from './SubagentCard'
+import { basename, downloadWorkspaceFile } from '../files'
 
 interface Props {
   messages: Message[]
@@ -14,6 +15,8 @@ interface Props {
   sessionKey?: string | null
   /** 每次用户提交时自增；发送是明确的“看最新消息”意图。 */
   sendPulse?: number
+  /** code_run 等步骤的「工作区」入口。 */
+  onOpenWorkspace?: () => void
 }
 
 /* ---------- 工具步骤行（L2 过程层）：单行 + 状态点 + 点击展开 ---------- */
@@ -55,12 +58,32 @@ function toolState(block: ToolBlock): 'running' | 'failed' | 'done' {
   return 'done'
 }
 
-function StepRow({ block }: { block: ToolBlock }) {
+function StepRow({ block, onOpenWorkspace }: { block: ToolBlock; onOpenWorkspace?: () => void }) {
   const [open, setOpen] = useState(false)
+  const [dlBusy, setDlBusy] = useState(false)
+  const [dlErr, setDlErr] = useState('')
   const state = toolState(block)
   const argSummary = summarizeInput(block.input)
+  const input = block.input as Record<string, unknown> | undefined
+  const filePath = block.name === 'file_write' || block.name === 'file_patch'
+    ? (typeof input?.path === 'string' ? input.path : '')
+    : ''
   // 完成态只靠绿点表达，不再重复写“完成”，避免整列噪音
   const stateLabel = state === 'running' ? '运行中' : state === 'failed' ? '失败' : ''
+
+  const download = async () => {
+    if (!filePath || dlBusy) return
+    setDlBusy(true)
+    setDlErr('')
+    try {
+      await downloadWorkspaceFile(filePath, basename(filePath))
+    } catch (err: unknown) {
+      setDlErr(err instanceof Error ? err.message : String(err))
+    } finally {
+      setDlBusy(false)
+    }
+  }
+
   return (
     <div className={'step ' + state}>
       <span className={'status-dot ' + state} />
@@ -70,6 +93,28 @@ function StepRow({ block }: { block: ToolBlock }) {
         {stateLabel && <span className="step-state">{stateLabel}</span>}
         <span className="step-caret">{open ? '▾' : '▸'}</span>
       </button>
+      {filePath && (
+        <button
+          type="button"
+          className="step-dl"
+          onClick={(e) => { e.stopPropagation(); download() }}
+          disabled={dlBusy}
+          title={dlErr || `下载 ${filePath}`}
+        >
+          {dlBusy ? '…' : '下载'}
+        </button>
+      )}
+      {block.name === 'code_run' && onOpenWorkspace && (
+        <button
+          type="button"
+          className="step-dl"
+          onClick={(e) => { e.stopPropagation(); onOpenWorkspace() }}
+          title="打开工作区文件面板"
+        >
+          文件
+        </button>
+      )}
+      {dlErr && <span className="step-dl-error" title={dlErr}>{dlErr}</span>}
       {open && (
         <div className="step-detail">
           {block.input !== undefined && (
@@ -95,7 +140,7 @@ function StepRow({ block }: { block: ToolBlock }) {
   )
 }
 
-function StepGroup({ blocks }: { blocks: ToolBlock[] }) {
+function StepGroup({ blocks, onOpenWorkspace }: { blocks: ToolBlock[]; onOpenWorkspace?: () => void }) {
   const states = blocks.map(toolState)
   const running = states.includes('running')
   const failed = states.includes('failed')
@@ -109,7 +154,7 @@ function StepGroup({ blocks }: { blocks: ToolBlock[] }) {
         </div>
       )}
       {blocks.map((b, i) => (
-        <StepRow key={b.id || 'tool_' + i} block={b} />
+        <StepRow key={b.id || 'tool_' + i} block={b} onOpenWorkspace={onOpenWorkspace} />
       ))}
     </div>
   )
@@ -172,6 +217,7 @@ function renderBlocks(
   isUser: boolean,
   streaming: boolean,
   onImageSettled: () => void,
+  onOpenWorkspace?: () => void,
 ): ReactNode[] {
   const out: ReactNode[] = []
   // 只有“最后一个块 + 消息仍在流式”才算真正进行中；
@@ -187,7 +233,7 @@ function renderBlocks(
         group.push(blocks[j] as ToolBlock)
         j++
       }
-      out.push(<StepGroup key={'tg_' + i} blocks={group} />)
+      out.push(<StepGroup key={'tg_' + i} blocks={group} onOpenWorkspace={onOpenWorkspace} />)
       i = j
       continue
     }
@@ -274,7 +320,11 @@ function RunFooter({ msg, live }: { msg: Message; live: boolean }) {
   )
 }
 
-function MessageRow({ msg, onImageSettled }: { msg: Message; onImageSettled: () => void }) {
+function MessageRow({ msg, onImageSettled, onOpenWorkspace }: {
+  msg: Message
+  onImageSettled: () => void
+  onOpenWorkspace?: () => void
+}) {
   const isUser = msg.role === 'user'
   const blocks = msg.blocks || []
   const toolBlocks = blocks.filter((b): b is ToolBlock => b.type === 'tool')
@@ -310,7 +360,7 @@ function MessageRow({ msg, onImageSettled }: { msg: Message; onImageSettled: () 
     <div className={'msg ' + (isUser ? 'user' : 'assistant') + (msg.status === 'error' ? ' has-error' : '')}>
       <div className="bubble-col">
         {hasReasoning && !hasReasoningBlocks && <ReasoningSection text={msg.reasoning} live={isActiveStream} />}
-        {renderBlocks(blocks, isUser, isActiveStream, onImageSettled)}
+        {renderBlocks(blocks, isUser, isActiveStream, onImageSettled, onOpenWorkspace)}
         {!hasTextBlocks && msg.content && (
           isUser ? (
             <div className="bubble">{msg.content}</div>
@@ -338,7 +388,7 @@ function MessageRow({ msg, onImageSettled }: { msg: Message; onImageSettled: () 
 /** 距离底部多少像素以内，仍视为“用户想跟随新内容”。 */
 const FOLLOW_THRESHOLD_PX = 96
 
-export default function MessageList({ messages, streaming, autoCompacted, sessionKey, sendPulse }: Props) {
+export default function MessageList({ messages, streaming, autoCompacted, sessionKey, sendPulse, onOpenWorkspace }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const innerRef = useRef<HTMLDivElement>(null)
   const followRef = useRef(true)
@@ -484,7 +534,7 @@ export default function MessageList({ messages, streaming, autoCompacted, sessio
           <div className="compaction-banner">上下文已压缩 {autoCompacted} 次（较早对话已摘要）</div>
         )}
         {messages.map((m) => (
-          <MessageRow key={m.id} msg={m} onImageSettled={handleImageSettled} />
+          <MessageRow key={m.id} msg={m} onImageSettled={handleImageSettled} onOpenWorkspace={onOpenWorkspace} />
         ))}
       </div>
     </div>

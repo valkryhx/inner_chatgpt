@@ -1,47 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { getToken } from '../api'
+import { isWorkspaceImage, workspacePathOf } from '../files'
 
-const REMOTE_PROTOCOLS = new Set(['http:', 'https:', 'data:', 'blob:'])
-const WINDOWS_ABS_RE = /^[A-Za-z]:[\/]/
-const LOCAL_PREFIXES = ['/workspace/', 'workspace/']
-
-/**
- * 判断图片地址是否应走「当前用户 workspace 鉴权接口」。
- *
- * - http(s)/data/blob 保持原样，由浏览器直接加载；
- * - 绝对 file URI、Windows 盘符路径、/workspace/... 与普通相对路径
- *   都视为 workspace 本地文件，必须带 Bearer token 拉取。
- */
-export function isWorkspaceImage(src: string): boolean {
-  const s = (src || '').trim()
-  if (!s) return false
-  if (s.startsWith('//')) return false
-  const scheme = /^([a-z][a-z0-9+.-]*):/i.exec(s)?.[1]?.toLowerCase()
-  if (scheme) {
-    if (REMOTE_PROTOCOLS.has(scheme + ':')) return false
-    if (scheme === 'file') return true
-  }
-  if (WINDOWS_ABS_RE.test(s)) return true
-  if (LOCAL_PREFIXES.some((p) => s.startsWith(p))) return true
-  // 以 / 开头但不是 // 的路径，按 workspace 相对路径处理（与后端一致）。
-  if (s.startsWith('/')) return true
-  // 其余普通相对路径；未知协议不交给后端。
-  return !scheme
-}
-
-/** 把 workspace 路径归一成后端可解析的字符串（保留盘符与原始信息）。 */
-export function workspaceImagePath(src: string): string {
-  const s = (src || '').trim()
-  if (/^file:/i.test(s)) {
-    try {
-      const u = new URL(s)
-      return decodeURIComponent(u.pathname || '')
-    } catch {
-      return s
-    }
-  }
-  return s
-}
+/** 兼容旧导入：判定/归一实现已统一到 `files.ts`，图片额外要求图片扩展名。 */
+export { isWorkspaceImage }
+export const workspaceImagePath = workspacePathOf
 
 // React 在流式重渲染时可能重挂载 Markdown 子树。缓存已解析的 blob URL，
 // 避免同一个 workspace 图片每次挂载都先退回占位符、再撑开高度。

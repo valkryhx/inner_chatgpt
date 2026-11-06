@@ -12,6 +12,7 @@ import type {
   User,
   Skill,
   TeamSnapshot,
+  WorkspaceListing,
 } from './types'
 
 const BASE = '/api'
@@ -202,6 +203,12 @@ export const api = {
       body: JSON.stringify({ raw }),
     }),
   mcpExport: () => request<{ json: string }>('/me/mcp-servers/export'),
+
+  // ---------------- workspace 文件 ----------------
+  workspaceFiles: (path = '', depth = 2, limit = 500) =>
+    request<WorkspaceListing>(
+      `/me/workspace-files?path=${encodeURIComponent(path)}&depth=${depth}&limit=${limit}`,
+    ),
 
   // me: skills
   listSkills: () => request<Skill[]>('/me/skills'),

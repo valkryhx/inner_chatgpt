@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from .config import BUILTIN_SKILLS_DIR, SHARED_SKILLS_DIR, SKILLS_DIR, WORKSPACES_DIR
 
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:/")
+_FILE_URI_RE = re.compile(r"^file:", re.IGNORECASE)
 
 
 class PathSecurityError(ValueError):
@@ -142,3 +145,77 @@ def _reject_unsafe_segment(segment: str) -> None:
         raise PathSecurityError("非法路径片段")
     if "/" in segment or "\\" in segment:
         raise PathSecurityError("非法路径片段（含分隔符）")
+
+
+# ---------------- 前端可见路径归一（图片与文件下载共用） ----------------
+def normalize_workspace_path(raw: str) -> str:
+    r"""把模型/用户写出的各种路径归一成 workspace 可解析的相对/绝对路径。
+
+    支持：
+    - ``reports/q3.docx`` / ``./a.csv``
+    - ``D:/work/a.docx`` / ``D:\work\a.docx``
+    - ``file:///D:/work/a.docx``
+    - ``/workspace/reports/a.docx``（沙箱别名）
+    - ``/reports/a.docx``（按 workspace 相对路径处理）
+
+    空路径抛 ``ValueError``，其余不合法的形态由后续 ``_resolve_under`` 拒绝。
+    """
+    p = (raw or "").strip()
+    if not p:
+        raise ValueError("path 不能为空")
+
+    if _FILE_URI_RE.match(p):
+        parsed = urlparse(p)
+        p = unquote(parsed.path or "")
+    else:
+        p = unquote(p)
+
+    # 统一成 POSIX 分隔符；Windows 的 Path 同样接受 forward slashes。
+    p = p.replace("\\", "/")
+
+    # file:///D:/... -> D:/...
+    if re.match(r"^/[A-Za-z]:/", p):
+        p = p[1:]
+
+    # 沙箱别名：/workspace/... 和 workspace/... 都映射到用户 workspace 根。
+    for prefix in ("/workspace/", "workspace/"):
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+            break
+    else:
+        if p.startswith("/") and not _WINDOWS_ABS_RE.match(p):
+            p = p.lstrip("/")
+
+    p = p.strip()
+    if not p:
+        raise ValueError("path 不能为空")
+    return p
+
+
+def resolve_workspace_download(user_id: str, raw: str) -> Path:
+    """Resolve a downloadable file under the user's workspace only.
+
+    读技能目录不在此接口范围内（技能有自己的 API），这里只开放 workspace，
+    并复用 ``resolve()`` + 包含关系校验来阻断 ``..``、绝对路径越界与软链逃逸。
+    """
+    rel = normalize_workspace_path(raw)
+    base = user_workspace(user_id, create=False)
+    candidate = Path(rel) if Path(rel).is_absolute() else (base / rel)
+    target = _resolve_under(base, candidate)
+    if not target.is_file():
+        raise FileNotFoundError(str(target))
+    return target
+
+
+def resolve_workspace_dir(user_id: str, raw: str = "") -> Path:
+    """Resolve a directory under the user's workspace (``""`` = root)."""
+    base = user_workspace(user_id, create=False)
+    if not (raw or "").strip():
+        return base
+    rel = normalize_workspace_path(raw)
+    candidate = Path(rel) if Path(rel).is_absolute() else (base / rel)
+    target = _resolve_under(base, candidate)
+    if not target.is_dir():
+        raise FileNotFoundError(str(target))
+    return target
+

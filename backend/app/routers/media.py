@@ -12,15 +12,13 @@ r"""用户 workspace 媒体文件（图片）鉴权读取。
 from __future__ import annotations
 
 import mimetypes
-import re
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from ..auth import get_current_user
-from ..workspace import PathSecurityError, safe_read_path
+from ..workspace import PathSecurityError, normalize_workspace_path, safe_read_path
 
 router = APIRouter(prefix="/api/me", tags=["media"])
 
@@ -35,12 +33,10 @@ IMAGE_MIME_BY_SUFFIX = {
     ".avif": "image/avif",
     ".svg": "image/svg+xml",
 }
-_WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:/")
-_FILE_URI_RE = re.compile(r"^file:", re.IGNORECASE)
 
 
 def normalize_workspace_media_path(raw: str) -> str:
-    r"""把模型/用户写出的各种图片路径归一成 workspace 可解析路径。
+    r"""图片路径归一（实现已移到 ``workspace.normalize_workspace_path``）。
 
     支持：
     - ``chart.png`` / ``images/chart.png``
@@ -49,37 +45,10 @@ def normalize_workspace_media_path(raw: str) -> str:
     - ``/workspace/images/chart.png``（常见的沙箱别名）
     - ``/images/chart.png``（按 workspace 相对路径处理）
     """
-    p = (raw or "").strip()
-    if not p:
-        raise HTTPException(status_code=400, detail="path 不能为空")
-
-    if _FILE_URI_RE.match(p):
-        parsed = urlparse(p)
-        p = unquote(parsed.path or "")
-    else:
-        p = unquote(p)
-
-    # 统一成 POSIX 分隔符；Windows 的 Path 同样接受 forward slashes。
-    p = p.replace("\\", "/")
-
-    # file:///D:/... -> D:/...
-    if re.match(r"^/[A-Za-z]:/", p):
-        p = p[1:]
-
-    # 沙箱别名：/workspace/... 和 workspace/... 都映射到用户 workspace 根。
-    for prefix in ("/workspace/", "workspace/"):
-        if p.startswith(prefix):
-            p = p[len(prefix):]
-            break
-    else:
-        if p.startswith("/") and not _WINDOWS_ABS_RE.match(p):
-            # Markdown 中常见的 /images/a.png 按 workspace 相对路径处理。
-            p = p.lstrip("/")
-
-    p = p.strip()
-    if not p:
-        raise HTTPException(status_code=400, detail="path 不能为空")
-    return p
+    try:
+        return normalize_workspace_path(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def resolve_workspace_media(user_id: str, raw_path: str) -> tuple[Path, str]:

@@ -3,6 +3,8 @@ import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import remarkGfm from 'remark-gfm'
 import MarkdownImage from './MarkdownImage'
+import FileChip from './FileChip'
+import { basename, isWorkspaceLocal, workspacePathOf } from '../files'
 
 interface Props {
   text: string
@@ -80,6 +82,14 @@ export default function Markdown({ text, onImageSettled }: Props) {
         urlTransform={safeMarkdownUrl}
         components={{
           a: ({ href, children, ...rest }) => {
+            const raw = (href || '').trim()
+            // 本地 workspace 文件（含图片）→ 文件胶囊 + 鉴权下载。
+            // 链接不会内联渲染（那是 ![alt](path) 的职责），若按普通 <a> 处理，
+            // 点击只会跳到 SPA 路由拿到 index.html，因此图片链接同样给下载入口。
+            if (raw && isWorkspaceLocal(raw)) {
+              const path = workspacePathOf(raw)
+              return <FileChip path={path} name={basename(path)} label={children} />
+            }
             const safe = safeUrl(href)
             if (!safe) return <span>{children}</span>
             return (

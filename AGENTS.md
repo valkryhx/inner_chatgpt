@@ -112,6 +112,8 @@
 | `docs/20261105-Subagent调研与设计方案.md` | **P2 设计文档（已实施）**：GA 进程树 vs Aivory 子任务 的调研对比、进程内 asyncio subagent 架构、`AgentContext` 多租户贯穿、5 个编排工具契约、停止/超时/失败语义、前端 subagent block、6 阶段实施蓝本与测试计划 |
 | `docs/20261106-Web自测Bug修复记录.md` | **Web 自测 14 项 Bug 修复记录（最新）**：子代理角色/Team 配额泄漏/压缩不变量/前端可见性逐条根因、改动文件、真实环境复验命令 |
 | `docs/20261106-Web自测Bug修复-测试方案.md` | **修复验收测试方案**：pytest / API / Playwright 三层用例矩阵、一键运行（`work/claude_test_and_review/_fix_verify_all.py`）、验收标准与已知限制 |
+| `docs/20261106-任意格式文件下载实施记录.md` | **任意格式文件下载（最新，已实施）**：`workspace-file/-files/-zip` 三端点、FileChip/WorkspacePanel/步骤下载、Office 依赖、154 项单测 + 16 项真实 E2E 证据 |
+| `docs/20261106-任意格式文件下载设计方案.md` | **任意格式文件下载设计**：workspace 通用下载端点、目录列表与打包、Markdown/工具步骤/文件面板三入口、安全边界与 P1–P5 实施测试计划 |
 | `docs/20261106-Codex修复须知-Web自测Bug.md` | 自测 Bug 的修复建议单（含优先级、建议改法、验收与回归清单） |
 
 ### 0.3 目录约定（写文件前先确认放在哪个目录）

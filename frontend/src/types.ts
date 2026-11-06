@@ -291,3 +291,23 @@ export interface Skill {
   /** 内置/公用 Skill 只读 */
   readonly?: boolean
 }
+ 
+/* ---------- workspace 文件下载 ---------- */
+
+export interface WorkspaceEntry {
+  name: string
+  /** workspace 相对路径（POSIX） */
+  path: string
+  type: 'file' | 'dir'
+  size: number
+  mtime: number
+  /** 以 . 开头的隐藏项；`.subagents` 为子代理产物 */
+  hidden?: boolean
+}
+
+export interface WorkspaceListing {
+  root: string
+  entries: WorkspaceEntry[]
+  truncated: boolean
+  limit: number
+}
