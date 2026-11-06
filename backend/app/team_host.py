@@ -113,11 +113,23 @@ class TeamHost:
             self.scope, timeout_s=timeout_s
         )
 
-    async def release_lifecycle(self) -> None:
+    def release_lifecycle_now(self) -> None:
+        """Synchronously release the active-team slot.
+
+        This must be safe to call from a cancelled task's ``finally``: it does
+        not await, so anyio/asyncio cancellation cannot interrupt it.  Skipping
+        this release leaks the per-user Team quota until the process restarts.
+        Idempotent by design.
+        """
         self._require_lead()
         lease, self._lifecycle_lease = self._lifecycle_lease, None
         if lease is not None:
             lease.release()
+
+    async def release_lifecycle(self) -> None:
+        # Kept for callers that already await it; delegation keeps the release
+        # synchronous and idempotent.
+        self.release_lifecycle_now()
 
     async def create(self, name: str = "Agent Team") -> dict[str, Any]:
         """Create the team and return its status snapshot."""
@@ -243,7 +255,8 @@ class TeamHost:
 
     async def spawn_teammate(self, *, task_name: str, message: str,
                              team_task_id: str = "",
-                             expected_version: int | None = None) -> dict[str, Any]:
+                             expected_version: int | None = None,
+                             max_turns: int = 0) -> dict[str, Any]:
         """Create/bind an owner and invoke the injected spawn protocol.
 
         This module intentionally does not import the chat/subagent runtime.  The
@@ -271,7 +284,7 @@ class TeamHost:
         try:
             spawned = await self._spawn_fn(
                 task_name=task_name, message=message, team_task_id=team_task_id,
-                owner_agent_id=f"sub:{task_name}",
+                owner_agent_id=f"sub:{task_name}", max_turns=max_turns,
                 scope=self.scope,
             )
         except Exception:

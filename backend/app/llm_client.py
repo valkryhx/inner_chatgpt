@@ -224,7 +224,8 @@ class LLMClient:
                 pass
             self._client = None
 
-    def _build_request(self, messages: list[dict], tools: Optional[list[dict]]):
+    def _build_request(self, messages: list[dict], tools: Optional[list[dict]],
+                       *, max_tokens: Optional[int] = None):
         s = self.s
         headers = {"Authorization": f"Bearer {s.api_key}", "Content-Type": "application/json", "Accept": "text/event-stream"}
         if s.api_mode == "responses":
@@ -259,14 +260,26 @@ class LLMClient:
         pt = _prepare_tools(tools, s.api_mode)
         if pt:
             payload["tools"] = pt
+        # Per-call output cap (e.g. compaction summaries must stay small).
+        if max_tokens:
+            if s.api_mode == "responses":
+                payload["max_output_tokens"] = max_tokens
+            else:
+                ml = (s.model or "").lower()
+                key = "max_completion_tokens" if ml.startswith(("gpt-5", "o1", "o2", "o3", "o4")) else "max_tokens"
+                payload[key] = max_tokens
         return url, headers, payload
 
 
     async def run(self, messages: list[dict], tools: Optional[list[dict]] = None,
-                  on_delta=None, stop_check=None) -> ChatResult:
+                  on_delta=None, stop_check=None, *,
+                  max_tokens: Optional[int] = None) -> ChatResult:
         """Run one non-streaming-collect call. Streams deltas to on_delta(kind, text)
-        where kind is 'text' or 'reasoning'. Returns ChatResult."""
-        url, headers, payload = self._build_request(messages, tools)
+        where kind is 'text' or 'reasoning'. Returns ChatResult.
+
+        ``max_tokens`` overrides the configured output cap for this call only.
+        """
+        url, headers, payload = self._build_request(messages, tools, max_tokens=max_tokens)
         client = self._get_client()
 
         attempt = 0

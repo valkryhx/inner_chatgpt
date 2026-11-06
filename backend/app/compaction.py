@@ -52,11 +52,20 @@ def _trim_note_message(dropped):
     }
 
 
-async def _summarize(ur, prompt: str) -> str:
+async def _summarize(ur, prompt: str, *, max_tokens: int | None = None) -> str:
     """Call the user's model to produce a summary; return '' on any failure."""
     try:
-        res = await ur.model.client.run([{"role": "user", "content": prompt}])
+        res = await ur.model.client.run(
+            [{"role": "user", "content": prompt}], max_tokens=max_tokens
+        )
         return (res.content or "").strip()
+    except TypeError:
+        # Older/fake clients without the per-call cap.
+        try:
+            res = await ur.model.client.run([{"role": "user", "content": prompt}])
+            return (res.content or "").strip()
+        except Exception:
+            return ""
     except Exception:
         return ""
 
@@ -92,6 +101,27 @@ def _safe_keep_from(messages, keep_from):
     while 0 < keep_from < n and messages[keep_from].get("role") == "tool":
         keep_from -= 1
     return max(0, keep_from)
+
+
+def _tail_keep_from(messages, keep_from, budget):
+    """Advance ``keep_from`` until the preserved suffix fits ``budget`` tokens.
+
+    Used only as a last resort when the summary alone keeps the history above
+    the soft line.  Returns ``None`` when no safe boundary fits (e.g. a single
+    huge message), so the caller can keep the summary + full tail instead.
+    """
+    n = len(messages)
+    k = _safe_keep_from(messages, keep_from)
+    for _ in range(n):
+        if message_token_counter(messages[k:]) <= budget:
+            return k
+        if k >= n - 1:
+            return None
+        nxt = _safe_keep_from(messages, k + 1)
+        if nxt <= k:
+            return None
+        k = nxt
+    return None
 
 
 async def manual_compact(user_id, session_id, keep=6, instructions=""):
@@ -137,7 +167,9 @@ async def manual_compact(user_id, session_id, keep=6, instructions=""):
     return {"compacted": True, "trigger": "manual", "dropped_messages": dropped,
             "kept_messages": kept, "summary_tokens": summary_tokens,
             "before_messages": total, "after_messages": kept,
-            "message": "已压缩 " + str(dropped) + " 条较早消息 → 摘要约 " + str(summary_tokens) + " tokens，保留最近 " + str(len(preserved)) + " 条"}
+            "message": "已压缩 " + str(dropped) + " 条较早消息 → 摘要约 " + str(summary_tokens)
+                       + " tokens；保留 " + str(kept) + " 条（最近 "
+                       + str(len(preserved)) + " 条 + 1 条摘要）"}
 
 
 async def enforce_soft_limit(user_id, session_id, pending_text=""):
@@ -167,23 +199,59 @@ async def enforce_soft_limit(user_id, session_id, pending_text=""):
         keep_from = i
     keep_from = min(keep_from, max(0, len(messages) - AUTO_MIN_KEEP_MESSAGES))
     keep_from = _safe_keep_from(messages, keep_from)
+
     old = messages[:keep_from]
     preserved = messages[keep_from:]
     if not old:
         return None
 
-    dialog = _dialog_text(old)
-    summary = await _summarize(ur, SUMMARY_PROMPT.format(extra="", messages=dialog))
-    if not summary:
-        return None
+    # The summary must bring the history back under the soft line, otherwise
+    # the very next turn compacts again (BUG-06: "after_tokens > soft").  Cap
+    # the summary call and retry with a smaller tail when needed.
+    attempts = 0
+    sm = None
+    st = 0
+    after = 0
+    while True:
+        tail_tokens = message_token_counter(preserved)
+        # Cap the summary inside the recovery budget, not just the soft line:
+        # keeping ~25% headroom is what stops every following turn from
+        # compacting again (BUG-06).
+        cap = max(128, min(target, soft - 32) - tail_tokens - 32)
+        summary = await _summarize(
+            ur, SUMMARY_PROMPT.format(extra="", messages=_dialog_text(old)),
+            max_tokens=min(4096, cap),
+        )
+        if not summary:
+            return None
+        sm = _summary_message(summary, "auto")
+        st = estimate_tokens(summary)
+        after = message_token_counter(preserved) + st
+        if after <= soft or attempts >= 2 or not preserved:
+            break
+        # Fold the oldest half of the preserved tail into the next summary
+        # pass; never start the tail on an orphan tool message.
+        move_to = _safe_keep_from(messages, keep_from + max(1, len(preserved) // 2))
+        if move_to <= keep_from:
+            break
+        keep_from = move_to
+        old = messages[:keep_from]
+        preserved = messages[keep_from:]
+        attempts += 1
 
-    sm = _summary_message(summary, "auto")
+    if after > soft and preserved:
+        # Last resort: drop raw tail messages (without summarising) so the
+        # next turn cannot compact on the same history again.
+        limit = _tail_keep_from(messages, keep_from, max(0, soft - st))
+        if limit is not None and limit > keep_from:
+            keep_from = limit
+            preserved = messages[keep_from:]
+            after = message_token_counter(preserved) + st
+
     await ur.store.set(user_id, session_id, [sm, *preserved])
     dropped = len(old)
     kept = len(preserved) + 1
-    st = estimate_tokens(summary)
     await _record_visible_summary(session_id, user_id, summary, "auto", st, kept, dropped)
-    after = message_token_counter(preserved) + st
     return {"trigger": "auto", "dropped_messages": dropped, "kept_messages": kept,
             "summary_tokens": st, "before_tokens": total, "after_tokens": after, "soft_limit": soft}
 

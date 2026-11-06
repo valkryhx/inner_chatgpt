@@ -8,15 +8,20 @@ import LoginPage from './components/LoginPage'
 import SettingsModal from './components/SettingsModal'
 import TeamPanel from './components/TeamPanel'
 
+// 面板展开状态按用户隔离：同一浏览器换账号登录时不应继承上一个人的偏好。
 const TEAM_OPEN_KEY = 'team_panel_open'
 
 function newGenId() {
   return 'g_' + Math.random().toString(16).slice(2, 10)
 }
 
-function readTeamOpen(): boolean {
+function teamOpenKey(userId?: string | null): string {
+  return userId ? `${TEAM_OPEN_KEY}:${userId}` : TEAM_OPEN_KEY
+}
+
+function readTeamOpen(userId?: string | null): boolean {
   try {
-    return localStorage.getItem(TEAM_OPEN_KEY) === '1'
+    return localStorage.getItem(teamOpenKey(userId)) === '1'
   } catch {
     return false
   }
@@ -49,6 +54,15 @@ function appendReasoningBlock(blocks: any[], chunk: string): any[] {
 
 
 function mergeTeamEvent(prev: TeamSnapshot | null, event: TeamEvent): TeamSnapshot | null {
+  // Team creation can fail (quota/DB) while the ordinary turn still runs.  Keep
+  // the event even when no team snapshot exists, so the panel and the notice
+  // bar can explain why no task board appeared.
+  if (event.type === 'team_unavailable') {
+    const base = prev || { team: null, tasks: [], events: [], messages: [] }
+    const events = [...base.events.filter((e) => e.event_seq !== event.event_seq), event]
+      .sort((a, b) => a.event_seq - b.event_seq)
+    return { team: base.team, tasks: base.tasks, events, messages: base.messages }
+  }
   // 新 Team 的 team_start 必须能替换旧代快照，否则同一会话下一轮生成期间
   // 会一直显示上一轮的旧任务板（generation/team id 都不同）。
   if (event.type === 'team_start' && (!prev?.team || prev.team.team_id !== event.team_id)) {
@@ -71,7 +85,14 @@ function mergeTeamEvent(prev: TeamSnapshot | null, event: TeamEvent): TeamSnapsh
   let tasks = prev.tasks
   let messages = prev.messages
   let team = prev.team
-  if (event.type === 'task_created' || event.type === 'task_updated') {
+  if (event.type === 'team_resumed') {
+    // The backend snapshots the previous generation's open board.  Keep the
+    // restored rows in the same snapshot so the panel updates on first paint.
+    const restoredTasks = event.payload.tasks
+    const restoredMessages = event.payload.messages
+    if (Array.isArray(restoredTasks)) tasks = restoredTasks as TeamSnapshot['tasks']
+    if (Array.isArray(restoredMessages)) messages = restoredMessages as TeamSnapshot['messages']
+  } else if (event.type === 'task_created' || event.type === 'task_updated') {
     const task = event.payload.task as TeamSnapshot['tasks'][number] | undefined
     if (task?.task_id) {
       const exists = tasks.some((t) => t.task_id === task.task_id)
@@ -109,7 +130,8 @@ export default function App() {
   const [pendingModelId, setPendingModelId] = useState<string>('')
   const [error, setError] = useState<string | null>(null)
   const [teamSnapshot, setTeamSnapshot] = useState<TeamSnapshot | null>(null)
-  const [teamOpen, setTeamOpen] = useState(readTeamOpen)
+  const [teamError, setTeamError] = useState<string | null>(null)
+  const [teamOpen, setTeamOpen] = useState(false)
   const [teamGenerationId, setTeamGenerationId] = useState<string>('')
   const [notice, setNotice] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -120,13 +142,25 @@ export default function App() {
   // 正在本端流式生成的会话 id；用于阻止历史加载覆盖乐观渲染的消息
   const streamSidRef = useRef<string | null>(null)
 
+  // Restore the panel preference once the account is known, then persist it.
+  // One effect keeps the restore from being overwritten by a premature write.
+  const prevUserIdRef = useRef<string | null>(null)
   useEffect(() => {
+    if (!user) {
+      prevUserIdRef.current = null
+      return
+    }
+    if (prevUserIdRef.current !== user.id) {
+      prevUserIdRef.current = user.id
+      setTeamOpen(readTeamOpen(user.id))
+      return
+    }
     try {
-      localStorage.setItem(TEAM_OPEN_KEY, teamOpen ? '1' : '0')
+      localStorage.setItem(teamOpenKey(user.id), teamOpen ? '1' : '0')
     } catch {
       /* localStorage may be unavailable in hardened browsers. */
     }
-  }, [teamOpen])
+  }, [user?.id, teamOpen])
 
   useEffect(() => {
     if (!notice) return
@@ -385,6 +419,7 @@ export default function App() {
     if (!text.trim() || streaming) return
     setError(null)
     setTeamSnapshot(null)
+    setTeamError(null)
 
     const tempSid = activeId || 'pending'
     const genId = newGenId()
@@ -523,6 +558,12 @@ export default function App() {
       } else if (ev.type === 'team_event') {
         setTeamGenerationId(genId)
         setTeamSnapshot((prev) => mergeTeamEvent(prev, ev.event))
+        if (ev.event.type === 'team_unavailable') {
+          const reason = ev.event.payload?.error
+          setTeamError(typeof reason === 'string' && reason ? reason : '未知原因')
+        } else if (ev.event.type === 'team_start') {
+          setTeamError(null)
+        }
       } else if (ev.type === 'compaction') {
         setAutoCompacted((n) => n + 1)
       } else if (ev.type === 'done') {
@@ -688,6 +729,14 @@ export default function App() {
             </select>
           </label>
         </div>
+        {teamError && (
+          <div className="notice-bar team-warn">
+            Team 本轮不可用：{teamError}
+            <button className="ghost-btn" style={{ marginLeft: 10 }} onClick={() => setTeamError(null)}>
+              关闭
+            </button>
+          </div>
+        )}
         {notice && (
           <div className="notice-bar">
             {notice}

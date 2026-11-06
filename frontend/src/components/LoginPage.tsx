@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type FormEvent } from 'react'
 import { api, setToken } from '../api'
 import type { User } from '../types'
 
@@ -20,7 +20,7 @@ export default function LoginPage({ onAuthed }: Props) {
   const canSubmit = mode === 'login' ? !!identifier.trim() && !!password : !!email.trim() && !!password
 
   const submit = async () => {
-    if (!canSubmit) return
+    if (!canSubmit || busy) return
     setBusy(true)
     setError(null)
     try {
@@ -42,6 +42,13 @@ export default function LoginPage({ onAuthed }: Props) {
     }
   }
 
+  // A real <form> gives Enter-to-submit and password-manager autofill; the
+  // hand-rolled keydown handler only worked when focus was in the password box.
+  const onSubmit = (e: FormEvent) => {
+    e.preventDefault()
+    submit()
+  }
+
   return (
     <div className="auth-page">
       <div className="auth-card">
@@ -51,14 +58,14 @@ export default function LoginPage({ onAuthed }: Props) {
           <p>HX 的智能 Agent 工作台</p>
         </div>
         <div className="auth-tabs">
-          <button className={mode === 'login' ? 'active' : ''} onClick={() => setMode('login')}>
+          <button type="button" className={mode === 'login' ? 'active' : ''} onClick={() => setMode('login')}>
             登录
           </button>
-          <button className={mode === 'register' ? 'active' : ''} onClick={() => setMode('register')}>
+          <button type="button" className={mode === 'register' ? 'active' : ''} onClick={() => setMode('register')}>
             注册
           </button>
         </div>
-        <div className="auth-form">
+        <form className="auth-form" onSubmit={onSubmit}>
           {mode === 'register' && (
             <label>
               <span>昵称</span>
@@ -106,16 +113,13 @@ export default function LoginPage({ onAuthed }: Props) {
               onChange={(e) => setPassword(e.target.value)}
               placeholder="至少 4 位"
               autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') submit()
-              }}
             />
           </label>
           {error && <div className="auth-error">{error}</div>}
-          <button className="auth-submit" onClick={submit} disabled={busy || !canSubmit}>
+          <button type="submit" className="auth-submit" disabled={busy || !canSubmit}>
             {busy ? '请稍候…' : mode === 'login' ? '登录' : '注册并登录'}
           </button>
-        </div>
+        </form>
       </div>
     </div>
   )

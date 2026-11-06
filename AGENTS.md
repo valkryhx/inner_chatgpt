@@ -90,6 +90,7 @@
 
 | 文档 | 用途 |
 |---|---|
+| `docs/20261106-AgentTeam轮次与跨轮任务恢复修复.md` | **Team 轮次/恢复修复（最新）**：subagent 默认轮数 300、`max_turns` 全链路透传、跨 generation 任务板快照恢复、主轮结束后等待 teammate、真实测试清单 |
 | `docs/20261106-AgentTeam侧栏展开状态稳定修复.md` | **Team 侧栏展开状态稳定修复**：SSE `team_event` 协议错位、展开壳与数据解耦、展开偏好持久化、真实浏览器 E2E |
 | `docs/20261106-Agent停止卡死与陈旧租约自愈.md` | **停止可靠性（最新）**：协作停 + task.cancel + 资源级联三层停止、进程内 generation registry、reservation TTL、陈旧 active 租约自愈、前端本地优先停止、真实 LLM E2E |
 | `docs/20261106-changelog-AgentTeamP3.md` | **P3 已完成清单 + 真实 E2E 验收（最新，先读这份）** |
@@ -109,6 +110,9 @@
 | `docs/20261105-changelog-侧栏身份区与设置弹窗.md` | **侧栏身份区重做 + 设置弹窗定高**：全名替字母头像、整行可点进设置、登出降级为次要动作；modal 固定高度，切 tab 不跳尺寸 |
 | `docs/20261105-Skill目录包导入与公用技能设计与实施.md` | **Skill 目录包导入 + 公用技能层**：三层模型 builtin/shared/user、zip 安全解压（穿越/软链/炸弹防护）、`backend/skills_shared/` 公用目录、已导入 2 个 Codex 技能 |
 | `docs/20261105-Subagent调研与设计方案.md` | **P2 设计文档（已实施）**：GA 进程树 vs Aivory 子任务 的调研对比、进程内 asyncio subagent 架构、`AgentContext` 多租户贯穿、5 个编排工具契约、停止/超时/失败语义、前端 subagent block、6 阶段实施蓝本与测试计划 |
+| `docs/20261106-Web自测Bug修复记录.md` | **Web 自测 14 项 Bug 修复记录（最新）**：子代理角色/Team 配额泄漏/压缩不变量/前端可见性逐条根因、改动文件、真实环境复验命令 |
+| `docs/20261106-Web自测Bug修复-测试方案.md` | **修复验收测试方案**：pytest / API / Playwright 三层用例矩阵、一键运行（`work/claude_test_and_review/_fix_verify_all.py`）、验收标准与已知限制 |
+| `docs/20261106-Codex修复须知-Web自测Bug.md` | 自测 Bug 的修复建议单（含优先级、建议改法、验收与回归清单） |
 
 ### 0.3 目录约定（写文件前先确认放在哪个目录）
 

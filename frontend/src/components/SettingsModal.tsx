@@ -345,7 +345,18 @@ function McpSection() {
     setBusy(true)
     try {
       const r = await api.mcpImport(jsonText)
-      setNotice(r.message || '导入完成')
+      const counts: string[] = []
+      if (r.added.length) counts.push(`新增 ${r.added.length}`)
+      if (r.updated.length) counts.push(`更新 ${r.updated.length}`)
+      if (r.skipped.length) counts.push(`跳过 ${r.skipped.length}`)
+      setNotice(
+        (r.message || '导入完成') + (counts.length ? `（${counts.join('，')}）` : ''),
+      )
+      // Per-server failures are returned in OK responses; a bare "导入完成"
+      // hides them and the user cannot tell which entry was rejected.
+      if (r.errors?.length) {
+        setError('以下条目未导入：' + r.errors.join('；'))
+      }
       dirtyRef.current = false
       await load(true)
     } catch (e: any) {

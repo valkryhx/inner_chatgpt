@@ -129,10 +129,14 @@ class SubagentRegistry:
                     f"同时存活的子代理已达上限 {self.max_active}；请先 close_agent 释放槽位"
                 )
 
-        effective_role = "teammate" if team_id else role
+        # A child that participates in a team is always a teammate, even when
+        # the caller did not pass team_id explicitly (it inherits the parent's
+        # team).  Passing parent_ctx.role here would make the child a "lead"
+        # and break build_teammate_tools() in SubagentRuntime.
+        effective_role = "teammate" if (team_id or parent_ctx.team_id) else role
         ctx = parent_ctx.child(
             name, team_id=team_id,
-            role="teammate" if team_id else parent_ctx.role,
+            role="teammate",
         )
         node = AgentNode(agent_id=ctx.agent_id, name=name, ctx=ctx, role=effective_role)
         self._nodes[name] = node

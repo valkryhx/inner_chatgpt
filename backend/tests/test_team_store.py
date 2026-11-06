@@ -147,3 +147,66 @@ def test_restart_recovery_releases_stale_leases_and_tasks(isolated_db):
         team = await team_store.get_team(s)
         assert team is not None and team["status"] == "stale"
     run(flow())
+
+
+def test_create_team_resumes_open_board_across_generations(isolated_db):
+    async def flow():
+        first = scope(gid="g1", tid="t1")
+        await team_store.acquire_generation("u1", "s1", "g1")
+        await team_store.create_team(first, name="first")
+        a = await team_store.create_task(first, subject="draft")
+        b = await team_store.create_task(first, subject="review", blocked_by=[a["task_id"]])
+        assert (await team_store.claim_task(first, a["task_id"], expected_version=0))["ok"]
+        await team_store.send_message(
+            first, recipient="lead", kind="note", content="draft is ready"
+        )
+        await team_store.set_team_status(first, "stale")
+
+        second = scope(gid="g2", tid="t2")
+        await team_store.acquire_generation("u1", "s1", "g2")
+        await team_store.create_team(second, name="second")
+        tasks = await team_store.list_tasks(second)
+        assert len(tasks) == 2
+        resumed = {t["subject"]: t for t in tasks}
+        assert resumed["draft"]["status"] == "pending"
+        assert resumed["draft"]["owner_agent_id"] == ""
+        assert resumed["review"]["status"] == "pending"
+        assert resumed["review"]["blockedBy"] == [resumed["draft"]["task_id"]]
+        assert all(t["task_id"] not in (a["task_id"], b["task_id"]) for t in tasks)
+        messages = await team_store.list_messages(second)
+        assert [m["content"] for m in messages] == ["draft is ready"]
+        events = await team_store.events_since(second, 0)
+        resume_event = next(e for e in events if e["event_type"] == "team_resumed")
+        assert resume_event["payload"]["source_team_id"] == "t1"
+        assert resume_event["payload"]["source_generation_id"] == "g1"
+        assert resume_event["payload"]["open_task_count"] == 2
+        assert resume_event["payload"]["message_count"] == 1
+        # The source board remains an immutable audit snapshot.
+        old_a = await team_store.get_task(first, a["task_id"])
+        assert old_a is not None and old_a["status"] == "in_progress"
+
+    run(flow())
+
+
+def test_resume_does_not_cross_user_or_copy_completed_only(isolated_db):
+    async def flow():
+        first = scope(uid="u1", sid="s1", gid="g1", tid="t1")
+        await team_store.create_team(first, name="first")
+        done = await team_store.create_task(first, subject="done")
+        assert (await team_store.claim_task(first, done["task_id"], expected_version=0))["ok"]
+        assert (await team_store.complete_task(first, done["task_id"], expected_version=1))["ok"]
+        await team_store.set_team_status(first, "stale")
+
+        other = scope(uid="u2", sid="s1", gid="g2", tid="t2")
+        await team_store.create_team(other, name="other")
+        assert await team_store.list_tasks(other) == []
+
+        second = scope(uid="u1", sid="s1", gid="g2", tid="t3")
+        await team_store.create_team(second, name="second")
+        assert await team_store.list_tasks(second) == []
+        assert not any(
+            e["event_type"] == "team_resumed"
+            for e in await team_store.events_since(second, 0)
+        )
+
+    run(flow())

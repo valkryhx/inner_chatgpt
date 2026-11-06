@@ -174,6 +174,7 @@ class SubagentHost:
             node.result = _final_text(runtime.history) if runtime is not None else ""
         except asyncio.CancelledError:
             node.status = "stopped"
+            node.turns = _count_turns(runtime.history) if runtime is not None else 0
             node.result = _final_text(runtime.history)
             raise
         except Exception as e:  # noqa: BLE001
@@ -360,6 +361,23 @@ class SubagentHost:
                     pass
 
     # ---------------- lifecycle ----------------
+    def has_active(self) -> bool:
+        """Whether any child still needs a join before the SSE can close."""
+        return bool(self.registry.active_nodes())
+
+    def stop_all_now(self) -> None:
+        """Synchronously signal/cancel every child task.
+
+        Used from the parent's cancellation-safe ``finally`` so child tasks do
+        not keep running (and holding quota) after the SSE task is cancelled.
+        The actual unwind/lease release happens in each child's own finally.
+        """
+        for n in self.registry.active_nodes():
+            n.stop.set()
+            if n.task is not None and not n.task.done():
+                n.task.cancel()
+        self._touch()
+
     async def stop_all(self) -> None:
         """用户点「停止」：把本代所有子代理标记停止并取消。
 
@@ -369,17 +387,13 @@ class SubagentHost:
         is reported stopped.  Bounded wait keeps the stop endpoint responsive
         even if a tool ignores cancellation.
         """
-        tasks = []
-        for n in self.registry.active_nodes():
-            n.stop.set()
-            if n.task is not None and not n.task.done():
-                n.task.cancel()
-                tasks.append(n.task)
-        self._touch()
+        self.stop_all_now()
+        tasks = [n.task for n in self.registry.active_nodes()
+                 if n.task is not None and not n.task.done()]
         if tasks:
             try:
                 await asyncio.wait(tasks, timeout=1.5)
-            except Exception:
+            except BaseException:
                 pass
 
     async def close_all(self) -> None:

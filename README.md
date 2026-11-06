@@ -119,12 +119,13 @@ npm run build        # 生成 frontend/dist
 | `APP_JWT_SECRET` | JWT 签名密钥，生产环境务必设置 | 开发用内置值 |
 | `AGENT_SOFT_LIMIT` | 覆盖自动压缩的 token 软线阈值（调参/演示用） | 取该用户模型的 `auto_compact_tokens`，否则 90% 上下文窗口 |
 | `AGENT_HARD_LIMIT` | 覆盖硬线裁剪的 token 阈值 | 取该用户模型的 `hard_limit_tokens`，否则 95% 上下文窗口 |
-| `AGENT_MAX_TURNS` | 单轮请求内 Agent 循环的最大模型轮数（防死循环） | 48 |
+| `AGENT_MAX_TURNS` | 单轮请求内 Agent 循环的最大模型轮数（防死循环） | 300 |
 | `MCP_CONNECT_TIMEOUT` | 单个用户 MCP server 的连接超时（秒），超时/失败自动跳过 | 12 |
 | `SUBAGENT_MAX_DEPTH` | 子代理最大派生深度（防止无限套娃） | 2 |
 | `SUBAGENT_MAX_ACTIVE` | 每个会话同时存活的子代理上限（每会话，非全局） | 4 |
 | `SUBAGENT_TIMEOUT_S` | 单个子代理的墙钟超时（秒），超时置 stopped | 300 |
-| `SUBAGENT_MAX_TURNS` | 单个子代理的模型轮数上限 | 24 |
+| `SUBAGENT_MAX_TURNS` | 单个子代理的模型轮数上限；也可由 `spawn_agent` / `spawn_teammate` 的 `max_turns` 参数覆盖 | 300 |
+| `TEAM_DRAIN_TIMEOUT_S` | Lead 已结束但 teammate 仍运行时，SSE 等待 teammate 完成的上限（秒）；超时会停止 teammate | 300 |
 
 示例：`AGENT_SOFT_LIMIT=200 python run.py`（可快速演示自动压缩）。
 

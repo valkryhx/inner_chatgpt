@@ -405,3 +405,39 @@ def test_prepare_turn_team_releases_lease_on_create_failure(monkeypatch):
     assert turn.team is None
     assert team.released == 1
     assert turn.buffer.events[0]["event"]["payload"]["error"].startswith("RuntimeError")
+
+
+def test_merged_events_waits_for_live_child_after_main_done():
+    from app.routers.chat import _merged_events
+
+    async def main_gen():
+        yield {"type": "done", "status": "complete"}
+
+    class Host:
+        active = True
+
+        def has_active(self):
+            return self.active
+
+        async def stop_all(self):
+            self.active = False
+
+    async def scenario():
+        buf = EventBuffer()
+        host = Host()
+
+        async def child():
+            await asyncio.sleep(0.05)
+            buf.put({"type": "subagent_end", "agent_id": "sub:x", "status": "completed",
+                     "result": "done", "turns": 3})
+            host.active = False
+
+        task = asyncio.create_task(child())
+        out = []
+        async for ev in _merged_events(main_gen(), buf, host):
+            out.append(ev["type"])
+        await task
+        return out
+
+    types = run(scenario())
+    assert "subagent_end" in types

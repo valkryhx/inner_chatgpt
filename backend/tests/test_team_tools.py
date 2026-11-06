@@ -123,12 +123,13 @@ def test_spawn_protocol_passes_server_scope_and_binds_owner(isolated_db):
         reg = build_team_tool_registry(host)
         out = json.loads(await reg.dispatch("spawn_teammate", {
             "task_name": "a", "message": "go", "team_task_id": task["task_id"],
-            "expected_version": 0, "user_id": "malicious",
+            "expected_version": 0, "max_turns": 45, "user_id": "malicious",
         }))
         assert out["ok"] is True
         assert out["task"]["owner_agent_id"] == "sub:a"
         assert calls[0]["scope"].user_id == "u1"
         assert calls[0]["owner_agent_id"] == "sub:a"
+        assert calls[0]["max_turns"] == 45
 
     run(flow())
 

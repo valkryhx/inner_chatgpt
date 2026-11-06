@@ -136,7 +136,10 @@ textarea, input { caret-color: var(--clay); }
   height: 52px; flex-shrink: 0; border-bottom: 1px solid var(--line); background: var(--canvas);
   display: flex; align-items: center; padding: 0 18px; gap: 12px;
 }
-.main-header .title { font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.main-header .title {
+  font-weight: 600; flex: 1; min-width: 120px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
 .badge { font-size: 11px; color: var(--muted); background: var(--surface); padding: 3px 8px; border-radius: 999px; font-variant-numeric: tabular-nums; }
 .ghost-btn {
   background: transparent; border: 1px solid var(--line); color: var(--ink-2);
@@ -147,10 +150,12 @@ textarea, input { caret-color: var(--clay); }
 .ghost-btn:disabled { opacity: .45; cursor: default; }
 
 .messages {
-  flex: 1; overflow-y: auto; padding: 32px 0 24px;
+  flex: 1; min-height: 0; overflow-y: auto; padding: 32px 0 24px;
   /* 禁用浏览器“猜测锚点”的自动滚动；由 active 状态显式吸附底部。 */
   overflow-anchor: none;
   overscroll-behavior: contain;
+  /* 滚动条出现/消失时不改变正文可用宽度，避免重新换行造成抖动。 */
+  scrollbar-gutter: stable;
 }
 .messages-inner { width: 100%; max-width: calc(var(--measure) + 40px); margin: 0 auto; padding: 0 20px; display: flex; flex-direction: column; gap: 26px; }
 .empty {
@@ -318,6 +323,8 @@ textarea, input { caret-color: var(--clay); }
   line-height: 1.6;
 }
 .composer-hint-sep { margin: 0 6px; color: var(--line-strong); }
+/* 生成中：上下文数字是上一轮的快照，压低对比度表示“暂未更新” */
+.hint-streaming { color: var(--muted); opacity: .8; }
 
 /* ===== 多用户：登录页 ===== */
 .booting { height: 100vh; display: flex; align-items: center; justify-content: center; color: var(--muted); }
@@ -504,6 +511,7 @@ textarea, input { caret-color: var(--clay); }
   padding: 8px 18px; background: var(--clay-soft); color: var(--ink-2);
   border-bottom: 1px solid var(--line); font-size: 13px; display: flex; align-items: center;
 }
+.team-warn { background: #fbeeec; color: var(--danger); border-bottom-color: #e8c9c5; }
 
 /* ===== MCP：标准 mcp.json 编辑框 ===== */
 .form-grid textarea.mcp-json {
@@ -649,7 +657,13 @@ textarea, input { caret-color: var(--clay); }
     border-right: none; border-bottom: 1px solid var(--line);
   }
   .sidebar-header { padding: 10px 12px; }
-  .session-list { max-height: 17vh; }
+  .session-list {
+    max-height: 17vh;
+    /* 列表高度随视口变化，必然会在某一行中间截断；底部渐隐明确表示“还能滚动”。 */
+    -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), transparent);
+            mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), transparent);
+    scrollbar-gutter: stable;
+  }
   /* 小屏不再整块隐藏身份区：否则手机上没有入口进设置/登出。
      改为只保留「身份 + 登出」这一行，隐藏模型/工具状态行。 */
   .sidebar-footer { display: flex; padding: 6px 8px; gap: 0; }
@@ -702,6 +716,15 @@ textarea, input { caret-color: var(--clay); }
   .model-picker select { max-width: 190px; }
   .messages-inner { padding: 0 16px; }
   .user-email { display: none; }
+}
+
+/* 中屏（≤1180）+ Team 面板展开：给标题保底宽度，压缩模型选择器 */
+@media (max-width: 1180px) {
+  .main-header { gap: 8px; }
+  .main-header .title { min-width: 160px; font-size: 14px; }
+  .main-header .badge { display: none; }
+  .model-picker-label { display: none; }
+  .model-picker select { max-width: 180px; }
 }
 
 /* ===== 子代理卡片（P2）：一次 spawn 一张卡，默认折叠 ===== */

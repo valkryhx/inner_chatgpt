@@ -102,6 +102,7 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext) -> TurnRuntime:
         return await host.spawn(
             task_name=str(kwargs.get("task_name", "")),
             message=str(kwargs.get("message", "")),
+            max_turns=int(kwargs.get("max_turns", 0) or 0),
             team_id=team_id,
             role="teammate",
         )

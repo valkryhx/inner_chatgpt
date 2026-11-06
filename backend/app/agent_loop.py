@@ -46,36 +46,116 @@ class AgentLoop:
 
     # ---------- sanitation: repair dangling tool_calls ----------
     async def sanitize(self, history: list[dict]) -> bool:
-        """If the tail assistant message has tool_calls lacking matching tool
-        results, repair: re-run known missing tools, else drop that assistant msg.
-        Returns True if changed (caller persists)."""
+        """Repair tool-call protocol leftovers before a new model turn.
+
+        A stopped turn can leave a ``role=tool`` message without its preceding
+        assistant ``tool_calls`` message, or leave part of a multi-call block
+        unanswered.  OpenAI-compatible gateways may report that malformed
+        history as the misleading error "current model does not support
+        function calling".  Remove orphan results and incomplete blocks; replay
+        known missing tools only when the incomplete block is the tail.
+        Returns True if ``history`` was changed (caller should persist it).
+        """
         if not history:
             return False
-        last_ai_idx = None
-        for i in range(len(history) - 1, -1, -1):
-            if history[i].get("role") == "assistant" and history[i].get("tool_calls"):
-                last_ai_idx = i
-                break
-        if last_ai_idx is None:
-            return False
-        ai = history[last_ai_idx]
-        wanted = {tc.get("id"): tc for tc in ai.get("tool_calls", []) if tc.get("id")}
-        have = {m.get("tool_call_id") for m in history[last_ai_idx + 1:] if m.get("role") == "tool"}
-        missing = {tid: tc for tid, tc in wanted.items() if tid not in have}
-        if not missing:
-            return False
-        has_later_non_tool = any(m.get("role") != "tool" for m in history[last_ai_idx + 1:])
-        names = set(self.registry.names())
-        can_replay = all((tc.get("function", {}).get("name") in names) for tc in missing.values())
-        if not has_later_non_tool and can_replay:
-            for tid, tc in missing.items():
-                name = tc.get("function", {}).get("name")
-                args = _safe_json(tc.get("function", {}).get("arguments"))
-                out = await self.registry.dispatch(name, args)
-                history.append({"role": "tool", "tool_call_id": tid, "name": name, "content": out})
-            return True
-        del history[last_ai_idx]
-        return True
+        changed = False
+
+        def call_ids(msg: dict) -> list[str]:
+            return [
+                str(tc.get("id"))
+                for tc in (msg.get("tool_calls") or [])
+                if tc.get("id")
+            ]
+
+        def drop_orphan_tool_messages() -> None:
+            nonlocal changed
+            known = {
+                cid
+                for msg in history
+                if msg.get("role") == "assistant"
+                for cid in call_ids(msg)
+            }
+            kept = [
+                msg for msg in history
+                if msg.get("role") != "tool" or str(msg.get("tool_call_id") or "") in known
+            ]
+            if len(kept) != len(history):
+                history[:] = kept
+                changed = True
+
+        drop_orphan_tool_messages()
+        i = 0
+        while i < len(history):
+            msg = history[i]
+            if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+                i += 1
+                continue
+
+            wanted = call_ids(msg)
+            if not wanted:
+                del history[i]
+                changed = True
+                continue
+
+            j = i + 1
+            while j < len(history) and history[j].get("role") == "tool":
+                j += 1
+
+            have = [str(history[k].get("tool_call_id") or "") for k in range(i + 1, j)]
+            missing = [cid for cid in wanted if cid not in have]
+            if not missing:
+                # Keep exactly one result for each call.  Duplicate results are
+                # also invalid even when the call id itself is known.
+                seen: set[str] = set()
+                block: list[dict] = []
+                for k in range(i + 1, j):
+                    cid = str(history[k].get("tool_call_id") or "")
+                    if cid in wanted and cid not in seen:
+                        block.append(history[k])
+                        seen.add(cid)
+                if len(block) != j - i - 1:
+                    history[i + 1:j] = block
+                    changed = True
+                    i += 1 + len(block)
+                else:
+                    i = j
+                continue
+
+            has_later_non_tool = any(m.get("role") != "tool" for m in history[j:])
+            names = set(self.registry.names()) if self.registry is not None else set()
+            can_replay = all(
+                (tc.get("function") or {}).get("name") in names
+                for tc in (msg.get("tool_calls") or [])
+                if str(tc.get("id") or "") in missing
+            )
+            if not has_later_non_tool and can_replay:
+                for tc in msg.get("tool_calls") or []:
+                    tid = str(tc.get("id") or "")
+                    if tid not in missing:
+                        continue
+                    name = (tc.get("function") or {}).get("name")
+                    args = _safe_json((tc.get("function") or {}).get("arguments"))
+                    out = await self.registry.dispatch(name, args)
+                    history.append({
+                        "role": "tool",
+                        "tool_call_id": tid,
+                        "name": name,
+                        "content": out,
+                    })
+                changed = True
+                i = len(history)
+                continue
+
+            # Keep neither half of an incomplete exchange.  Leaving the tool
+            # result behind is what makes the next request invalid.
+            del history[i:j]
+            changed = True
+            # Inspect the item that shifted into this index.
+
+        # A dropped incomplete assistant block may have left a result whose
+        # call was removed above.
+        drop_orphan_tool_messages()
+        return changed
 
     # ---------- main loop ----------
     async def run_stream(

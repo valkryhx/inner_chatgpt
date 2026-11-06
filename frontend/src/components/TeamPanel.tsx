@@ -20,6 +20,7 @@ const TASK_ORDER: TeamTaskStatus[] = ['in_progress', 'pending', 'completed', 'ca
 
 const EVENT_LABEL: Record<string, string> = {
   team_start: '团队已创建',
+  team_resumed: '任务板已恢复',
   team_end: '团队已结束',
   task_created: '创建任务',
   task_updated: '任务更新',
@@ -49,6 +50,10 @@ function eventDetail(ev: TeamEvent): string {
   }
   if (ev.type === 'team_end') {
     return typeof payload.status === 'string' ? payload.status : ''
+  }
+  if (ev.type === 'team_resumed') {
+    const count = payload.task_count
+    return typeof count === 'number' ? `恢复 ${count} 个任务` : '继承上一轮任务板'
   }
   return ''
 }
@@ -160,7 +165,18 @@ export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop 
           <div className="team-content">
             {tab === 'tasks' && (
               tasks.length === 0 ? (
-                <div className="team-empty">还没有任务。Lead 可通过 task_create 拆解工作。</div>
+                // Every generation opens a Team (root == lead), so a finished
+                // round with no task must read as "no collaboration", not as a
+                // board still waiting to be filled.
+                !active && messages.length === 0 ? (
+                  <div className="team-empty">
+                    {status === 'failed'
+                      ? '本轮 Team 未能启动。'
+                      : '本轮未发生协作（0 任务 0 消息）。'}
+                  </div>
+                ) : (
+                  <div className="team-empty">还没有任务。Lead 可通过 task_create 拆解工作。</div>
+                )
               ) : (
                 <div className="team-task-list">
                   {TASK_ORDER.map((statusKey) => {

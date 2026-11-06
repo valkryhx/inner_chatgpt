@@ -40,7 +40,8 @@ async def create_session(body: CreateSessionIn, user: dict = Depends(get_current
                     break
         if cfg and cfg.get("api_key") and cfg.get("model") and cfg.get("base_url"):
             model_id = cfg["id"]
-    sess = await db.create_session(user["id"], title=body.title or "新会话", model_id=model_id, provider="")
+    title = (body.title or "").strip()[:200] or "新会话"
+    sess = await db.create_session(user["id"], title=title, model_id=model_id, provider="")
     return SessionOut(**sess)
 
 
@@ -125,6 +126,19 @@ async def update_session(session_id: str, body: UpdateSessionIn, user: dict = De
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
     fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if "title" in fields:
+        title = str(fields["title"] or "").strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="title 不能为空")
+        fields["title"] = title[:200]
+    if "model_id" in fields:
+        model_id = str(fields["model_id"] or "").strip()
+        # An empty model_id means "clear the binding"; a non-empty one must be
+        # a config the caller actually owns, otherwise the next send would
+        # fail deep inside the runtime with an opaque error.
+        if model_id and not await db.get_llm_config(user["id"], model_id):
+            raise HTTPException(status_code=400, detail="model_id 不存在或不属于当前用户")
+        fields["model_id"] = model_id
     updated = await db.update_session(session_id, user["id"], **fields)
     return SessionOut(**updated)
 

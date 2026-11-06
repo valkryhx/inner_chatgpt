@@ -123,7 +123,9 @@ function fmtChars(n: number): string {
 }
 
 function ReasoningSection({ text, live }: { text: string; live: boolean }) {
-  const [open, setOpen] = useState(false)
+  // Mounted while live: keep the body open after the phase changes to tool/text.
+  // Historical completed blocks still mount with live=false and stay collapsed.
+  const [open, setOpen] = useState(live)
   const chars = text.length
   return (
     <div className={'reasoning-block' + (live ? ' live' : '')}>
@@ -133,7 +135,7 @@ function ReasoningSection({ text, live }: { text: string; live: boolean }) {
         <span className="reasoning-meta">{fmtChars(chars)}</span>
         <span className="step-caret">{open ? '▾' : '▸'}</span>
       </button>
-      {(open || live) && <div className="reasoning-body">{text}</div>}
+      {open && <div className="reasoning-body">{text}</div>}
     </div>
   )
 }
@@ -196,7 +198,13 @@ function renderBlocks(
     } else if (block.type === 'chart') {
       out.push(<ChartView key={'chart_' + i} spec={block.spec} />)
     } else if (block.type === 'subagent') {
-      out.push(<SubagentCard key={'sub_' + i + '_' + (block as SubagentBlock).agent_id} block={block} />)
+      const sb = block as SubagentBlock
+      // 停止/断连时父 SSE 可能来不及转发子代理的 subagent_end；消息已不在流式时
+      // 不能再把卡片显示成“运行中”（旧版本落库的数据也走这条兜底）。
+      const shown: SubagentBlock = sb.status === 'running' && !streaming
+        ? { ...sb, status: 'stopped' }
+        : sb
+      out.push(<SubagentCard key={'sub_' + i + '_' + sb.agent_id} block={shown} />)
     } else if (block.type === 'text') {
       const text = block.text || ''
       if (text) {
@@ -410,7 +418,7 @@ export default function MessageList({ messages, streaming, autoCompacted, sessio
   useLayoutEffect(() => {
     if (!followRef.current) return
     if (streaming) pinToBottom()
-    else schedulePinToBottom('smooth')
+    else schedulePinToBottom('auto')
   }, [messages, streaming, pinToBottom, schedulePinToBottom])
 
   // 异步图片尺寸（尤其 blob 图片）可能在 React 提交之外改变高度。

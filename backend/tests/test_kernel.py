@@ -85,6 +85,43 @@ def test_sanitize_noop_when_paired():
     assert run(loop.sanitize(history)) is False
 
 
+def test_sanitize_drops_orphan_tool_result():
+    loop = AgentLoop(client=None, registry=ToolRegistry([]), system_prompt="")
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "x", "content": "1"},
+        {"role": "tool", "tool_call_id": "orphan", "name": "x", "content": "stale"},
+        {"role": "user", "content": "continue"},
+    ]
+    assert run(loop.sanitize(history)) is True
+    assert history == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "x", "content": "1"},
+        {"role": "user", "content": "continue"},
+    ]
+
+
+def test_sanitize_drops_incomplete_block_without_leaving_tool_result():
+    loop = AgentLoop(client=None, registry=ToolRegistry([]), system_prompt="")
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "x", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "x", "content": "1"},
+        {"role": "user", "content": "continue"},
+    ]
+    assert run(loop.sanitize(history)) is True
+    assert history == [
+        {"role": "user", "content": "hi"},
+        {"role": "user", "content": "continue"},
+    ]
+
+
 def test_safe_json():
     assert _safe_json('{"a":1}') == {"a": 1}
     assert _safe_json("[1]") == {"_raw": "[1]"}

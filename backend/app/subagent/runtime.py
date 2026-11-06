@@ -91,7 +91,18 @@ class SubagentRuntime:
         # 4b) teammate 只在 Team 作用域内获得受限协作工具。
         # task_create / spawn_teammate / team_status 永不进入 teammate registry。
         if self.ctx.team_id:
-            team_host = TeamHost(TeamScope.from_agent(self.ctx.scope()))
+            # Defensive: the child may inherit team_id without being marked
+            # "teammate" (older contexts / custom callers).  Build an explicit
+            # teammate scope so build_teammate_tools() can never fail here.
+            team_scope = TeamScope(
+                user_id=self.ctx.user_id,
+                session_id=self.ctx.session_id,
+                generation_id=self.ctx.generation_id,
+                team_id=self.ctx.team_id,
+                agent_id=self.ctx.agent_id,
+                role="teammate",
+            )
+            team_host = TeamHost(team_scope)
             for tool in build_teammate_tools(team_host):
                 merged.add(tool)
         self.registry = merged
@@ -99,7 +110,12 @@ class SubagentRuntime:
         # 5) 初始 history：默认只有一条 user message（上下文隔离）
         self.history = self._initial_history()
 
-        self.max_turns = self.spec.max_turns or _env_int("SUBAGENT_MAX_TURNS", 24)
+        # 24 was a legacy hard-coded cap.  It silently truncated both
+        # spawn_agent(max_turns=40/45) and the default teammate budget.  Keep
+        # the same 300-turn ceiling as the root loop unless explicitly set.
+        self.max_turns = self.spec.max_turns or _env_int(
+            "SUBAGENT_MAX_TURNS", _env_int("AGENT_MAX_TURNS", 300)
+        )
         self.loop = AgentLoop(self.client, self.registry, self.system_prompt,
                               max_turns=self.max_turns, history_store=None)
         return self

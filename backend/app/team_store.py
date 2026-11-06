@@ -228,19 +228,34 @@ async def create_team(scope: TeamScope, *, name: str) -> dict[str, Any]:
     ts = now_ms()
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
-        await conn.execute(
-            "INSERT INTO team_runs(team_id,user_id,session_id,generation_id,lead_agent_id,name,status,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?, 'active', ?,?)",
-            (scope.team_id, scope.user_id, scope.session_id, scope.generation_id,
-             scope.agent_id, name or "Agent Team", ts, ts),
-        )
-        await conn.execute(
-            "INSERT INTO team_events(team_id,event_seq,user_id,session_id,generation_id,agent_id,event_type,payload,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (scope.team_id, 1, scope.user_id, scope.session_id, scope.generation_id,
-             scope.agent_id, "team_start", json.dumps({"name": name}, ensure_ascii=False), ts),
-        )
-        await conn.commit()
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            await conn.execute(
+                "INSERT INTO team_runs(team_id,user_id,session_id,generation_id,lead_agent_id,name,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?, 'active', ?,?)",
+                (scope.team_id, scope.user_id, scope.session_id, scope.generation_id,
+                 scope.agent_id, name or "Agent Team", ts, ts),
+            )
+            await conn.execute(
+                "INSERT INTO team_events(team_id,event_seq,user_id,session_id,generation_id,agent_id,event_type,payload,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (scope.team_id, 1, scope.user_id, scope.session_id, scope.generation_id,
+                 scope.agent_id, "team_start", json.dumps({"name": name}, ensure_ascii=False), ts),
+            )
+            from .team_resume import copy_resume_taskboard
+            resumed = await copy_resume_taskboard(conn, scope, ts)
+            if resumed is not None:
+                await conn.execute(
+                    "INSERT INTO team_events(team_id,event_seq,user_id,session_id,generation_id,agent_id,event_type,payload,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (scope.team_id, 2, scope.user_id, scope.session_id, scope.generation_id,
+                     scope.agent_id, "team_resumed",
+                     json.dumps(resumed, ensure_ascii=False), ts),
+                )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
     return await get_team(scope) or {}
 
 

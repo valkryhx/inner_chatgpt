@@ -25,6 +25,9 @@ frontend/.vite/
 npm-debug.log*
 pnpm-debug.log*
 
+# playwright-cli 调试产物（截图/快照/网络日志）
+.playwright-cli/
+
 # misc
 .DS_Store
 Thumbs.db

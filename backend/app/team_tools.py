@@ -96,11 +96,16 @@ def _build_tools(host: TeamHost, *, teammate: bool) -> list[Tool]:
                 version = int(version)
             except (TypeError, ValueError):
                 return _err("expected_version 必须是整数")
+        try:
+            max_turns = int(args.get("max_turns", 0) or 0)
+        except (TypeError, ValueError):
+            return _err("max_turns 必须是整数")
         out = await host.spawn_teammate(
             task_name=str(args.get("task_name", "")),
             message=str(args.get("message", "")),
             team_task_id=task_id,
             expected_version=version,
+            max_turns=max_turns,
         )
         return _json(out)
 
@@ -187,6 +192,7 @@ def _build_tools(host: TeamHost, *, teammate: bool) -> list[Tool]:
                         "message": {"type": "string"},
                         "team_task_id": {"type": "string"},
                         "expected_version": {"type": "integer"},
+                        "max_turns": {"type": "integer", "description": "可选，覆盖默认轮数上限（默认 300）"},
                     },
                     "required": ["task_name", "message"],
                 }, spawn_teammate,

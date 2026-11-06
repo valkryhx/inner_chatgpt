@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -24,9 +26,29 @@ from ..subagent.session import build_turn_runtime, prepare_turn_team
 _SUBAGENT_EVENT_ID = "__subagent__"
 
 
-async def _merged_events(main_gen, buffer, host):
-    """把主代理事件流与子代理事件流合并成一条（顺序 = 真实发生顺序）。"""
+async def _merged_events(main_gen, buffer, host, stop_event=None):
+    """Merge main and child events; wait briefly for live children at main EOF.
+
+    A root model can legitimately finish its response immediately after
+    spawning a teammate.  The old implementation closed the child buffer at
+    that instant, so a reviewer could be marked stopped after 0 turns while it
+    was still starting.  Keep the SSE alive while child tasks are active.
+    Users can still stop through the normal stop path.
+    """
     q: asyncio.Queue = asyncio.Queue()
+
+    def has_active() -> bool:
+        fn = getattr(host, "has_active", None)
+        try:
+            return bool(fn()) if callable(fn) else False
+        except Exception:
+            return False
+
+    def drain_timeout() -> float:
+        try:
+            return max(0.5, float(os.environ.get("TEAM_DRAIN_TIMEOUT_S", "300")))
+        except (TypeError, ValueError):
+            return 300.0
 
     async def pump_main():
         try:
@@ -46,13 +68,36 @@ async def _merged_events(main_gen, buffer, host):
 
     t_main = asyncio.create_task(pump_main())
     t_sub = asyncio.create_task(pump_sub())
+    main_done = False
+    deadline = 0.0
     try:
         while True:
-            ev = await q.get()
+            timeout = None
+            if main_done:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                if not has_active():
+                    break
+                if not deadline:
+                    deadline = asyncio.get_running_loop().time() + drain_timeout()
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    stop_all = getattr(host, "stop_all", None)
+                    if callable(stop_all):
+                        await stop_all()
+                    break
+                timeout = min(0.25, remaining)
+            try:
+                ev = await asyncio.wait_for(q.get(), timeout=timeout)
+            except asyncio.TimeoutError:
+                continue
             if ev.get("type") == _SUBAGENT_EVENT_ID:
-                break
+                main_done = True
+                continue
             yield ev
-        # 主循环结束：若还有未消费的子代理事件，短暂排空后收尾
+
+        # Drain events already queued by an agent that became terminal between
+        # the last queue read and the has_active() check.
         try:
             while True:
                 ev = await asyncio.wait_for(q.get(), timeout=0.2)
@@ -80,6 +125,94 @@ class _TurnUR:
         self.store = turn.store
         self.model = turn.model
         self.user_id = getattr(turn, "user_id", "")
+
+logger = logging.getLogger(__name__)
+
+
+async def _settle_turn(turn, user_id: str, session_id: str, generation_id: str,
+                       status: str) -> None:
+    """Background fallback used when the request task was cancelled mid-cleanup.
+
+    A fresh task is outside the anyio cancel scope, so these awaits can finish.
+    """
+    try:
+        await turn.host.close_all()
+    except BaseException:
+        pass
+    if turn.team is not None:
+        try:
+            await turn.team.set_status(status)
+        except BaseException:
+            pass
+    try:
+        await team_store.release_generation(user_id, session_id, generation_id)
+    except BaseException:
+        pass
+
+
+async def _cleanup_turn(turn, hub, user_id: str, session_id: str, generation_id: str,
+                        team_id: str, status: str) -> None:
+    """Release a turn's resources without letting cancellation skip cleanup.
+
+    Order matters: the synchronous releases run before any ``await`` so a
+    cancelled anyio scope cannot interrupt them.  Every later await is guarded
+    with ``BaseException`` (``CancelledError`` is not an ``Exception``);
+    if one is interrupted we schedule a fresh task to finish the rest.
+    """
+    # 1) Cancellation-proof, synchronous releases.
+    release_pending = None
+    if turn.team is not None:
+        release_now = getattr(turn.team, "release_lifecycle_now", None)
+        if callable(release_now):
+            try:
+                release_now()
+            except BaseException:
+                logger.warning("release team lifecycle lease failed", exc_info=True)
+        else:  # legacy/test doubles without the sync release
+            release_pending = getattr(turn.team, "release_lifecycle", None)
+    stop_now = getattr(turn.host, "stop_all_now", None)
+    try:
+        if callable(stop_now):
+            stop_now()
+    except BaseException:
+        logger.warning("stop subagent tasks failed", exc_info=True)
+    try:
+        hub.unregister_subagent_host(user_id, session_id, generation_id, team_id)
+    except TypeError:
+        try:
+            hub.unregister_subagent_host(session_id, generation_id)
+        except BaseException:
+            logger.warning("unregister subagent host failed", exc_info=True)
+    except BaseException:
+        logger.warning("unregister subagent host failed", exc_info=True)
+
+    # 2) Async cleanup; each await is independent.  On any interruption the
+    # remaining bookkeeping moves to a fresh task outside the cancel scope, so
+    # team_end is emitted once rather than once here and once again there.
+    def _schedule_settle() -> None:
+        try:
+            asyncio.create_task(_settle_turn(turn, user_id, session_id, generation_id, status))
+        except BaseException:
+            logger.warning("schedule turn settle failed", exc_info=True)
+
+    if callable(release_pending):
+        try:
+            await release_pending()
+        except BaseException:
+            logger.warning("release team lifecycle lease was interrupted", exc_info=True)
+    try:
+        await turn.host.close_all()
+    except BaseException:
+        logger.warning("close subagent host was interrupted", exc_info=True)
+        _schedule_settle()
+        return
+    if turn.team is not None:
+        try:
+            await turn.team.events_since(turn.team.observed_seq)
+            await turn.team.set_status(status)
+        except BaseException:
+            logger.warning("team cleanup was interrupted", exc_info=True)
+            _schedule_settle()
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -248,13 +381,27 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
             blocks.append(b)
         return b
 
+    def _finalize_sub_blocks(status: str) -> None:
+        """Mark still-running child cards as stopped when the turn ends abnormally.
+
+        A stop/cancel tears the parent SSE down before the child's own
+        ``subagent_end`` can be consumed, so without this the persisted block
+        keeps ``status="running"`` and every refresh shows a card that can
+        never finish.
+        """
+        if status not in ("stopped", "error"):
+            return
+        for b in _sub_blocks.values():
+            if b.get("status") in ("running", "starting"):
+                b["status"] = "stopped"
+
     try:
         if turn is not None:
             turn_ur = _TurnUR(turn)
             if not getattr(turn_ur, "user_id", ""):
                 turn_ur.user_id = user_id
             events = _merged_events(run_agent_stream(turn_ur, session_id, text, stop_event),
-                                    turn.buffer, turn.host)
+                                    turn.buffer, turn.host, stop_event)
         else:
             events = run_agent_stream(ur, session_id, text, stop_event)
 
@@ -339,52 +486,43 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
 
         status = terminal_status or ("stopped" if stop_event.is_set() else "complete")
         terminal_status = status
+        _finalize_sub_blocks(status)
         await _persist(status, force=True)
         yield frame("done", {"message_id": message_id, "status": status, "model": ur.model.model_name})
     except asyncio.CancelledError:
         terminal_status = "stopped"
+        _finalize_sub_blocks(terminal_status)
         await _persist(terminal_status, force=True)
         raise
     except Exception as e:  # noqa: BLE001
         terminal_status = "error"
+        _finalize_sub_blocks(terminal_status)
         await _persist(terminal_status, force=True)
         yield frame("error", {"error": f"{type(e).__name__}: {e}"})
     finally:
+        # Cancellation-safe cleanup: synchronous releases happen before any
+        # await, so a cancelled anyio scope cannot leak the Team quota.
+        was_unknown = terminal_status is None
+        if was_unknown:
+            terminal_status = "stopped"
+        cleanup_status = "stopped" if terminal_status in ("stopped", "error") else "completed"
         if turn is not None:
             try:
-                await turn.host.close_all()
-            except Exception:
-                pass
-            if turn.team is not None:
-                # Drain durable events produced after the last observed tool
-                # call. The host mirrors them through the same SSE sink.
-                try:
-                    await turn.team.events_since(turn.team.observed_seq)
-                except Exception:
-                    pass
-            if turn.team is not None:
-                try:
-                    await turn.team.set_status("stopped" if terminal_status in ("stopped", "error") else "completed")
-                except Exception:
-                    pass
-                try:
-                    await turn.team.release_lifecycle()
-                except Exception:
-                    pass
+                await _cleanup_turn(turn, hub, user_id, session_id, generation_id,
+                                    team_ctx.team_id, cleanup_status)
+            except BaseException:
+                logger.warning("turn cleanup failed", exc_info=True)
+        if was_unknown:
             try:
-                hub.unregister_subagent_host(user_id, session_id, generation_id, team_ctx.team_id)
-            except TypeError:
-                try:
-                    hub.unregister_subagent_host(session_id, generation_id)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-        if terminal_status is None:
-            terminal_status = "stopped"
-            await _persist(terminal_status, force=True)
+                _finalize_sub_blocks(terminal_status)
+                await _persist(terminal_status, force=True)
+            except BaseException:
+                logger.warning("persist terminal status failed", exc_info=True)
         unregister_generation(user_id, session_id, generation_id)
-        await team_store.release_generation(user_id, session_id, generation_id)
+        try:
+            await team_store.release_generation(user_id, session_id, generation_id)
+        except BaseException:
+            logger.warning("release generation lease failed", exc_info=True)
 
 
 @router.post("/sessions/{session_id}/messages")

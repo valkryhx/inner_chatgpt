@@ -86,7 +86,16 @@ export default function Composer({ streaming, onSend, onStop, onCompact, context
           {(reasoningEffort || 'default').trim() || 'default'}
         </span>{' '}
         <span className="composer-hint-sep">·</span>{' '}
-        {contextUsage ? (
+        {streaming ? (
+          // The meter is a session-level snapshot refreshed after a turn; showing
+          // it as a live figure while tokens stream in reads as a stalled number.
+          <span className="hint-streaming" title="本轮回复结束后刷新上下文统计">
+            {contextUsage && contextUsage.used_tokens > 0
+              ? `${fmtK(contextUsage.used_tokens)} / ${fmtK(contextUsage.context_window)} · ${contextUsage.percent.toFixed(1)}% · `
+              : ''}
+            生成中…
+          </span>
+        ) : contextUsage ? (
           contextUsage.remaining_to_compact <= 0
             ? <>{fmtK(contextUsage.used_tokens)} / {fmtK(contextUsage.context_window)} · {contextUsage.percent.toFixed(1)}% · 即将自动压缩</>
             : <>{fmtK(contextUsage.used_tokens)} / {fmtK(contextUsage.context_window)} · {contextUsage.percent.toFixed(1)}% · 距压缩 {fmtK(contextUsage.remaining_to_compact)}</>
