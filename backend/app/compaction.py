@@ -102,7 +102,7 @@ async def manual_compact(user_id, session_id, keep=6, instructions=""):
     sess = await db.get_session(session_id, user_id)
     model_id = (sess or {}).get("model_id", "") or ""
     ur = await hub.get_user_runtime(user_id, model_id)
-    history = await ur.store.get(session_id)
+    history = await ur.store.get(user_id, session_id)
     total = len(history)
     if total <= keep:
         return {"compacted": False, "trigger": "manual", "dropped_messages": 0,
@@ -128,7 +128,7 @@ async def manual_compact(user_id, session_id, keep=6, instructions=""):
 
     sm = _summary_message(summary, "manual")
     new_history = [sm, *preserved]
-    await ur.store.set(session_id, new_history)
+    await ur.store.set(user_id, session_id, new_history)
 
     dropped = len(old)
     kept = len(preserved) + 1
@@ -151,7 +151,7 @@ async def enforce_soft_limit(user_id, session_id, pending_text=""):
     soft = int(getattr(ur, "soft_limit", 0) or 0)
     if soft <= 0:
         return None
-    messages = await ur.store.get(session_id)
+    messages = await ur.store.get(user_id, session_id)
     total = message_token_counter(messages) + estimate_tokens(pending_text or "")
     if total <= soft:
         return None
@@ -178,7 +178,7 @@ async def enforce_soft_limit(user_id, session_id, pending_text=""):
         return None
 
     sm = _summary_message(summary, "auto")
-    await ur.store.set(session_id, [sm, *preserved])
+    await ur.store.set(user_id, session_id, [sm, *preserved])
     dropped = len(old)
     kept = len(preserved) + 1
     st = estimate_tokens(summary)
@@ -199,7 +199,7 @@ async def enforce_hard_limit(user_id, session_id):
     hard = int(getattr(ur, "hard_limit", 0) or 0)
     if hard <= 0:
         return None
-    messages = await ur.store.get(session_id)
+    messages = await ur.store.get(user_id, session_id)
     if not messages:
         return None
     total_tokens = message_token_counter(messages)
@@ -225,7 +225,7 @@ async def enforce_hard_limit(user_id, session_id):
         dropped = len(messages) - 1
 
     note = _trim_note_message(dropped)
-    await ur.store.set(session_id, [note, *preserved])
+    await ur.store.set(user_id, session_id, [note, *preserved])
     after = message_token_counter(preserved) + estimate_tokens(message_text(note))
     await _record_visible_summary(session_id, user_id, message_text(note), "hard_trim",
                                   estimate_tokens(message_text(note)), len(preserved), dropped)

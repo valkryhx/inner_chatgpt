@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, getToken, setToken, streamMessage } from './api'
-import type { LlmModelOption, Message, Session, StreamEvent, User } from './types'
+import type { LlmModelOption, Message, Session, StreamEvent, TeamEvent, TeamSnapshot, User } from './types'
 import Sidebar from './components/Sidebar'
 import MessageList from './components/MessageList'
 import Composer from './components/Composer'
 import LoginPage from './components/LoginPage'
 import SettingsModal from './components/SettingsModal'
+import TeamPanel from './components/TeamPanel'
 
 function newGenId() {
   return 'g_' + Math.random().toString(16).slice(2, 10)
@@ -36,6 +37,48 @@ function appendReasoningBlock(blocks: any[], chunk: string): any[] {
   return [...blocks, { type: 'reasoning', text: chunk }]
 }
 
+
+function mergeTeamEvent(prev: TeamSnapshot | null, event: TeamEvent): TeamSnapshot | null {
+  if (!prev || !prev.team) {
+    if (event.type !== 'team_start') return prev
+    const now = Date.now()
+    return {
+      team: {
+        team_id: event.team_id, user_id: '', session_id: event.session_id || '',
+        generation_id: event.generation_id || '', lead_agent_id: event.agent_id || 'root',
+        name: typeof event.payload.name === 'string' ? event.payload.name : 'Agent Team',
+        status: 'active', created_at: now, updated_at: now, closed_at: 0,
+      },
+      tasks: [], events: [event], messages: [],
+    }
+  }
+  if (event.team_id && prev.team.team_id !== event.team_id) return prev
+  const events = prev.events.some((e) => e.event_seq === event.event_seq)
+    ? prev.events
+    : [...prev.events, event].sort((a, b) => a.event_seq - b.event_seq)
+  let tasks = prev.tasks
+  let messages = prev.messages
+  let team = prev.team
+  if (event.type === 'task_created' || event.type === 'task_updated') {
+    const task = event.payload.task as TeamSnapshot['tasks'][number] | undefined
+    if (task?.task_id) {
+      const exists = tasks.some((t) => t.task_id === task.task_id)
+      tasks = exists ? tasks.map((t) => t.task_id === task.task_id ? task : t) : [...tasks, task]
+    }
+  } else if (event.type === 'team_message') {
+    const message = event.payload.message as TeamSnapshot['messages'][number] | undefined
+    if (message?.message_id && !messages.some((m) => m.message_id === message.message_id)) {
+      messages = [...messages, message]
+    }
+  } else if (event.type === 'team_end') {
+    const nextStatus = typeof event.payload.status === 'string'
+      ? event.payload.status as typeof team.status
+      : team.status
+    team = { ...team, status: nextStatus }
+  }
+  return { team, tasks, events, messages }
+}
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null)
   const [booting, setBooting] = useState(true)
@@ -52,6 +95,9 @@ export default function App() {
   // 没有会话时选择的模型：作为下一个新会话的初始 model_id
   const [pendingModelId, setPendingModelId] = useState<string>('')
   const [error, setError] = useState<string | null>(null)
+  const [teamSnapshot, setTeamSnapshot] = useState<TeamSnapshot | null>(null)
+  const [teamOpen, setTeamOpen] = useState(false)
+  const [teamGenerationId, setTeamGenerationId] = useState<string>('')
   const [notice, setNotice] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const genIdRef = useRef<string>('')
@@ -166,6 +212,23 @@ export default function App() {
     })
   }, [user, loadSessions, refreshHealth, loadModels])
 
+  const loadTeam = useCallback(async (id: string) => {
+    try {
+      const snapshot = await api.getTeam(id)
+      if (activeId === id || !activeId) setTeamSnapshot(snapshot)
+    } catch {
+      if (activeId === id || !activeId) setTeamSnapshot(null)
+    }
+  }, [activeId])
+
+  useEffect(() => {
+    if (!user || !activeId) {
+      setTeamSnapshot(null)
+      return
+    }
+    loadTeam(activeId)
+  }, [user, activeId, loadTeam])
+
   useEffect(() => {
     if (!user) return
     if (activeId) {
@@ -273,9 +336,11 @@ export default function App() {
   const send = async (text: string) => {
     if (!text.trim() || streaming) return
     setError(null)
+    setTeamSnapshot(null)
 
     const tempSid = activeId || 'pending'
     const genId = newGenId()
+    setTeamGenerationId(genId)
     genIdRef.current = genId
     const ctrl = new AbortController()
     abortRef.current = ctrl
@@ -407,6 +472,10 @@ export default function App() {
             : b,
         )
         patch({ ...assistantMsg, blocks: [...blocks] })
+      } else if (ev.type === 'team_event') {
+        const teamEvent = ev as unknown as TeamEvent
+        setTeamGenerationId(genId)
+        setTeamSnapshot((prev) => mergeTeamEvent(prev, teamEvent))
       } else if (ev.type === 'compaction') {
         setAutoCompacted((n) => n + 1)
       } else if (ev.type === 'done') {
@@ -451,6 +520,7 @@ export default function App() {
         setTimeout(() => loadMessages(sid!), 150)
       }
       loadSessions()
+      if (sid) setTimeout(() => loadTeam(sid), 180)
     }
   }
 
@@ -557,6 +627,11 @@ export default function App() {
           <button className="ghost-btn" onClick={() => doCompact()} disabled={!activeId || streaming}>
             压缩上下文
           </button>
+          {teamSnapshot?.team && (
+            <button className="ghost-btn team-toggle" onClick={() => setTeamOpen((v) => !v)} title="打开或收起 Agent Team 任务板">
+              Team {teamSnapshot.tasks.filter((t) => t.status === 'in_progress').length > 0 ? '· 运行中' : ''}
+            </button>
+          )}
         </div>
         {notice && (
           <div className="notice-bar">
@@ -584,6 +659,7 @@ export default function App() {
         />
         <Composer streaming={streaming} onSend={send} onStop={stop} onCompact={doCompact} />
       </div>
+      <TeamPanel snapshot={teamSnapshot} open={teamOpen} onToggle={() => setTeamOpen((v) => !v)} />
       {settingsOpen && (
         <SettingsModal
           onLlmChanged={loadModels}

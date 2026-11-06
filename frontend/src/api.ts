@@ -10,6 +10,7 @@ import type {
   StreamEvent,
   User,
   Skill,
+  TeamSnapshot,
 } from './types'
 
 const BASE = '/api'
@@ -126,6 +127,7 @@ export const api = {
       body: JSON.stringify({ generation_id: generationId, message_id: messageId }),
     }),
   mcpTools: () => request<{ tools: { name: string; description: string }[] }>('/mcp/tools'),
+  getTeam: (sessionId: string) => request<TeamSnapshot>(`/sessions/${sessionId}/team`),
 
   // me: LLM configs
   listLlmModels: () => request<{ models: LlmModelOption[] }>('/me/llm-models'),

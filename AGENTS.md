@@ -71,15 +71,27 @@
   `wait_agent.since_event_seq` 增量事件。
 - 单测 62 项通过（原 42 + 新增 20），前端 `npm run build` 通过，3 次真实 LLM E2E + Playwright UI 验证。
 
-**P3（下一步）：** team / task 工具 → 计划模式 → goal → hooks。浏览器控制暂不做。
-长出来的位置见 `docs/20261105-Subagent调研与设计方案.md` §14。
+**P3：Agent Team-lite（Web 多用户隔离基线）—— 已完成（2026-11-06）。**
+
+已完成内容（详见 `docs/20261106-changelog-AgentTeamP3.md`）：
+
+- 四级作用域 `user_id -> session_id -> generation_id -> team_id` 贯穿 Team/任务/消息/事件/工具。
+- 持久任务板、`blocked_by` 依赖、owner 软锁、CAS `expected_version`、失败 spawn 回收。
+- Root 为 lead；teammate 继承 file/code_run/Skill/MCP，但不能调用编排工具或递归 spawn。
+- active generation 唯一租约、团队生命周期租约、用户/团队资源闸门、停止级联。
+- 前端右侧 TeamPanel（任务 / 消息 / 动态），SSE 增量更新、刷新 REST 恢复。
+- Windows `--reload` 下 `code_run` 的 SelectorEventLoop 子进程兼容层。
+
+**P4（下一步）：** 计划模式 → goal → hooks。浏览器控制暂不做。
 路线图见 `docs/20261105-去LangChain依赖-决策记录.md`。
 
 ### 0.2 必读文档（按顺序）
 
 | 文档 | 用途 |
 |---|---|
-| `docs/20261105-changelog-SubagentP2.md` | **P2 已完成清单 + 自测（最新，先读这份）** |
+| `docs/20261106-changelog-AgentTeamP3.md` | **P3 已完成清单 + 真实 E2E 验收（最新，先读这份）** |
+| `docs/20261106-AgentTeam-Web多用户隔离设计方案.md` | **P3 Team 设计：四级作用域、任务所有权、资源闸门、停止语义** |
+| `docs/20261105-changelog-SubagentP2.md` | P2 已完成清单 + 自测 |
 | `docs/20261105-Markdown图片渲染修复.md` | **Markdown / 原生 `<img>` 图片修复**：workspace 鉴权接口、Windows 路径、HTML 清洗白名单、`code_run` 产物边界 |
 | `docs/20261105-changelog-停止生成内容保留.md` | **停止生成内容保留**：SSE 增量快照、stop 返回消息快照、前端停止态合并与空态判断 |
 | `docs/20261105-changelog-SkillP1.md` | **P1 已完成清单 + Skill/基础工具自测（先读这份）** |

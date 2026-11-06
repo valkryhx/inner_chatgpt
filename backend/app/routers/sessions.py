@@ -71,12 +71,17 @@ async def delete_session(session_id: str, user: dict = Depends(get_current_user)
         raise HTTPException(status_code=404, detail="session not found")
     await db.delete_session(session_id, user["id"])
     from ..runtime import get_hub
+    from .. import team_store
     hub = get_hub()
     if hub and hub.store is not None:
         try:
-            await hub.store.delete(session_id)
+            await hub.store.delete(user["id"], session_id)
         except Exception:
             pass
+    try:
+        await team_store.delete_session_data(user["id"], session_id)
+    except Exception:
+        pass
     return {"ok": True}
 
 

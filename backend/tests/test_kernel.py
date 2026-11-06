@@ -187,3 +187,33 @@ def test_safe_keep_from_skips_tool_boundary():
     assert _safe_keep_from(msgs, 2) == 1
     assert _safe_keep_from(msgs, 0) == 0
     assert _safe_keep_from(msgs, 4) == 4
+
+
+def test_history_store_legacy_migration_backfills_owner(tmp_path, monkeypatch):
+    import asyncio
+    import sqlite3
+    import app.history_store as hs
+
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL);
+        CREATE TABLE session_history (
+            session_id TEXT PRIMARY KEY,
+            history TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT INTO sessions VALUES ('s1', 'u1');
+        INSERT INTO session_history VALUES ('s1', '[{"role":"user","content":"old"}]', 1);
+    """)
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(hs, "DB_PATH", db)
+    store = hs.HistoryStore()
+
+    async def scenario():
+        await store.init()
+        assert (await store.get("u1", "s1"))[0]["content"] == "old"
+        assert await store.get("other", "s1") == []
+
+    asyncio.run(scenario())

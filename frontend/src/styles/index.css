@@ -748,3 +748,147 @@ textarea, input { caret-color: var(--clay); }
 }
 .subagent-result .step-label { display: block; margin-bottom: 4px; }
 .subagent-error { font-size: 12.5px; color: var(--danger); }
+
+/* ===== Agent Team 任务板（P3）：右侧独立工作面，不使用聊天气泡 ===== */
+.app { position: relative; }
+.team-panel {
+  display: flex; flex-shrink: 0; height: 100%;
+  border-left: 1px solid var(--line); background: var(--surface);
+  transition: width 220ms var(--ease);
+  width: 40px;
+}
+.team-panel.is-open { width: 330px; }
+.team-panel-rail {
+  width: 40px; flex: 0 0 40px; padding: 14px 0;
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  background: transparent; border: none; color: var(--muted);
+}
+.team-rail-mark {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--clay); box-shadow: 0 0 0 4px var(--clay-soft);
+}
+.team-rail-label {
+  writing-mode: vertical-rl; text-orientation: mixed;
+  font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--ink-2);
+}
+.team-rail-count {
+  min-width: 20px; padding: 1px 4px; border-radius: 999px;
+  background: var(--clay-soft); color: var(--btn);
+  font-size: 10px; font-variant-numeric: tabular-nums;
+}
+.team-rail-caret { margin-top: auto; font-size: 18px; color: var(--line-strong); }
+.team-panel-rail:hover .team-rail-caret { color: var(--btn); }
+.team-panel-body {
+  width: 290px; min-width: 0; height: 100%; overflow: hidden;
+  display: flex; flex-direction: column;
+}
+.team-head {
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 10px;
+  padding: 18px 16px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.team-kicker {
+  font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--muted); font-weight: 700;
+}
+.team-head h2 { margin: 3px 0 0; font-size: 16px; line-height: 1.3; font-weight: 650; }
+.team-status {
+  display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
+  font-size: 10.5px; color: var(--muted); white-space: nowrap;
+}
+.team-status .status-dot { width: 6px; height: 6px; }
+.team-stats {
+  display: flex; gap: 12px; padding: 10px 16px;
+  color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid var(--line);
+}
+.team-stats b { color: var(--ink-2); font-weight: 650; }
+.team-tabs { display: flex; padding: 10px 12px 0; gap: 3px; }
+.team-tabs button {
+  flex: 1; border: none; border-bottom: 2px solid transparent; background: transparent;
+  padding: 6px 5px 8px; border-radius: 6px 6px 0 0;
+  font-size: 11.5px; color: var(--muted); font-weight: 600;
+}
+.team-tabs button span {
+  margin-left: 3px; padding: 0 4px; border-radius: 999px;
+  background: var(--surface-2); font-size: 9.5px; font-variant-numeric: tabular-nums;
+}
+.team-tabs button:hover { color: var(--ink-2); background: var(--surface-2); }
+.team-tabs button.active { color: var(--btn); border-bottom-color: var(--btn); }
+.team-content { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px 20px; }
+.team-empty {
+  padding: 26px 14px; text-align: center; color: var(--muted);
+  font-size: 11.5px; line-height: 1.65; border: 1px dashed var(--line-strong);
+  border-radius: var(--r-md); background: var(--canvas);
+}
+.team-task-list { display: flex; flex-direction: column; gap: 16px; }
+.team-task-group { display: flex; flex-direction: column; gap: 6px; }
+.team-group-head {
+  display: flex; justify-content: space-between; padding: 0 2px;
+  color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .04em;
+}
+.team-task {
+  padding: 9px 10px; border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--canvas); box-shadow: 0 1px 1px rgba(26,25,24,.02);
+}
+.team-task.task-in_progress { border-color: #dfc0b2; }
+.team-task.task-completed { opacity: .78; }
+.team-task-top { display: flex; align-items: flex-start; gap: 6px; }
+.team-task-dot {
+  width: 6px; height: 6px; border-radius: 50%; margin-top: 5px; flex-shrink: 0;
+  background: var(--line-strong);
+}
+.team-task-dot.in_progress { background: var(--clay); }
+.team-task-dot.completed { background: var(--ok); }
+.team-task-dot.cancelled { background: var(--muted); }
+.team-task-subject {
+  flex: 1; min-width: 0; color: var(--ink); font-size: 12px; font-weight: 600;
+  line-height: 1.5; overflow-wrap: anywhere;
+}
+.team-task-version { color: var(--muted); font-size: 9.5px; font-variant-numeric: tabular-nums; }
+.team-task-desc {
+  margin: 5px 0 6px 12px; color: var(--ink-2); font-size: 10.5px; line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+.team-task-meta {
+  display: flex; flex-wrap: wrap; gap: 5px 9px; margin-left: 12px;
+  color: var(--muted); font-size: 9.5px;
+}
+.team-task-blocked { margin: 6px 0 0 12px; color: var(--warn); font-size: 9.5px; }
+.team-message-list, .team-event-list { display: flex; flex-direction: column; gap: 8px; }
+.team-message {
+  padding: 9px 10px; border-left: 2px solid var(--clay-soft);
+  background: var(--canvas); border-radius: 0 var(--r-sm) var(--r-sm) 0;
+}
+.team-message-route {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
+  color: var(--muted); font-size: 9.5px;
+}
+.team-message-route > span:first-child, .team-message-route > span:nth-child(3) {
+  color: var(--ink-2); font-weight: 600;
+}
+.team-message-kind {
+  margin-left: auto; padding: 0 5px; border-radius: 999px;
+  background: var(--surface-2); font-size: 9px;
+}
+.team-message p { margin: 5px 0 0; color: var(--ink-2); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.team-event-list { list-style: none; margin: 0; padding: 0; }
+.team-event-list li {
+  display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+  padding-bottom: 7px; border-bottom: 1px solid var(--line);
+  font-size: 10px; color: var(--ink-2);
+}
+.team-event-seq { color: var(--muted); font-variant-numeric: tabular-nums; }
+.team-event-name { font-weight: 600; }
+.team-event-detail { color: var(--muted); overflow-wrap: anywhere; }
+.team-toggle { white-space: nowrap; }
+
+@media (max-width: 1100px) {
+  .team-panel.is-open { width: 300px; }
+  .team-panel-body { width: 260px; }
+}
+@media (max-width: 720px) {
+  .team-panel { display: none; }
+  .team-toggle { display: none; }
+}

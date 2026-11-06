@@ -97,11 +97,12 @@ def _build_target(target: Any) -> Any:
 
 
 class MCPToolset:
-    """持有一个 fastmcp.Client，暴露为 LangChain 工具列表（必须在 lifespan 内 enter/exit）。"""
+    """持有一个 fastmcp.Client，暴露为自研 Tool 列表（必须在 lifespan 内 enter/exit）。"""
 
-    def __init__(self, target: Any = None) -> None:
+    def __init__(self, target: Any = None, *, user_id: str = "") -> None:
         # target None -> 内置 demo
         self._target = target
+        self._user_id = user_id
         self._client: Optional[Client] = None
         self._tools: list[Tool] = []
         self._raw: list[Any] = []
@@ -112,7 +113,8 @@ class MCPToolset:
     @classmethod
     def merge(cls, toolsets: list["MCPToolset"]) -> "MCPToolset":
         """聚合多个已连接的 toolset 的工具；关闭父级时统一释放全部子级。"""
-        merged = cls(None)
+        user_ids = {ts._user_id for ts in toolsets if ts._user_id}
+        merged = cls(None, user_id=next(iter(user_ids)) if len(user_ids) == 1 else "")
         merged._children = list(toolsets)
         for ts in toolsets:
             merged._tools.extend(ts.tools)
@@ -155,10 +157,22 @@ class MCPToolset:
         description = getattr(t, "description", "") or name
         schema = getattr(t, "inputSchema", None) or {"type": "object", "properties": {}}
         client = self._client
+        user_id = self._user_id
 
         async def _call(args: dict) -> str:
             assert client is not None
-            return await _call_tool_safe(client, name, args if isinstance(args, dict) else {}, schema)
+            payload = args if isinstance(args, dict) else {}
+            if not user_id:
+                return await _call_tool_safe(client, name, payload, schema)
+            # Keep the semaphore scope user-wide: several sessions or agents for
+            # the same user must share USER_MAX_MCP_CALLS.  Timeout is converted
+            # into a normal tool observation so the model can continue.
+            from .quota import QuotaExceeded, get_quota
+            try:
+                async with get_quota().mcp_call(user_id, timeout_s=2.0):
+                    return await _call_tool_safe(client, name, payload, schema)
+            except QuotaExceeded as exc:
+                return f"[工具执行错误] {exc}"
 
         return Tool(name=name, description=description, input_schema=schema, call=_call)
 

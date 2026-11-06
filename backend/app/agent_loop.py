@@ -34,12 +34,15 @@ def _dump(obj: Any) -> str:
 
 class AgentLoop:
     def __init__(self, client: LLMClient, registry: ToolRegistry, system_prompt: str,
-                 max_turns: int = 48, history_store=None):
+                 max_turns: int = 48, history_store=None, *, user_id: str = ""):
         self.client = client
         self.registry = registry
         self.system_prompt = system_prompt
         self.max_turns = max_turns
         self.history_store = history_store  # optional; when set, persists history
+        # Owner identity is server-generated.  It is never accepted from a tool
+        # argument or model output.
+        self.user_id = user_id
 
     # ---------- sanitation: repair dangling tool_calls ----------
     async def sanitize(self, history: list[dict]) -> bool:
@@ -90,7 +93,10 @@ class AgentLoop:
         try:
             changed = await self.sanitize(history)
             if changed and self.history_store is not None:
-                await self.history_store.set(session_id, history)
+                if self.user_id:
+                    await self.history_store.set(self.user_id, session_id, history)
+                else:
+                    await self.history_store.set(session_id, history)
         except Exception:
             pass
 
@@ -144,7 +150,10 @@ class AgentLoop:
                 history.append({"role": "assistant", "content": content,
                                 **({"reasoning": reasoning} if reasoning else {})})
                 if self.history_store is not None:
-                    await self.history_store.set(session_id, history)
+                    if self.user_id:
+                        await self.history_store.set(self.user_id, session_id, history)
+                    else:
+                        await self.history_store.set(session_id, history)
                 yield {"type": "done", "status": "complete"}
                 return
 
@@ -165,7 +174,10 @@ class AgentLoop:
                 history.append({"role": "tool", "tool_call_id": fid, "name": name, "content": out})
                 yield {"type": "tool_result", "id": fid, "name": name, "content": out, "is_error": is_err}
                 if self.history_store is not None:
-                    await self.history_store.set(session_id, history)
+                    if self.user_id:
+                        await self.history_store.set(self.user_id, session_id, history)
+                    else:
+                        await self.history_store.set(session_id, history)
 
         yield {"type": "error", "error": f"达到最大轮数 {self.max_turns}，已停止"}
 

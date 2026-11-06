@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from ..agent_loop import AgentLoop
 from ..builtin_tools import build_builtin_tools
 from ..skill_store import build_skill_prompt
+from ..team_host import TeamHost
+from ..team_tools import build_teammate_tools
+from ..scope import TeamScope
 from ..tools import ToolRegistry
 from .capabilities import build_capability_profile, build_child_registry
 from .context import AgentContext
@@ -70,7 +73,14 @@ class SubagentRuntime:
         # 4) 写类工具隔离到该 run 的产出目录，避免并发互相覆盖（设计文档 §7.2）
         write_root = f".subagents/{self.ctx.session_id}/{self.spec.name}"
         self.write_root = write_root
-        own_builtin = build_builtin_tools(self.ctx.user_id, write_root=write_root)
+        own_builtin = build_builtin_tools(
+            self.ctx.user_id,
+            write_root=write_root,
+            session_id=self.ctx.session_id,
+            generation_id=self.ctx.generation_id,
+            team_id=self.ctx.team_id,
+            agent_id=self.ctx.agent_id,
+        )
         # 用「带隔离根的 builtin」替换父 registry 里同名的 builtin 工具；
         # MCP 工具（非 builtin 名）保持父级裁剪结果。
         builtin_names = {t.name for t in own_builtin}
@@ -78,6 +88,12 @@ class SubagentRuntime:
         for t in child_tools_registry.tools:
             if t.name not in builtin_names:
                 merged.add(t)
+        # 4b) teammate 只在 Team 作用域内获得受限协作工具。
+        # task_create / spawn_teammate / team_status 永不进入 teammate registry。
+        if self.ctx.team_id:
+            team_host = TeamHost(TeamScope.from_agent(self.ctx.scope()))
+            for tool in build_teammate_tools(team_host):
+                merged.add(tool)
         self.registry = merged
 
         # 5) 初始 history：默认只有一条 user message（上下文隔离）

@@ -2,7 +2,7 @@
 
 > 摘要：在 P2 Subagent 之上实现 Team-lite，但把团队、任务、消息和运行时严格绑定到 `user_id + session_id + generation_id`；完整隔离不仅要靠查询条件，还要靠工具闭世界、任务/消息所有权、用户级配额、全局公平调度和故障域隔离。  
 > 日期：2026-11-06  
-> 状态：设计完成，待实施  
+> 状态：P3 基线已实施（2026-11-06）；实施记录见 `docs/20261106-changelog-AgentTeamP3.md`
 > 前置：P2 Subagent 已完成；下一阶段仍不引入 LangChain / LangGraph，也不照搬 GA CLI 总装层。
 
 ---

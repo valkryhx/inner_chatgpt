@@ -165,61 +165,91 @@ def _list_impl(user_id: str, path: str = "", max_entries: int = 200, depth: int 
 
 
 # ---------------- code_run ----------------
-def _run_code_sync(code: str, code_type: str, cwd: Path, timeout: int) -> dict:
+async def _run_code_impl(
+    user_id: str,
+    code: str,
+    code_type: str = "python",
+    timeout: int = DEFAULT_TIMEOUT,
+    *,
+    root: str = "",
+    session_id: str = "",
+    generation_id: str = "",
+    agent_id: str = "root",
+) -> str:
+    from .process_registry import (
+        ProcessLease, register, spawn_process, unregister, _kill_tree,
+    )
+    from .quota import QuotaExceeded, get_quota
+
+    cwd = write_root_for(user_id, root)
+    timeout = max(1, min(int(timeout or DEFAULT_TIMEOUT), MAX_TIMEOUT))
+    code_type = (code_type or "python").lower()
     blocked = protected_code_reason(code)
     if blocked:
-        return {"status": "error", "msg": blocked}
+        return _err(blocked)
+
     tmp_path = None
+    proc = None
+    lease = ProcessLease(user_id, session_id, generation_id, agent_id)
     try:
         if code_type in ("python", "py"):
             fd, tmp_path = tempfile.mkstemp(suffix=".ai.py", prefix="inner_")
             os.close(fd)
             with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(code)
-            cmd = [
-                sys.executable, "-X", "utf8", "-u", "-c",
-                WORKSPACE_PYTHON_GUARD, tmp_path, str(cwd),
-            ]
+            cmd = [sys.executable, "-X", "utf8", "-u", "-c",
+                   WORKSPACE_PYTHON_GUARD, tmp_path, str(cwd)]
         elif code_type in ("powershell", "ps1", "pwsh", "bash", "sh", "shell"):
-            if os.name == "nt":
-                cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", code]
-            else:
-                cmd = ["bash", "-c", code]
+            cmd = (["powershell", "-NoProfile", "-NonInteractive", "-Command", code]
+                   if os.name == "nt" else ["bash", "-c", code])
         else:
-            return {"status": "error", "msg": f"不支持的类型: {code_type}"}
+            return _err(f"不支持的类型: {code_type}")
 
-        creationflags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
-        proc = subprocess.run(
-            cmd, cwd=str(cwd), stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=timeout, creationflags=creationflags,
-            env=workspace_env(cwd),
-        )
-        out = proc.stdout.decode("utf-8", errors="replace")
-        return {"status": "success" if proc.returncode == 0 else "error",
-                "exit_code": proc.returncode, "output": out}
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "msg": f"执行超时（{timeout}s），已终止"}
+        async with get_quota().code_run(user_id, timeout_s=2.0):
+            await register(lease)
+            creationflags = 0x08000000 if os.name == "nt" else 0
+            kwargs = {}
+            if os.name == "nt":
+                kwargs["creationflags"] = creationflags
+            else:
+                kwargs["start_new_session"] = True
+            proc = await spawn_process(
+                cmd,
+                cwd=str(cwd),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=workspace_env(cwd),
+                **kwargs,
+            )
+            lease.proc = proc
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except (asyncio.TimeoutError, TimeoutError):
+                await _kill_tree(proc)
+                return _err(f"执行超时（{timeout}s），已终止")
+            except asyncio.CancelledError:
+                await _kill_tree(proc)
+                raise
+            out = (stdout or b"").decode("utf-8", errors="replace")
+            if lease.stopped:
+                return _err("已停止：执行进程已被终止")
+            header = f"[code_run {code_type}] exit={proc.returncode} cwd={cwd}\n"
+            return _truncate(header + out)
+    except QuotaExceeded as e:
+        return _err(str(e))
     except Exception as e:  # noqa: BLE001
-        return {"status": "error", "msg": str(e)}
+        if proc is not None and proc.returncode is None:
+            await _kill_tree(proc)
+        detail = str(e).strip()
+        return _err(f"{type(e).__name__}: {detail}" if detail else type(e).__name__)
     finally:
+        await unregister(lease)
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
-
-
-async def _run_code_impl(user_id: str, code: str, code_type: str = "python",
-                         timeout: int = DEFAULT_TIMEOUT, *, root: str = "") -> str:
-    cwd = write_root_for(user_id, root)
-    timeout = max(1, min(int(timeout or DEFAULT_TIMEOUT), MAX_TIMEOUT))
-    result = await asyncio.to_thread(_run_code_sync, code, (code_type or "python").lower(), cwd, timeout)
-    if result.get("status") == "error" and "output" not in result:
-        return _err(result.get("msg", "执行失败"))
-    output = result.get("output", "")
-    header = f"[code_run {code_type}] exit={result.get('exit_code')} cwd={cwd}\n"
-    return _truncate(header + output)
 
 
 # ---------------- load_skill ----------------
@@ -233,7 +263,15 @@ def _load_skill_impl(user_id: str, skill: str, args: str = "") -> str:
     return info["content"]
 
 
-def build_builtin_tools(user_id: str, *, write_root: str | None = None) -> list[Tool]:
+def build_builtin_tools(
+    user_id: str,
+    *,
+    write_root: str | None = None,
+    session_id: str = "",
+    generation_id: str = "",
+    team_id: str = "",
+    agent_id: str = "root",
+) -> list[Tool]:
     """Create the built-in tool set bound to one user (closures capture user_id).
 
     ``write_root`` 可选：限定「写」类工具（file_write / file_patch / code_run）的根目录。
@@ -285,6 +323,9 @@ def build_builtin_tools(user_id: str, *, write_root: str | None = None) -> list[
             str(args.get("type", "python") or "python"),
             int(args.get("timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
             root=root,
+            session_id=session_id,
+            generation_id=generation_id,
+            agent_id=agent_id,
         )
 
     async def load_skill(args: dict) -> str:

@@ -90,10 +90,23 @@ async def run_agent_stream(
     Event shapes match the frontend protocol:
       text_delta / thinking_delta / tool_start / tool_result / chart / done / error
     """
-    store = ur.store
-    history = await store.get(session_id)
+    store = getattr(ur, "store", None)
+    user_id = str(getattr(ur, "user_id", "") or "")
+    if store is None:
+        # Compatibility with minimal test runtimes; production UserRuntime
+        # always has a HistoryStore.
+        history = []
+    if store is not None:
+        if user_id:
+            history = await store.get(user_id, session_id)
+        else:
+            history = await store.get(session_id)
     history.append({"role": "user", "content": user_text})
-    await store.set(session_id, history)
+    if store is not None:
+        if user_id:
+            await store.set(user_id, session_id, history)
+        else:
+            await store.set(session_id, history)
 
     async for ev in ur.loop.run_stream(history, stop_event=stop_event, session_id=session_id):
         et = ev.get("type")

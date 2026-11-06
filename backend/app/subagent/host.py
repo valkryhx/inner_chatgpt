@@ -18,6 +18,8 @@ from .context import AgentContext
 from .events import EventBuffer
 from .registry import AgentNode, SubagentError, SubagentRegistry
 from .runtime import SubagentRuntime, SubagentSpec
+from ..quota import QuotaExceeded, get_quota
+from ..scope import TeamScope
 
 DEFAULT_WAIT_TIMEOUT = 60.0
 MAX_READ_CHARS = 20000
@@ -63,15 +65,29 @@ class SubagentHost:
     # ---------------- spawn ----------------
     async def spawn(self, *, task_name: str, message: str,
                     fork_turns: str = "none", background: bool = True,
-                    max_turns: int = 0) -> dict:
+                    max_turns: int = 0, team_id: str = "",
+                    role: str = "general") -> dict:
         if self._closed:
             raise SubagentError("该会话的子代理宿主已关闭")
         if not (message or "").strip():
             raise SubagentError("message 不能为空")
 
-        node = self.registry.create_child(self.ctx, task_name)
+        node = self.registry.create_child(
+            self.ctx, task_name, team_id=team_id, role=role
+        )
         node.status = "starting"
         node.run_id = "run_" + uuid.uuid4().hex[:12]
+
+        quota_scope = TeamScope(
+            self.ctx.user_id, self.ctx.session_id, self.ctx.generation_id,
+            team_id or self.ctx.team_id or f"nogroup:{self.ctx.generation_id}",
+            self.ctx.agent_id,
+        )
+        try:
+            node.quota_lease = await get_quota().subagent_lease(quota_scope, timeout_s=2.0)
+        except QuotaExceeded as e:
+            self.registry.remove(node.name)
+            raise SubagentError(str(e)) from e
 
         await sub_store.create_run(
             run_id=node.run_id,
@@ -84,6 +100,8 @@ class SubagentHost:
             role=node.role,
             task_message=message,
             status="running",
+            generation_id=self.ctx.generation_id,
+            team_id=team_id or self.ctx.team_id,
         )
 
         spec = SubagentSpec(
@@ -138,7 +156,11 @@ class SubagentHost:
                         })
                     # 增量持久化侧链（每轮工具/文本后）
                     try:
-                        last_seq = await sub_store.append_sidechain(node.run_id, runtime.history, start_seq=last_seq)
+                        last_seq = await sub_store.append_sidechain(
+                            node.run_id, runtime.history, start_seq=last_seq,
+                            user_id=self.ctx.user_id, session_id=self.ctx.session_id,
+                            generation_id=self.ctx.generation_id, team_id=self.ctx.team_id,
+                        )
                     except Exception:
                         pass
 
@@ -159,14 +181,24 @@ class SubagentHost:
             node.error = f"{type(e).__name__}: {e}"
             node.result = _final_text(runtime.history)
         finally:
+            lease = getattr(node, "quota_lease", None)
+            if lease is not None:
+                lease.release()
+                node.quota_lease = None
             try:
-                last_seq = await sub_store.append_sidechain(node.run_id, runtime.history, start_seq=last_seq)
+                last_seq = await sub_store.append_sidechain(
+                    node.run_id, runtime.history, start_seq=last_seq,
+                    user_id=self.ctx.user_id, session_id=self.ctx.session_id,
+                    generation_id=self.ctx.generation_id, team_id=self.ctx.team_id,
+                )
             except Exception:
                 pass
             try:
                 await sub_store.finish_run(
                     node.run_id, status=node.status,
                     result_text=node.result or "", turns=node.turns, error=node.error or "",
+                    user_id=self.ctx.user_id, session_id=self.ctx.session_id,
+                    generation_id=self.ctx.generation_id, team_id=self.ctx.team_id,
                 )
             except Exception:
                 pass
@@ -264,7 +296,10 @@ class SubagentHost:
                     "status": node.status}
         text = node.result or ""
         if not text:
-            row = await sub_store.get_run(node.run_id)
+            row = await sub_store.get_run(
+                node.run_id, user_id=self.ctx.user_id, session_id=self.ctx.session_id,
+                generation_id=self.ctx.generation_id, team_id=self.ctx.team_id,
+            )
             text = (row or {}).get("result_text", "") or ""
         limit = max(100, min(int(max_chars or MAX_READ_CHARS), MAX_READ_CHARS * 5))
         truncated = len(text) > limit

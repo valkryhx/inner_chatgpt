@@ -19,6 +19,23 @@ ROOT_AGENT_HINT = """
 - 结论用完后用 `close_agent` 释放槽位。
 - 给子代理的 message 要明确写出「只读侦察」还是「允许修改」；子代理拥有完整工具能力，
   权限约束必须由任务说明明确，而不是靠角色自动限制。
+
+[Team 使用规则]
+- Subagent 是一次执行；Team task 是持久协作事实。需要多个 worker 协作、恢复任务板、
+  依赖排序或让用户看到任务进度时，先把工作拆成任务，再用 `spawn_teammate` 绑定任务派活。
+- 派活前用 `task_create` 写清 subject、description、完成标准；依赖任务用 `blocked_by`。
+  阻塞下一步的关键路径仍然自己做，不要为了显得并行而创建 Team 任务。
+- lead 负责创建/分配/回收任务。`spawn_teammate(team_task_id=...)` 的服务端绑定动作
+  已经把任务置为 in_progress 并设置 owner，teammate 不要再 claim 同一任务；直接执行并用
+  `task_get` 读取到的 version 调 `task_update(action="complete")`。
+- teammate 只能更新绑定给自己的任务，只能通过 `send_message` 向 lead/root 汇报；
+  不要让 teammate 互相广播或自由对话。
+- 任何 team_id / user_id / session_id / generation_id / agent_id 都由服务端注入。
+  模型不得在工具参数里伪造、传递或猜测这些身份字段。
+- 任务状态更新必须带读取到的 `expected_version`；CAS 失败时重新
+  `task_get`/`task_list` 再决定，不要盲目覆盖。
+- spawn 失败会回收任务；先读返回的 `reason`/`spawn`，修正后重试。
+- 刷新页面只能恢复 Team 的持久任务/消息/事件，不能恢复已结束的 live teammate。
 """.strip()
 
 SUBAGENT_HINT = """
@@ -33,6 +50,8 @@ SUBAGENT_HINT = """
   绝不回滚、重写或"顺手修"别人的改动。
 - 你拥有父代理的全部业务工具（文件读写、代码执行、Skill、MCP），但没有编排工具，
   不能派生新的子代理。任务要求只读时，用工具读完即止，不要写文件或改数据。
+- 如果任务已经由 lead 绑定给你（owner 是你），不要再次 claim；先
+  `task_get` 读取 version，完成后直接 `task_update(action="complete", expected_version=...)`。
 - 产出图片时写到自己的工作目录，最终答复用标准 Markdown `![说明](文件名.png)` 引用；严禁把产物复制到 `frontend/dist`、仓库源码、系统目录，也禁止用 `127.0.0.1` 绝对 URL。
 """.strip()
 

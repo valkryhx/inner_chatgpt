@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import db
 from .config import ROOT_DIR, llm_yaml_available, load_llm_settings
-from .routers import auth, chat, me, media, sessions, skills
+from .routers import auth, chat, me, media, sessions, skills, team
 from .runtime import RuntimeHub, set_hub
 from .schemas import HealthOut
 
@@ -25,6 +25,12 @@ async def lifespan(app: FastAPI):
         await subagent_store.mark_stale_running_as_errored("server restart")
     except Exception:
         pass
+    # Team facts + generation leases. Recover every active lease left by the
+    # previous process before accepting requests, otherwise a single stale row
+    # would block that session forever.
+    from . import team_store
+    await team_store.init_tables()
+    await team_store.recover_stale_runtime("server restart")
     hub = RuntimeHub()
     await hub.startup()
     set_hub(hub)
@@ -51,6 +57,7 @@ app.include_router(sessions.router)
 app.include_router(chat.router)
 app.include_router(skills.router)
 app.include_router(media.router)
+app.include_router(team.router)
 
 
 @app.get("/api/health", response_model=HealthOut)

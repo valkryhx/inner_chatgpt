@@ -82,7 +82,7 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
     servers = [m for m in await db.list_mcp_servers(user_id) if m.get("enabled")]
     if not servers:
         from mcp_server.server import mcp as demo_mcp
-        return await MCPToolset(demo_mcp).__aenter__()
+        return await MCPToolset(demo_mcp, user_id=user_id).__aenter__()
 
     connect_timeout = float(os.environ.get("MCP_CONNECT_TIMEOUT", "12"))
     toolsets: list[MCPToolset] = []
@@ -91,7 +91,7 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
         try:
             if srv.get("transport") == "builtin_demo":
                 from mcp_server.server import mcp as demo_mcp
-                ts = MCPToolset(demo_mcp)
+                ts = MCPToolset(demo_mcp, user_id=user_id)
                 await asyncio.wait_for(ts.__aenter__(), timeout=connect_timeout)
             else:
                 target = {
@@ -102,7 +102,7 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
                     "headers": srv.get("headers", {}) or {},
                     "env": srv.get("env", {}) or {},
                 }
-                ts = MCPToolset(target)
+                ts = MCPToolset(target, user_id=user_id)
                 await asyncio.wait_for(ts.__aenter__(), timeout=connect_timeout)
             if ts.tools:
                 toolsets.append(ts)
@@ -117,7 +117,7 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
             continue
     if not toolsets:
         from mcp_server.server import mcp as demo_mcp
-        return await MCPToolset(demo_mcp).__aenter__()
+        return await MCPToolset(demo_mcp, user_id=user_id).__aenter__()
     return MCPToolset.merge(toolsets)
 
 
@@ -128,10 +128,12 @@ class UserRuntime:
         self.registry: Optional[ToolRegistry] = None
         self.loop: Optional[AgentLoop] = None
         self.store = get_history_store()
+        self.user_id = ""
         self.soft_limit = 0
         self.hard_limit = 0
 
     async def build(self, user_id: str, llm_config_id: str | None = None) -> "UserRuntime":
+        self.user_id = user_id
         # System prompt = base + per-user skill index (L1 listing only; bodies load on demand).
         try:
             skill_block = build_skill_prompt(user_id)
@@ -152,7 +154,7 @@ class UserRuntime:
         self.hard_limit = int(os.environ.get("AGENT_HARD_LIMIT", self.model.hard_limit))
         max_turns = int(os.environ.get("AGENT_MAX_TURNS", os.environ.get("AGENT_RECURSION_LIMIT", "48")))
         self.loop = AgentLoop(self.model.client, self.registry, system_prompt,
-                              max_turns=max_turns, history_store=self.store)
+                              max_turns=max_turns, history_store=self.store, user_id=user_id)
         return self
 
     async def close(self) -> None:
@@ -175,13 +177,19 @@ class UserRuntime:
         if self.loop is None:
             return False
         try:
-            history = await self.store.get(session_id)
+            if self.user_id:
+                history = await self.store.get(self.user_id, session_id)
+            else:
+                history = await self.store.get(session_id)
         except Exception:
             return False
         changed = await self.loop.sanitize(history)
         if changed:
             try:
-                await self.store.set(session_id, history)
+                if self.user_id:
+                    await self.store.set(self.user_id, session_id, history)
+                else:
+                    await self.store.set(session_id, history)
             except Exception:
                 pass
         return changed

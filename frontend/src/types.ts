@@ -90,6 +90,75 @@ export interface SubagentBlock {
   error?: string
 }
 
+/** Agent Team durable task/message projections. */
+export type TeamStatus = 'active' | 'completed' | 'stopped' | 'failed' | 'stale'
+export type TeamTaskStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled'
+
+export interface TeamRun {
+  team_id: string
+  user_id: string
+  session_id: string
+  generation_id: string
+  lead_agent_id: string
+  name: string
+  status: TeamStatus
+  created_at: number
+  updated_at: number
+  closed_at: number
+}
+
+export interface TeamTask {
+  task_id: string
+  team_id: string
+  user_id: string
+  session_id: string
+  generation_id: string
+  subject: string
+  description: string
+  status: TeamTaskStatus
+  owner_agent_id: string
+  created_by: string
+  created_at: number
+  updated_at: number
+  version: number
+  blockedBy: string[]
+}
+
+export interface TeamMessage {
+  message_id: string
+  team_id: string
+  user_id?: string
+  session_id?: string
+  generation_id?: string
+  sender_agent_id: string
+  recipient_agent_id: string
+  kind: string
+  content: string
+  created_at: number
+  delivered_at?: number
+  read_at?: number
+}
+
+export interface TeamEvent {
+  type: string
+  team_id: string
+  session_id?: string
+  generation_id?: string
+  agent_id?: string
+  task_id?: string
+  event_seq: number
+  payload: Record<string, unknown>
+  status?: string
+  updated_at?: number
+}
+
+export interface TeamSnapshot {
+  team: TeamRun | null
+  tasks: TeamTask[]
+  events: TeamEvent[]
+  messages: TeamMessage[]
+}
+
 export type MessageBlock =
   | TextBlock
   | ToolBlock
@@ -139,6 +208,7 @@ export type StreamEvent =
   | { type: 'subagent_event'; agent_id: string; event: StreamEvent }
   | { type: 'subagent_end'; agent_id: string; name?: string; status: string; result?: string; turns?: number; error?: string }
   | { type: 'compaction'; summary_tokens: number; kept_messages: number; trigger?: string }
+  | { type: 'team_event'; team_id: string; event_seq?: number; [key: string]: unknown }
   | { type: 'done'; message_id: string; status: 'complete' | 'stopped' | 'error' }
   | { type: 'error'; error: string }
 

@@ -33,6 +33,7 @@ Web 前端 + Agent 后端（自研 LLM 客户端 + 工具调用循环）+ SQLite
   - `builtin_tools.py`：内置工具 file_read / file_write / file_patch / list_files / code_run / load_skill
   - `skill_store.py`：文件系统 Skill（SKILL.md）解析 / 渐进披露 / 用户私有 CRUD
   - `workspace.py`：每用户 workspace + 路径安全（读写均限定在个人目录内）
+  - Agent Team：持久任务板 + lead/teammate + 任务依赖 + CAS 所有权 + 右侧实时任务面板。
   - `subagent/`：进程内 asyncio 子代理运行时（context / store / events / capabilities /
     registry / runtime / host / tools / prompts / session），不引入 langchain/langgraph、不 import GA
 - 认证：邮箱+密码（bcrypt）+ JWT access token + HttpOnly refresh cookie（旋转）

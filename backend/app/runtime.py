@@ -25,23 +25,38 @@ class RuntimeHub:
         # key = (user_id, model_key); model_key = session's LLM config id ("" = follow default)
         self._runtimes: dict[tuple[str, str], UserRuntime] = {}
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
-        # 活跃的子代理宿主：key = (session_id, generation_id)
-        # 用途：用户点「停止」时级联停止所有子代理；一次生成结束后清理。
-        self._subagent_hosts: dict[tuple[str, str], "object"] = {}
+        # 活跃的子代理宿主：key = (user_id, session_id, generation_id, team_id)
+        # 用户 id 必须参与键，防止只猜 session/generation 就能影响别人。
+        self._subagent_hosts: dict[tuple[str, str, str, str], "object"] = {}
 
     # ---------------- subagent hosts ----------------
-    def register_subagent_host(self, session_id: str, generation_id: str, host: "object") -> None:
-        self._subagent_hosts[(session_id, generation_id)] = host
+    def register_subagent_host(self, user_id: str, session_id: str, generation_id: str,
+                               team_id: str, host: "object") -> None:
+        self._subagent_hosts[(user_id, session_id, generation_id, team_id)] = host
 
-    def unregister_subagent_host(self, session_id: str, generation_id: str) -> None:
-        self._subagent_hosts.pop((session_id, generation_id), None)
+    def unregister_subagent_host(self, user_id: str, session_id: str, generation_id: str,
+                                 team_id: str = "") -> None:
+        self._subagent_hosts.pop((user_id, session_id, generation_id, team_id), None)
 
-    def get_subagent_host(self, session_id: str, generation_id: str):
-        return self._subagent_hosts.get((session_id, generation_id))
+    def get_subagent_host(self, user_id: str, session_id: str, generation_id: str, team_id: str = ""):
+        return self._subagent_hosts.get((user_id, session_id, generation_id, team_id))
 
-    async def stop_subagent_generation(self, session_id: str, generation_id: str) -> int:
-        """级联停止：把该代所有子代理标记停止（异步取消）。"""
-        host = self._subagent_hosts.get((session_id, generation_id))
+    async def stop_subagent_generation(self, user_id: str, session_id: str, generation_id: str) -> int:
+        """级联停止：只匹配该用户、该会话、该代的所有 host。"""
+        keys = [k for k in self._subagent_hosts
+                if k[0] == user_id and k[1] == session_id and k[2] == generation_id]
+        hosts = [self._subagent_hosts[k] for k in keys]
+        if not hosts:
+            return 0
+        n = 0
+        for host in hosts:
+            try:
+                n += len(host.list_agents())
+                await host.stop_all()
+            except Exception:
+                pass
+        return n
+
         if host is None:
             return 0
         try:
@@ -111,36 +126,34 @@ class RuntimeHub:
 
 
 # ---------------- stop registry ----------------
-_stop_events: dict[str, dict[str, asyncio.Event]] = {}
+# Production keys include the authenticated owner.  Session IDs are globally
+# unique, but owner scoping is still enforced so a caller can never act on a
+# guessed foreign key.
+_stop_events: dict[tuple[str, str, str], asyncio.Event] = {}
 
 
 def has_active_generation(session_id: str) -> bool:
-    return bool(_stop_events.get(session_id))
+    return any(sid == session_id for _, sid, _ in _stop_events)
 
 
-def register_generation(session_id: str, generation_id: str) -> asyncio.Event:
+def register_generation(user_id: str, session_id: str, generation_id: str) -> asyncio.Event:
     ev = asyncio.Event()
-    _stop_events.setdefault(session_id, {})[generation_id] = ev
+    _stop_events[(user_id, session_id, generation_id)] = ev
     return ev
 
 
-def unregister_generation(session_id: str, generation_id: str) -> None:
-    d = _stop_events.get(session_id)
-    if d:
-        d.pop(generation_id, None)
-        if not d:
-            _stop_events.pop(session_id, None)
+def unregister_generation(user_id: str, session_id: str, generation_id: str) -> None:
+    _stop_events.pop((user_id, session_id, generation_id), None)
 
 
-def request_stop(session_id: str, generation_id: Optional[str] = None) -> int:
-    d = _stop_events.get(session_id)
-    if not d:
-        return 0
-    targets = [generation_id] if generation_id else list(d.keys())
+def request_stop(user_id: str, session_id: str, generation_id: str | None = None) -> int:
     n = 0
-    for gid in targets:
-        ev = d.get(gid)
-        if ev is not None:
-            ev.set()
-            n += 1
+    for key, ev in list(_stop_events.items()):
+        owner, sid, gid = key
+        if owner != user_id or sid != session_id:
+            continue
+        if generation_id and gid != generation_id:
+            continue
+        ev.set()
+        n += 1
     return n

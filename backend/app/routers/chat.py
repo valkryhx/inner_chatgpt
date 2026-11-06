@@ -10,10 +10,12 @@ from fastapi.responses import StreamingResponse
 from .. import db
 from ..auth import get_current_user
 from ..runtime import get_hub, register_generation, request_stop, unregister_generation
+from ..process_registry import stop_generation as stop_code_runs
+from .. import team_store
 from ..schemas import CompactResult, MessageOut, SendMessageIn, StopIn, StopResult
 from ..sse import run_agent_stream, sse_frame
 from ..subagent.context import AgentContext
-from ..subagent.session import build_turn_runtime
+from ..subagent.session import build_turn_runtime, prepare_turn_team
 
 _SUBAGENT_EVENT_ID = "__subagent__"
 
@@ -73,6 +75,7 @@ class _TurnUR:
         self.loop = turn.loop
         self.store = turn.store
         self.model = turn.model
+        self.user_id = getattr(turn, "user_id", "")
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -81,6 +84,7 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                         model_id: str = "") -> AsyncIterator[str]:
     hub = get_hub()
     if hub is None:
+        await team_store.release_generation(user_id, session_id, generation_id)
         yield sse_frame("error", {"error": "runtime not ready"})
         return
     try:
@@ -88,6 +92,7 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     except Exception as e:  # noqa: BLE001
         # 典型场景：全新部署、用户还没配置任何模型（且仓库不携带 llm.yaml）。
         # 这里以 SSE 事件返回可读提示，而不是让前端只看到 500。
+        await team_store.release_generation(user_id, session_id, generation_id)
         yield sse_frame("error", {
             "error": f"无法初始化模型：{type(e).__name__}: {e}",
             "hint": "请先在「设置 -> 我的模型」新增模型（base_url / api_key / model）并设为默认。",
@@ -125,7 +130,7 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     await db.add_message(session_id, "user", content=text)
     await db.add_message(session_id, "assistant", content="", status="streaming", message_id=message_id)
 
-    stop_event = register_generation(session_id, generation_id)
+    stop_event = register_generation(user_id, session_id, generation_id)
     buffer: list[str] = []
     reasoning_buf: list[str] = []
     tool_steps: list[dict[str, Any]] = []
@@ -178,9 +183,20 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     ctx = AgentContext(user_id=user_id, session_id=session_id,
                        message_id=message_id, generation_id=generation_id)
     turn = None
+    team_ctx = ctx
     try:
-        turn = build_turn_runtime(ur, ctx)
-        hub.register_subagent_host(session_id, generation_id, turn.host)
+        turn = await build_turn_runtime(ur, ctx)
+        # build_turn_runtime creates the server-owned team id. All host and
+        # child contexts must use that same id; never trust a tool argument.
+        if getattr(turn, "team_id", ""):
+            team_ctx = ctx.with_team(turn.team_id, role="lead")
+        try:
+            hub.register_subagent_host(user_id, session_id, generation_id, team_ctx.team_id, turn.host)
+        except TypeError:
+            # Compatibility for lightweight test doubles with the pre-scope
+            # signature. Production RuntimeHub always uses the five-argument form.
+            hub.register_subagent_host(session_id, generation_id, turn.host)
+        await prepare_turn_team(turn, team_ctx)
     except Exception:
         turn = None
 
@@ -198,7 +214,10 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
 
     try:
         if turn is not None:
-            events = _merged_events(run_agent_stream(_TurnUR(turn), session_id, text, stop_event),
+            turn_ur = _TurnUR(turn)
+            if not getattr(turn_ur, "user_id", ""):
+                turn_ur.user_id = user_id
+            events = _merged_events(run_agent_stream(turn_ur, session_id, text, stop_event),
                                     turn.buffer, turn.host)
         else:
             events = run_agent_stream(ur, session_id, text, stop_event)
@@ -270,6 +289,10 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                 yield frame("subagent_end", {"agent_id": aid, "name": ev.get("name"),
                                              "status": ev.get("status"), "result": ev.get("result", ""),
                                              "turns": ev.get("turns", 0), "error": ev.get("error", "")})
+            elif et == "team_event":
+                team_event = ev.get("event") or {}
+                await _persist("streaming")
+                yield frame("team_event", team_event)
             elif et == "error":
                 terminal_status = "error"
                 yield frame("error", {"error": ev.get("error", "unknown error")})
@@ -296,14 +319,36 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                 await turn.host.close_all()
             except Exception:
                 pass
+            if turn.team is not None:
+                # Drain durable events produced after the last observed tool
+                # call. The host mirrors them through the same SSE sink.
+                try:
+                    await turn.team.events_since(turn.team.observed_seq)
+                except Exception:
+                    pass
+            if turn.team is not None:
+                try:
+                    await turn.team.set_status("stopped" if terminal_status in ("stopped", "error") else "completed")
+                except Exception:
+                    pass
+                try:
+                    await turn.team.release_lifecycle()
+                except Exception:
+                    pass
             try:
-                hub.unregister_subagent_host(session_id, generation_id)
+                hub.unregister_subagent_host(user_id, session_id, generation_id, team_ctx.team_id)
+            except TypeError:
+                try:
+                    hub.unregister_subagent_host(session_id, generation_id)
+                except Exception:
+                    pass
             except Exception:
                 pass
         if terminal_status is None:
             terminal_status = "stopped"
             await _persist(terminal_status, force=True)
-        unregister_generation(session_id, generation_id)
+        unregister_generation(user_id, session_id, generation_id)
+        await team_store.release_generation(user_id, session_id, generation_id)
 
 
 @router.post("/sessions/{session_id}/messages")
@@ -314,6 +359,16 @@ async def send_message(session_id: str, body: SendMessageIn, user: dict = Depend
     if not body.text.strip():
         raise HTTPException(status_code=400, detail="empty text")
     generation_id = body.generation_id or db.new_id("g")
+    # One active generation per (user, session). Without this lease two tabs
+    # can interleave writes into the same checkpoint, and stop becomes ambiguous.
+    acquired = await team_store.acquire_generation(user["id"], session_id, generation_id)
+    if not acquired:
+        active = await team_store.get_active_generation(user["id"], session_id)
+        raise HTTPException(status_code=409, detail={
+            "error": "generation_active",
+            "active_generation_id": active,
+            "hint": "请先停止当前生成，或刷新页面等待其结束。",
+        })
     message_id = db.new_id("msg")
     count = await db.count_messages(session_id)
     if count == 0 and sess["title"] in ("新会话", "", None):
@@ -330,13 +385,20 @@ async def stop_generation(session_id: str, body: StopIn, user: dict = Depends(ge
     sess = await db.get_session(session_id, user["id"])
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
-    n = request_stop(session_id, body.generation_id)
+    try:
+        n = request_stop(user["id"], session_id, body.generation_id)
+    except TypeError:
+        n = request_stop(session_id, body.generation_id)
     # 级联停止子代理：否则主代理停了、子代理还在后台继续烧钱（设计文档 §9.1）
     subs = 0
     try:
         hub = get_hub()
         if hub is not None and body.generation_id:
-            subs = await hub.stop_subagent_generation(session_id, body.generation_id)
+            try:
+                subs = await hub.stop_subagent_generation(user["id"], session_id, body.generation_id)
+            except TypeError:
+                subs = await hub.stop_subagent_generation(session_id, body.generation_id)
+            await stop_code_runs(user["id"], session_id, body.generation_id)
     except Exception:
         pass
 

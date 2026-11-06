@@ -1,7 +1,7 @@
-"""侧链持久化：subagent_runs + subagent_messages。
+"""Owner-scoped sidechain persistence for subagent runs.
 
-铁律（见设计文档 §4.2）：子代理消息**绝不**写进 session_history。
-主对话的权威回放源只有 session_history；子代理过程单独两张表，按需展示。
+Subagent messages never enter session_history. Every run operation accepts an
+owner scope; single-argument forms remain compatibility wrappers for old tests.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import aiosqlite
 
 from ..config import DB_PATH
 
-_CREATE = """
+_BASE_TABLES = """
 CREATE TABLE IF NOT EXISTS subagent_runs (
     run_id          TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL,
@@ -31,16 +31,19 @@ CREATE TABLE IF NOT EXISTS subagent_runs (
     started_at      INTEGER NOT NULL DEFAULT 0,
     finished_at     INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_subruns_session ON subagent_runs(session_id, started_at);
-CREATE INDEX IF NOT EXISTS idx_subruns_user ON subagent_runs(user_id, session_id);
-
 CREATE TABLE IF NOT EXISTS subagent_messages (
-    run_id     TEXT NOT NULL,
-    seq        INTEGER NOT NULL,
-    message    TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
+    run_id        TEXT NOT NULL,
+    seq           INTEGER NOT NULL,
+    message       TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
     PRIMARY KEY (run_id, seq)
 );
+"""
+_SCOPE_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_subruns_scope
+    ON subagent_runs(user_id, session_id, generation_id, team_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_submsg_scope
+    ON subagent_messages(user_id, session_id, generation_id, team_id, run_id, seq);
 """
 
 
@@ -51,76 +54,137 @@ def now_ms() -> int:
 async def init_tables() -> None:
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.executescript(_CREATE)
+        await conn.execute("PRAGMA busy_timeout=5000;")
+        # Add columns before creating scope indexes.  Legacy tables do not have
+        # generation_id/team_id/user_id yet, and an index referencing missing
+        # columns would abort startup.
+        await conn.executescript(_BASE_TABLES)
+        for table, cols in (
+            ("subagent_runs", (("generation_id", "TEXT NOT NULL DEFAULT ''"),
+                               ("team_id", "TEXT NOT NULL DEFAULT ''"))),
+            ("subagent_messages", (("user_id", "TEXT NOT NULL DEFAULT ''"),
+                                   ("session_id", "TEXT NOT NULL DEFAULT ''"),
+                                   ("generation_id", "TEXT NOT NULL DEFAULT ''"),
+                                   ("team_id", "TEXT NOT NULL DEFAULT ''"))),
+        ):
+            cur = await conn.execute(f"PRAGMA table_info({table})")
+            existing = {r[1] for r in await cur.fetchall()}
+            for col, decl in cols:
+                if col not in existing:
+                    await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        # Backfill message ownership from the authoritative parent run.
+        await conn.execute(
+            "UPDATE subagent_messages SET "
+            "user_id=COALESCE((SELECT user_id FROM subagent_runs r WHERE r.run_id=subagent_messages.run_id),''), "
+            "session_id=COALESCE((SELECT session_id FROM subagent_runs r WHERE r.run_id=subagent_messages.run_id),''), "
+            "generation_id=COALESCE((SELECT generation_id FROM subagent_runs r WHERE r.run_id=subagent_messages.run_id),''), "
+            "team_id=COALESCE((SELECT team_id FROM subagent_runs r WHERE r.run_id=subagent_messages.run_id),'') "
+            "WHERE user_id='' OR session_id='' OR generation_id='' OR team_id=''"
+        )
+        await conn.executescript(_SCOPE_INDEXES)
         await conn.commit()
 
 
 async def create_run(*, run_id: str, ctx_user_id: str, session_id: str, message_id: str,
                      parent_agent_id: str, agent_id: str, name: str, role: str,
-                     task_message: str, status: str = "running") -> dict:
+                     task_message: str, status: str = "running",
+                     generation_id: str = "", team_id: str = "") -> dict:
     started = now_ms()
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute(
-            "INSERT INTO subagent_runs(run_id,user_id,session_id,message_id,parent_agent_id,"
-            "agent_id,name,role,status,task_message,started_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (run_id, ctx_user_id, session_id, message_id, parent_agent_id, agent_id,
-             name, role, status, task_message, started),
+            "INSERT INTO subagent_runs(run_id,user_id,session_id,generation_id,team_id,message_id,"
+            "parent_agent_id,agent_id,name,role,status,task_message,started_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, ctx_user_id, session_id, generation_id, team_id, message_id,
+             parent_agent_id, agent_id, name, role, status, task_message, started),
         )
         await conn.commit()
-    return {
-        "run_id": run_id, "user_id": ctx_user_id, "session_id": session_id,
-        "message_id": message_id, "parent_agent_id": parent_agent_id,
-        "agent_id": agent_id, "name": name, "role": role, "status": status,
-        "task_message": task_message, "result_text": "", "error": "",
-        "turns": 0, "started_at": started, "finished_at": 0,
-    }
+    return {"run_id": run_id, "user_id": ctx_user_id, "session_id": session_id,
+            "generation_id": generation_id, "team_id": team_id, "message_id": message_id,
+            "parent_agent_id": parent_agent_id, "agent_id": agent_id, "name": name,
+            "role": role, "status": status, "task_message": task_message,
+            "result_text": "", "error": "", "turns": 0,
+            "started_at": started, "finished_at": 0}
 
 
-async def set_status(run_id: str, status: str) -> None:
+def _scope_sql(base: str, run_id: str, user_id: str, session_id: str,
+               generation_id: str, team_id: str) -> tuple[str, list[Any]]:
+    sql = base
+    vals: list[Any] = [run_id]
+    for col, value in (("user_id", user_id), ("session_id", session_id),
+                       ("generation_id", generation_id), ("team_id", team_id)):
+        if value:
+            sql += f" AND {col}=?"
+            vals.append(value)
+    return sql, vals
+
+
+async def set_status(run_id: str, status: str, *, user_id: str = "", session_id: str = "",
+                     generation_id: str = "", team_id: str = "") -> bool:
+    sql, vals = _scope_sql("UPDATE subagent_runs SET status=? WHERE run_id=?", run_id,
+                           user_id, session_id, generation_id, team_id)
+    vals.insert(0, status)
     async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute("UPDATE subagent_runs SET status=? WHERE run_id=?", (status, run_id))
+        cur = await conn.execute(sql, vals)
         await conn.commit()
+        return (cur.rowcount or 0) == 1
 
 
-async def finish_run(run_id: str, *, status: str, result_text: str = "",
-                     turns: int = 0, error: str = "") -> None:
+async def finish_run(run_id: str, *, status: str, result_text: str = "", turns: int = 0,
+                     error: str = "", user_id: str = "", session_id: str = "",
+                     generation_id: str = "", team_id: str = "") -> bool:
+    sql, vals = _scope_sql(
+        "UPDATE subagent_runs SET status=?, result_text=?, turns=?, error=?, "
+        "finished_at=? WHERE run_id=?", run_id, user_id, session_id, generation_id, team_id
+    )
+    vals[:0] = [status, result_text, int(turns), error, now_ms()]
     async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute(
-            "UPDATE subagent_runs SET status=?, result_text=?, turns=?, error=?, finished_at=? "
-            "WHERE run_id=?",
-            (status, result_text, int(turns), error, now_ms(), run_id),
-        )
+        cur = await conn.execute(sql, vals)
         await conn.commit()
+        return (cur.rowcount or 0) == 1
 
 
-async def append_sidechain(run_id: str, history: list[dict], *, start_seq: int = 0) -> int:
-    """把 history 里从 start_seq 开始的新消息追加到侧链表，返回新的已写条数。
-
-    只追加增量，避免整表重写（history 可能很长）。
-    """
+async def append_sidechain(run_id: str, history: list[dict], *, start_seq: int = 0,
+                           user_id: str = "", session_id: str = "",
+                           generation_id: str = "", team_id: str = "") -> int:
     rows = history[start_seq:]
     if not rows:
         return start_seq
     ts = now_ms()
     async with aiosqlite.connect(DB_PATH) as conn:
+        if user_id or session_id or generation_id or team_id:
+            cur = await conn.execute(
+                "SELECT 1 FROM subagent_runs WHERE run_id=? AND user_id=? AND session_id=? "
+                "AND generation_id=? AND team_id=?",
+                (run_id, user_id, session_id, generation_id, team_id),
+            )
+            if await cur.fetchone() is None:
+                return start_seq
         await conn.executemany(
-            "INSERT OR REPLACE INTO subagent_messages(run_id,seq,message,created_at) VALUES(?,?,?,?)",
-            [(run_id, start_seq + i, json.dumps(m, ensure_ascii=False), ts)
-             for i, m in enumerate(rows)],
+            "INSERT OR REPLACE INTO subagent_messages(run_id,seq,user_id,session_id,"
+            "generation_id,team_id,message,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            [(run_id, start_seq + i, user_id, session_id, generation_id, team_id,
+              json.dumps(m, ensure_ascii=False), ts) for i, m in enumerate(rows)],
         )
         await conn.commit()
     return start_seq + len(rows)
 
 
-async def load_sidechain(run_id: str) -> list[dict]:
+async def load_sidechain(run_id: str, *, user_id: str = "", session_id: str = "",
+                         generation_id: str = "", team_id: str = "") -> list[dict]:
+    sql = "SELECT message FROM subagent_messages WHERE run_id=?"
+    vals: list[Any] = [run_id]
+    for col, value in (("user_id", user_id), ("session_id", session_id),
+                       ("generation_id", generation_id), ("team_id", team_id)):
+        if value:
+            sql += f" AND {col}=?"
+            vals.append(value)
+    sql += " ORDER BY seq ASC"
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
-        cur = await conn.execute(
-            "SELECT message FROM subagent_messages WHERE run_id=? ORDER BY seq ASC", (run_id,)
-        )
+        cur = await conn.execute(sql, vals)
         rows = await cur.fetchall()
-    out: list[dict] = []
+    out = []
     for r in rows:
         try:
             out.append(json.loads(r["message"]))
@@ -129,21 +193,30 @@ async def load_sidechain(run_id: str) -> list[dict]:
     return out
 
 
-async def get_run(run_id: str) -> Optional[dict]:
+async def get_run(run_id: str, *, user_id: str = "", session_id: str = "",
+                  generation_id: str = "", team_id: str = "") -> Optional[dict]:
+    sql, vals = _scope_sql("SELECT * FROM subagent_runs WHERE run_id=?", run_id,
+                           user_id, session_id, generation_id, team_id)
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
-        cur = await conn.execute("SELECT * FROM subagent_runs WHERE run_id=?", (run_id,))
+        cur = await conn.execute(sql, vals)
         row = await cur.fetchone()
     return dict(row) if row else None
 
 
-async def list_runs(session_id: str, user_id: str, *, message_id: str = "") -> list[dict]:
-    """只返回本用户本会话的 run —— 所有权过滤不可省（对齐 Aivory）。"""
+async def list_runs(session_id: str, user_id: str, *, message_id: str = "",
+                    generation_id: str = "", team_id: str = "") -> list[dict]:
     sql = "SELECT * FROM subagent_runs WHERE session_id=? AND user_id=?"
     params: list[Any] = [session_id, user_id]
     if message_id:
         sql += " AND message_id=?"
         params.append(message_id)
+    if generation_id:
+        sql += " AND generation_id=?"
+        params.append(generation_id)
+    if team_id:
+        sql += " AND team_id=?"
+        params.append(team_id)
     sql += " ORDER BY started_at ASC"
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
@@ -153,7 +226,6 @@ async def list_runs(session_id: str, user_id: str, *, message_id: str = "") -> l
 
 
 async def mark_stale_running_as_errored(reason: str = "restarted") -> int:
-    """进程启动时调用：把上次进程遗留的 running 状态收敛为 errored。"""
     async with aiosqlite.connect(DB_PATH) as conn:
         cur = await conn.execute(
             "UPDATE subagent_runs SET status='errored', error=?, finished_at=? "
