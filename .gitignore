@@ -32,6 +32,5 @@ Thumbs.db
 # work / 临时测试产物
 work/
 
-# 文档与零碎资料：仅本地保留，不入 GitHub 仓库（内网资料）
-docs/
+# 零碎资料：仅本地保留，不入 GitHub 仓库（内网资料）
 misc/

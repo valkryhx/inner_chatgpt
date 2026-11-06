@@ -17,6 +17,11 @@ Web 前端 + Agent 后端（自研 LLM 客户端 + 工具调用循环）+ SQLite
 
 ---
 
+## 开发者必读
+
+- 功能实现原理（Agent 主循环 / 上下文持久化与压缩 / 模型切换 / MCP / Skill / 用户 workspace / Subagent）：[`docs/20261106-项目功能实现原理.md`](docs/20261106-项目功能实现原理.md)
+- 全部设计、实施、审计与阶段性 changelog：[`docs/`](docs/)
+
 ## 技术栈
 
 - 后端：FastAPI + **自研 Agent 内核**
