@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, getToken, setToken, streamMessage } from './api'
-import type { LlmModelOption, Message, Session, StreamEvent, TeamEvent, TeamSnapshot, User } from './types'
+import type { ContextUsage, LlmModelOption, Message, Session, StreamEvent, TeamEvent, TeamSnapshot, User } from './types'
 import Sidebar from './components/Sidebar'
 import MessageList from './components/MessageList'
 import Composer from './components/Composer'
@@ -8,8 +8,18 @@ import LoginPage from './components/LoginPage'
 import SettingsModal from './components/SettingsModal'
 import TeamPanel from './components/TeamPanel'
 
+const TEAM_OPEN_KEY = 'team_panel_open'
+
 function newGenId() {
   return 'g_' + Math.random().toString(16).slice(2, 10)
+}
+
+function readTeamOpen(): boolean {
+  try {
+    return localStorage.getItem(TEAM_OPEN_KEY) === '1'
+  } catch {
+    return false
+  }
 }
 
 // 消息块严格按事件发生顺序累积：文本增量并入末尾文本块，工具/图表插入当前位置。
@@ -39,8 +49,9 @@ function appendReasoningBlock(blocks: any[], chunk: string): any[] {
 
 
 function mergeTeamEvent(prev: TeamSnapshot | null, event: TeamEvent): TeamSnapshot | null {
-  if (!prev || !prev.team) {
-    if (event.type !== 'team_start') return prev
+  // 新 Team 的 team_start 必须能替换旧代快照，否则同一会话下一轮生成期间
+  // 会一直显示上一轮的旧任务板（generation/team id 都不同）。
+  if (event.type === 'team_start' && (!prev?.team || prev.team.team_id !== event.team_id)) {
     const now = Date.now()
     return {
       team: {
@@ -52,6 +63,7 @@ function mergeTeamEvent(prev: TeamSnapshot | null, event: TeamEvent): TeamSnapsh
       tasks: [], events: [event], messages: [],
     }
   }
+  if (!prev || !prev.team) return prev
   if (event.team_id && prev.team.team_id !== event.team_id) return prev
   const events = prev.events.some((e) => e.event_seq === event.event_seq)
     ? prev.events
@@ -91,12 +103,13 @@ export default function App() {
   const [activeStreamMsgId, setActiveStreamMsgId] = useState<string | null>(null)
   const [autoCompacted, setAutoCompacted] = useState<number>(0)
   const [health, setHealth] = useState<{ model: string; mcp_tools: number } | null>(null)
+  const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
   const [models, setModels] = useState<LlmModelOption[]>([])
   // 没有会话时选择的模型：作为下一个新会话的初始 model_id
   const [pendingModelId, setPendingModelId] = useState<string>('')
   const [error, setError] = useState<string | null>(null)
   const [teamSnapshot, setTeamSnapshot] = useState<TeamSnapshot | null>(null)
-  const [teamOpen, setTeamOpen] = useState(false)
+  const [teamOpen, setTeamOpen] = useState(readTeamOpen)
   const [teamGenerationId, setTeamGenerationId] = useState<string>('')
   const [notice, setNotice] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -106,6 +119,14 @@ export default function App() {
   const runTimesRef = useRef<Map<string, { started: number; finished?: number }>>(new Map())
   // 正在本端流式生成的会话 id；用于阻止历史加载覆盖乐观渲染的消息
   const streamSidRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(TEAM_OPEN_KEY, teamOpen ? '1' : '0')
+    } catch {
+      /* localStorage may be unavailable in hardened browsers. */
+    }
+  }, [teamOpen])
 
   useEffect(() => {
     if (!notice) return
@@ -154,6 +175,14 @@ export default function App() {
       setModels(r.models)
     } catch {
       /* 忽略：无模型列表时下拉仅显示当前 */
+    }
+  }, [])
+
+  const loadContextUsage = useCallback(async (id: string) => {
+    try {
+      setContextUsage(await api.getContextUsage(id))
+    } catch {
+      setContextUsage(null)
     }
   }, [])
 
@@ -232,14 +261,16 @@ export default function App() {
   useEffect(() => {
     if (!user) return
     if (activeId) {
+      loadContextUsage(activeId)
       setAutoCompacted(0)
       // 新会话首条消息：正在本端生成，跳过历史加载以免清空乐观消息
       if (streamSidRef.current === activeId) return
       loadMessages(activeId)
     } else {
       setMessages([])
+      setContextUsage(null)
     }
-  }, [user, activeId, loadMessages])
+  }, [user, activeId, loadMessages, loadContextUsage])
 
   const doLogout = async () => {
     try {
@@ -303,6 +334,7 @@ export default function App() {
         setNotice(r.message || '已压缩上下文')
         await loadMessages(activeId)
         await loadSessions()
+        await loadContextUsage(activeId)
       } else {
         setNotice(r.message || '暂无可压缩的内容（消息较少）')
       }
@@ -313,24 +345,40 @@ export default function App() {
     }
   }
 
-  const stop = async () => {
+  const stop = () => {
     if (!activeId) return
+    const sid = activeId
+    const genId = genIdRef.current
     const messageId = activeStreamMsgId || undefined
-    // 先把“用户已看到的本地消息”保留下来。stop 接口返回服务端已落库快照；
-    // 若服务端还来不及写，本地 snapshot 仍会显示，待重新加载时再与服务端合并。
-    let stoppedMsg: Message | null = null
-    try {
-      const r = await api.stop(activeId, genIdRef.current, messageId || undefined)
-      if (r.message) stoppedMsg = r.message
-    } catch {
-      /* ignore */
-    }
-    if (stoppedMsg) {
-      setMessages((prev) => prev.map((m) => (m.id === stoppedMsg!.id ? { ...stoppedMsg!, status: 'stopped' } : m)))
-    } else {
-      setMessages((prev) => prev.map((m) => (m.id === messageId ? { ...m, status: 'stopped' } : m)))
-    }
+
+    // Stop is a local-first action. The user must regain the composer
+    // immediately, even if the backend is stuck in an LLM/tool await. Mark the
+    // visible assistant bubble terminal, abort our fetch, then ask the server
+    // to cancel in the background. The backend stop endpoint uses task.cancel()
+    // and bounded waits, so this parallel request normally resolves quickly.
+    const finishedAt = Date.now()
+    setMessages((prev) => prev.map((m) => {
+      if (m.id !== messageId && m.status !== 'streaming') return m
+      const timing = runTimesRef.current.get(m.id)
+      if (timing) runTimesRef.current.set(m.id, { ...timing, finished: finishedAt })
+      return { ...m, status: 'stopped', run_finished_at: m.run_finished_at || finishedAt }
+    }))
+    setStreaming(false)
+    setActiveStreamMsgId(null)
     abortRef.current?.abort()
+
+    api.stop(sid, genId, messageId).then((r) => {
+      if (r.message) {
+        const stopped = { ...r.message, status: 'stopped' as const }
+        setMessages((prev) => prev.map((m) => (m.id === stopped.id ? { ...stopped } : m)))
+      }
+    }).catch(() => {
+      /* Local stop already succeeded from the user's perspective. */
+    }).finally(() => {
+      // Pull the authoritative snapshot after the server has converged the
+      // lease/team facts. This also repairs any hard-cutoff fallback.
+      setTimeout(() => { loadMessages(sid); loadTeam(sid); loadContextUsage(sid) }, 250)
+    })
   }
 
   const send = async (text: string) => {
@@ -473,9 +521,8 @@ export default function App() {
         )
         patch({ ...assistantMsg, blocks: [...blocks] })
       } else if (ev.type === 'team_event') {
-        const teamEvent = ev as unknown as TeamEvent
         setTeamGenerationId(genId)
-        setTeamSnapshot((prev) => mergeTeamEvent(prev, teamEvent))
+        setTeamSnapshot((prev) => mergeTeamEvent(prev, ev.event))
       } else if (ev.type === 'compaction') {
         setAutoCompacted((n) => n + 1)
       } else if (ev.type === 'done') {
@@ -494,7 +541,17 @@ export default function App() {
     try {
       await streamMessage(sid, text, genId, onEvent, ctrl.signal)
     } catch (e) {
-      if (!ctrl.signal.aborted) setError(String(e))
+      if (!ctrl.signal.aborted) {
+        const msg = String(e)
+        // A stale server lease is usually auto-converged on the next send, but
+        // a real concurrent generation still needs an explicit user action.
+        // Surface an actionable message instead of a cryptic 409.
+        if (msg.includes('generation_active') || msg.includes('当前仍在生成')) {
+          setError('当前会话仍在生成。请点击「停止」，或刷新页面后再发送。')
+        } else {
+          setError(msg)
+        }
+      }
     } finally {
       // 停止/网络中断时服务端不一定来得及发 done；给本地气泡补上结束时间，
       // 让尾部状态从“执行中”可靠切换为“已停止/可继续输入”。
@@ -508,10 +565,16 @@ export default function App() {
         }
         setMessages((prev) => prev.map((m) => (m.id === assistantMsg.id ? assistantMsg : m)))
       }
-      setStreaming(false)
-      setActiveStreamMsgId(null)
-      streamSidRef.current = null
-      abortRef.current = null
+      // Local-first stop unlocks the composer before this old stream has fully
+      // unwound. If the user already sent the next message, genIdRef points to
+      // a newer generation; do not let this stale finally block clear its refs
+      // or flip streaming back to false mid-run.
+      if (genIdRef.current === genId) {
+        setStreaming(false)
+        setActiveStreamMsgId(null)
+        if (streamSidRef.current === sid) streamSidRef.current = null
+        if (abortRef.current === ctrl) abortRef.current = null
+      }
       // 停止是“用户主动结束”而不是失败：本地已经显示的文本/工具/图片必须保留。
       // 等 stop 端点把快照写入 DB 后，再做一次合并式刷新。
       if (ctrl.signal.aborted) {
@@ -520,7 +583,10 @@ export default function App() {
         setTimeout(() => loadMessages(sid!), 150)
       }
       loadSessions()
-      if (sid) setTimeout(() => loadTeam(sid), 180)
+      if (sid) {
+        setTimeout(() => loadTeam(sid), 180)
+        setTimeout(() => loadContextUsage(sid), 180)
+      }
     }
   }
 
@@ -541,6 +607,7 @@ export default function App() {
       await api.setSessionModel(activeId, modelId)
       setPendingModelId(modelId)
       await loadSessions()
+      await loadContextUsage(activeId)
       setError(null)
     } catch (e) {
       setError(String(e))
@@ -561,18 +628,19 @@ export default function App() {
     ? (activeSession.model_id || '')
     : pendingModelId || defaultModelId()
 
-  const activeModelLabel = (() => {
+  const activeModel = (() => {
     if (!activeSession) {
       // 没有会话时，显示当前选中（或默认）的模型，避免侧栏误显示「未配置模型」。
-      const d =
+      return (
         models.find((x) => x.id === currentModelId) ||
         models.find((x) => x.is_default) ||
-        models[0]
-      return d ? d.model : null
+        models[0] ||
+        null
+      )
     }
-    const m = models.find((x) => x.id === (activeSession.model_id || ''))
-    return m ? m.model : null
+    return models.find((x) => x.id === (activeSession.model_id || '')) || null
   })()
+  const activeModelLabel = activeModel ? activeModel.model : null
 
   return (
     <div className="app">
@@ -619,19 +687,6 @@ export default function App() {
               ))}
             </select>
           </label>
-          {activeSession && (
-            <span className="badge">
-              工具 {health?.mcp_tools ?? 0} · 压缩 {activeSession.compaction?.compacted ? '已启用' : '未触发'}
-            </span>
-          )}
-          <button className="ghost-btn" onClick={() => doCompact()} disabled={!activeId || streaming}>
-            压缩上下文
-          </button>
-          {teamSnapshot?.team && (
-            <button className="ghost-btn team-toggle" onClick={() => setTeamOpen((v) => !v)} title="打开或收起 Agent Team 任务板">
-              Team {teamSnapshot.tasks.filter((t) => t.status === 'in_progress').length > 0 ? '· 运行中' : ''}
-            </button>
-          )}
         </div>
         {notice && (
           <div className="notice-bar">
@@ -657,9 +712,23 @@ export default function App() {
           sessionKey={activeId}
           sendPulse={sendPulse}
         />
-        <Composer streaming={streaming} onSend={send} onStop={stop} onCompact={doCompact} />
+        <Composer
+          streaming={streaming}
+          onSend={send}
+          onStop={stop}
+          onCompact={doCompact}
+          contextUsage={contextUsage}
+          modelName={activeModel?.model || ''}
+          reasoningEffort={activeModel?.reasoning_effort || ''}
+        />
       </div>
-      <TeamPanel snapshot={teamSnapshot} open={teamOpen} onToggle={() => setTeamOpen((v) => !v)} />
+      <TeamPanel
+        snapshot={teamSnapshot}
+        open={teamOpen}
+        streaming={streaming}
+        onToggle={() => setTeamOpen((v) => !v)}
+        onStop={stop}
+      />
       {settingsOpen && (
         <SettingsModal
           onLlmChanged={loadModels}

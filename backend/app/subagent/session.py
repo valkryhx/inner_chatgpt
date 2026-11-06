@@ -32,7 +32,7 @@ from .events import EventBuffer
 from .host import SubagentHost
 from .tools import build_subagent_tools
 
-DEFAULT_MAX_TURNS = 48
+DEFAULT_MAX_TURNS = 300
 
 
 @dataclass

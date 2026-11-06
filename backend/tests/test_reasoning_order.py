@@ -204,6 +204,32 @@ def test_stop_result_returns_persisted_snapshot(monkeypatch):
     assert out.message.status == "stopped"
 
 
+def test_stop_endpoint_releases_generation_lease(monkeypatch):
+    """A successful stop must not leave the next turn blocked by a stale lease."""
+    from app.routers import chat
+    from app import db, team_store
+    from app.schemas import StopIn
+
+    released: list[tuple[str, str, str]] = []
+
+    async def fake_get_session(sid, uid):
+        return {"id": sid, "user_id": uid}
+
+    async def fake_release(uid, sid, gid):
+        released.append((uid, sid, gid))
+
+    monkeypatch.setattr(chat, "request_stop", lambda uid, sid, gid: 1)
+    monkeypatch.setattr(chat, "get_hub", lambda: None)
+    monkeypatch.setattr(db, "get_session", fake_get_session)
+    monkeypatch.setattr(team_store, "release_generation", fake_release)
+
+    out = asyncio.run(chat.stop_generation(
+        "s1", StopIn(generation_id="g1"), {"id": "u1"}
+    ))
+    assert out.ok is True
+    assert released == [("u1", "s1", "g1")]
+
+
 def _wire_event_stream(monkeypatch, fake_run_agent_stream, captured):
     """把 _event_stream 的外部依赖收窄到内存假实现。"""
     from app.routers import chat

@@ -34,7 +34,7 @@ def _dump(obj: Any) -> str:
 
 class AgentLoop:
     def __init__(self, client: LLMClient, registry: ToolRegistry, system_prompt: str,
-                 max_turns: int = 48, history_store=None, *, user_id: str = ""):
+                 max_turns: int = 300, history_store=None, *, user_id: str = ""):
         self.client = client
         self.registry = registry
         self.system_prompt = system_prompt
@@ -124,19 +124,33 @@ class AgentLoop:
 
             drive_task = asyncio.create_task(_drive())
             result: Optional[ChatResult] = None
-            while True:
-                kind, text = await q.get()
-                if kind == "__end__":
-                    break
-                if kind == "reasoning":
-                    yield {"type": "thinking_delta", "text": text}
-                else:
-                    yield {"type": "text_delta", "text": text}
             try:
+                while True:
+                    kind, text = await q.get()
+                    if kind == "__end__":
+                        break
+                    if kind == "reasoning":
+                        yield {"type": "thinking_delta", "text": text}
+                    else:
+                        yield {"type": "text_delta", "text": text}
                 result = await drive_task
             except LLMError as e:
                 yield {"type": "error", "error": str(e)}
                 return
+            except asyncio.CancelledError:
+                # Cancelling the outer SSE task must also stop the inner LLM
+                # request.  Otherwise the model call keeps running in the
+                # background and can mutate history after the user stopped.
+                if not drive_task.done():
+                    drive_task.cancel()
+                try:
+                    await drive_task
+                except BaseException:
+                    pass
+                raise
+            finally:
+                if not drive_task.done():
+                    drive_task.cancel()
 
             if stopped():
                 yield {"type": "done", "status": "stopped"}

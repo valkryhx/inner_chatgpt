@@ -361,12 +361,26 @@ class SubagentHost:
 
     # ---------------- lifecycle ----------------
     async def stop_all(self) -> None:
-        """用户点「停止」：把本代所有子代理标记停止并取消。"""
+        """用户点「停止」：把本代所有子代理标记停止并取消。
+
+        Cancellation must be followed by a short bounded join.  Merely calling
+        task.cancel() leaves child tasks unwinding in the background; they can
+        still hold quota leases / write sidechains after the parent generation
+        is reported stopped.  Bounded wait keeps the stop endpoint responsive
+        even if a tool ignores cancellation.
+        """
+        tasks = []
         for n in self.registry.active_nodes():
             n.stop.set()
             if n.task is not None and not n.task.done():
                 n.task.cancel()
+                tasks.append(n.task)
         self._touch()
+        if tasks:
+            try:
+                await asyncio.wait(tasks, timeout=1.5)
+            except Exception:
+                pass
 
     async def close_all(self) -> None:
         self._closed = True

@@ -152,7 +152,7 @@ class UserRuntime:
         self.registry = ToolRegistry(builtin + safe_mcp)
         self.soft_limit = int(os.environ.get("AGENT_SOFT_LIMIT", self.model.soft_limit))
         self.hard_limit = int(os.environ.get("AGENT_HARD_LIMIT", self.model.hard_limit))
-        max_turns = int(os.environ.get("AGENT_MAX_TURNS", os.environ.get("AGENT_RECURSION_LIMIT", "48")))
+        max_turns = int(os.environ.get("AGENT_MAX_TURNS", os.environ.get("AGENT_RECURSION_LIMIT", "300")))
         self.loop = AgentLoop(self.model.client, self.registry, system_prompt,
                               max_turns=max_turns, history_store=self.store, user_id=user_id)
         return self

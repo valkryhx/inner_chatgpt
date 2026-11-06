@@ -36,6 +36,17 @@ async def _latest_team(conn: aiosqlite.Connection, user_id: str,
 
 async def _team_scope(session_id: str, user: dict) -> tuple[dict[str, Any] | None, TeamScope | None]:
     await _owned_session(session_id, user)
+    # Do not report a permanently-active team after its generation is gone.
+    # The read endpoint is also a refresh recovery point for the TeamPanel.
+    from ..runtime import has_active_generation
+    if not has_active_generation(session_id, user["id"]):
+        active_generation = await team_store.get_active_generation(user["id"], session_id)
+        if active_generation:
+            await team_store.converge_generation_facts(
+                user["id"], session_id, active_generation, status="stale"
+            )
+        else:
+            await team_store.converge_orphaned_active_teams(user["id"], session_id)
     async with aiosqlite.connect(team_store.DB_PATH) as conn:
         team = await _latest_team(conn, user["id"], session_id)
     if team is None:

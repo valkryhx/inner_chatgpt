@@ -182,6 +182,18 @@ export interface Message {
   run_finished_at?: number
 }
 
+/** 当前会话的上下文占用（与后端自动压缩使用同一 token 估算口径）。 */
+export interface ContextUsage {
+  used_tokens: number
+  context_window: number
+  auto_compact_tokens: number
+  hard_limit_tokens: number
+  percent: number
+  compact_percent: number
+  remaining_to_compact: number
+  compacted: boolean
+}
+
 export interface SessionDetail {
   session: Session
   messages: Message[]
@@ -208,7 +220,7 @@ export type StreamEvent =
   | { type: 'subagent_event'; agent_id: string; event: StreamEvent }
   | { type: 'subagent_end'; agent_id: string; name?: string; status: string; result?: string; turns?: number; error?: string }
   | { type: 'compaction'; summary_tokens: number; kept_messages: number; trigger?: string }
-  | { type: 'team_event'; team_id: string; event_seq?: number; [key: string]: unknown }
+  | { type: 'team_event'; event: TeamEvent }
   | { type: 'done'; message_id: string; status: 'complete' | 'stopped' | 'error' }
   | { type: 'error'; error: string }
 
@@ -232,6 +244,8 @@ export interface LlmModelOption {
   label: string
   model: string
   wire_api: string
+  /** 模型配置里的 reasoning_effort；空字符串表示使用上游默认值。 */
+  reasoning_effort: string
   is_default: boolean
   source: string
 }

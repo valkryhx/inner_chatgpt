@@ -181,6 +181,48 @@ async def get_active_generation(user_id: str, session_id: str) -> Optional[str]:
     return str(row[0]) if row else None
 
 
+async def converge_generation_facts(user_id: str, session_id: str, generation_id: str,
+                                    *, status: str = "stale") -> dict[str, int]:
+    """Close an active generation and return its Team facts to a safe state.
+
+    Used both for explicit stop (status=stopped) and for a lease left behind
+    when no in-process task exists anymore (status=stale).  In-progress tasks
+    become pending with a new version so an old CAS holder cannot resurrect
+    them.  The caller must still decide whether a live task may still write.
+    """
+    if status not in TEAM_STATUSES:
+        status = "stale"
+    ts = now_ms()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("PRAGMA busy_timeout=5000;")
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            gen_cur = await conn.execute(
+                "UPDATE session_generations SET status=?,finished_at=? "
+                "WHERE user_id=? AND session_id=? AND generation_id=? AND status='active'",
+                (status, ts, user_id, session_id, generation_id),
+            )
+            task_cur = await conn.execute(
+                "UPDATE team_tasks SET status='pending',owner_agent_id='',version=version+1,updated_at=? "
+                "WHERE user_id=? AND session_id=? AND generation_id=? AND status='in_progress'",
+                (ts, user_id, session_id, generation_id),
+            )
+            team_cur = await conn.execute(
+                "UPDATE team_runs SET status=?,updated_at=?,closed_at=? "
+                "WHERE user_id=? AND session_id=? AND generation_id=? AND status='active'",
+                (status, ts, ts, user_id, session_id, generation_id),
+            )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+    return {
+        "generations": gen_cur.rowcount or 0,
+        "tasks": task_cur.rowcount or 0,
+        "teams": team_cur.rowcount or 0,
+    }
+
+
 # ---------------- team lifecycle ----------------
 async def create_team(scope: TeamScope, *, name: str) -> dict[str, Any]:
     ts = now_ms()
@@ -497,6 +539,30 @@ async def mark_message_read(scope: TeamScope, message_id: str) -> bool:
         )
         await conn.commit()
         return (cur.rowcount or 0) == 1
+
+
+async def converge_orphaned_active_teams(user_id: str, session_id: str) -> int:
+    """Close active teams that no longer have an active generation lease.
+
+    This is the last line of defence for the TeamPanel: a crash between the
+    generation update and the team update could otherwise leave a run marked
+    active forever.  It only touches the caller's session and only when there
+    is no active lease at all.
+    """
+    ts = now_ms()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("PRAGMA busy_timeout=5000;")
+        cur = await conn.execute(
+            "UPDATE team_runs SET status='stale',updated_at=?,closed_at=? "
+            "WHERE user_id=? AND session_id=? AND status='active' "
+            "AND generation_id NOT IN ("
+            "  SELECT generation_id FROM session_generations "
+            "  WHERE user_id=? AND session_id=? AND status='active'"
+            ")",
+            (ts, ts, user_id, session_id, user_id, session_id),
+        )
+        await conn.commit()
+        return cur.rowcount or 0
 
 
 async def recover_stale_runtime(reason: str = "server restart") -> dict[str, int]:

@@ -1,5 +1,6 @@
 import type {
   AuthResponse,
+  ContextUsage,
   LLMConfig,
   LlmModelOption,
   MCPServer,
@@ -34,6 +35,28 @@ export class ApiError extends Error {
   }
 }
 
+function detailText(value: unknown, fallback: string): string {
+  if (typeof value === 'string') return value
+  if (Array.isArray(value)) {
+    const parts = value.map((item) => detailText(item, '')).filter(Boolean)
+    return parts.length > 0 ? parts.join('；') : fallback
+  }
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>
+    const parts = [obj.error, obj.message, obj.hint, obj.detail]
+      .map((item) => detailText(item, ''))
+      .filter(Boolean)
+    if (parts.length > 0) return parts.join('：')
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return fallback
+    }
+  }
+  if (value === undefined || value === null || value === '') return fallback
+  return String(value)
+}
+
 function authHeaders(extra?: Record<string, string>): Record<string, string> {
   const h: Record<string, string> = { ...(extra || {}) }
   const t = getToken()
@@ -49,8 +72,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText
     try {
-      const body = await res.json()
-      detail = body.detail || body.error || detail
+      const body: unknown = await res.json()
+      const obj = body && typeof body === 'object' ? body as Record<string, unknown> : {}
+      detail = detailText(obj.detail ?? obj.error, detail)
     } catch {
       /* ignore */
     }
@@ -92,6 +116,7 @@ export const api = {
       body: JSON.stringify({ title, model_id: modelId ?? '' }),
     }),
   getSession: (id: string) => request<SessionDetail>(`/sessions/${id}`),
+  getContextUsage: (id: string) => request<ContextUsage>(`/sessions/${id}/context`),
   renameSession: (id: string, title: string) =>
     request<Session>(`/sessions/${id}`, {
       method: 'PATCH',
@@ -219,7 +244,17 @@ function parseFrame(raw: string): { event: string; data: StreamEvent } | null {
   if (!dataLine) return null
   try {
     const data = JSON.parse(dataLine) as Record<string, unknown>
-    // 后端把事件类型放在 SSE 的 `event:` 行，data 里通常没有 type 字段。
+    // team_event 的 data 本身就是持久化 Team 事件，其中 `type` 是
+    // team_start / task_created 等业务类型。若直接用外层 SSE 名覆盖会丢业务类型，
+    // 若保留业务类型又会让 App 永远匹配不到 `team_event` 分支。
+    // 因此与 subagent_event 一样包一层：外层 type 表示协议，event 保存业务事件。
+    if (event === 'team_event') {
+      return {
+        event,
+        data: { type: 'team_event', event: data } as unknown as StreamEvent,
+      }
+    }
+    // 其余事件后端把类型放在 SSE 的 `event:` 行，data 里通常没有 type 字段。
     // 这里以事件名为准补齐 type，否则前端所有分支都匹配不上（历史 bug）。
     if (event && event !== 'message' && typeof data.type !== 'string') {
       data.type = event
@@ -250,8 +285,9 @@ export async function streamMessage(
     }
     let msg = `stream failed (${res.status})`
     try {
-      const b = await res.json()
-      msg = b.detail || b.error || msg
+      const b: unknown = await res.json()
+      const obj = b && typeof b === 'object' ? b as Record<string, unknown> : {}
+      msg = detailText(obj.detail ?? obj.error, msg)
     } catch {
       /* ignore */
     }

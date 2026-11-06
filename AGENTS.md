@@ -80,6 +80,7 @@
 - Root 为 lead；teammate 继承 file/code_run/Skill/MCP，但不能调用编排工具或递归 spawn。
 - active generation 唯一租约、团队生命周期租约、用户/团队资源闸门、停止级联。
 - 前端右侧 TeamPanel（任务 / 消息 / 动态），SSE 增量更新、刷新 REST 恢复。
+- 停止链路加固：`/stop` 同时 set event + cancel task + 级联子代理/code_run；发送/读路径自动收敛无 live task 的陈旧租约；前端本地优先停止。详见 `docs/20261106-Agent停止卡死与陈旧租约自愈.md`。
 - Windows `--reload` 下 `code_run` 的 SelectorEventLoop 子进程兼容层。
 
 **P4（下一步）：** 计划模式 → goal → hooks。浏览器控制暂不做。
@@ -89,6 +90,8 @@
 
 | 文档 | 用途 |
 |---|---|
+| `docs/20261106-AgentTeam侧栏展开状态稳定修复.md` | **Team 侧栏展开状态稳定修复**：SSE `team_event` 协议错位、展开壳与数据解耦、展开偏好持久化、真实浏览器 E2E |
+| `docs/20261106-Agent停止卡死与陈旧租约自愈.md` | **停止可靠性（最新）**：协作停 + task.cancel + 资源级联三层停止、进程内 generation registry、reservation TTL、陈旧 active 租约自愈、前端本地优先停止、真实 LLM E2E |
 | `docs/20261106-changelog-AgentTeamP3.md` | **P3 已完成清单 + 真实 E2E 验收（最新，先读这份）** |
 | `docs/20261106-AgentTeam-Web多用户隔离设计方案.md` | **P3 Team 设计：四级作用域、任务所有权、资源闸门、停止语义** |
 | `docs/20261105-changelog-SubagentP2.md` | P2 已完成清单 + 自测 |

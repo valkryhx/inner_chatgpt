@@ -4,7 +4,9 @@ import type { TeamEvent, TeamSnapshot, TeamTask, TeamTaskStatus } from '../types
 interface Props {
   snapshot: TeamSnapshot | null
   open: boolean
+  streaming: boolean
   onToggle: () => void
+  onStop?: () => void
 }
 
 const TASK_LABEL: Record<TeamTaskStatus, string> = {
@@ -73,43 +75,70 @@ function TaskCard({ task }: { task: TeamTask }) {
   )
 }
 
-export default function TeamPanel({ snapshot, open, onToggle }: Props) {
+export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop }: Props) {
   const [tab, setTab] = useState<'tasks' | 'messages' | 'events'>('tasks')
   const tasks = snapshot?.tasks || []
   const messages = snapshot?.messages || []
   const events = snapshot?.events || []
-  const team = snapshot?.team
+  const team = snapshot?.team || null
   const counts = useMemo(() => {
     const by = { pending: 0, in_progress: 0, completed: 0, cancelled: 0 }
     for (const task of tasks) by[task.status] += 1
     return by
   }, [tasks])
 
-  if (!snapshot || !team) return null
+  // The rail is a permanent workspace affordance, not a property of one
+  // generation. Historical sessions may legitimately have no Team snapshot;
+  // hiding the rail there made the sidebar appear/disappear between sessions.
+  // Keep the shell mounted and render an empty/idle body when opened.
 
-  const status = team.status || 'active'
+  const status = team?.status || 'idle'
   const active = status === 'active'
+  // While a generation is running but this round's Team has not arrived yet,
+  // show a quiet inline tail beside the title instead of a large centered
+  // waiting card.  This keeps the panel geometry stable between turns.
+  const starting = streaming && !team
   return (
-    <aside className={'team-panel' + (open ? ' is-open' : '')} aria-label="Agent Team 任务板">
+    <aside className={'team-panel' + (open ? ' is-open' : '') + (team ? '' : ' is-empty')} aria-label="Agent Team 任务板">
       <button type="button" className="team-panel-rail" onClick={onToggle} title={open ? '收起任务板' : '展开任务板'}>
         <span className="team-rail-mark" />
         <span className="team-rail-label">Team</span>
-        <span className="team-rail-count">{counts.in_progress + counts.pending}</span>
+        {team && <span className="team-rail-count">{counts.in_progress + counts.pending}</span>}
         <span className="team-rail-caret">{open ? '›' : '‹'}</span>
       </button>
       {open && (
         <div className="team-panel-body">
           <header className="team-head">
-            <div>
+            <div className="team-heading">
               <div className="team-kicker">Agent Team</div>
-              <h2>{team.name || 'Agent Team'}</h2>
+              <div className="team-title-row">
+                <h2>{team?.name || 'Agent Team'}</h2>
+                {starting && (
+                  <span className="team-starting-tail" aria-live="polite">[正在启动...]</span>
+                )}
+              </div>
             </div>
-            <span className={'team-status ' + status}>
-              <span className={'status-dot ' + (active ? 'running' : status === 'failed' ? 'failed' : 'done')} />
-              {active ? '运行中' : status === 'completed' ? '已完成' : status === 'stopped' ? '已停止' : status === 'stale' ? '已过期' : '失败'}
-            </span>
+            {streaming && onStop && (
+              <button type="button" className="team-stop-btn" onClick={onStop} title="停止本轮生成">
+                停止
+              </button>
+            )}
+            {!starting && (
+              <span className={'team-status ' + status}>
+                <span className={'status-dot ' + (active ? 'running' : status === 'failed' ? 'failed' : status === 'idle' ? '' : 'done')} />
+                {!team ? '未启动' : active ? '运行中' : status === 'completed' ? '已完成' : status === 'stopped' ? '已停止' : status === 'stale' ? '已过期' : '失败'}
+              </span>
+            )}
           </header>
 
+          {!team ? (
+            !starting && (
+              <div className="team-content team-content-idle">
+                <p className="team-idle-hint">发送消息后，Lead 会自动建立本轮 Agent Team。</p>
+              </div>
+            )
+          ) : (
+            <>
           <div className="team-stats">
             <span><b>{tasks.length}</b> 任务</span>
             <span><b>{counts.in_progress}</b> 进行中</span>
@@ -185,6 +214,8 @@ export default function TeamPanel({ snapshot, open, onToggle }: Props) {
               )
             )}
           </div>
+            </>
+          )}
         </div>
       )}
     </aside>

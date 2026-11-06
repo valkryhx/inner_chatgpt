@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import type { MouseEvent as ReactMouseEvent } from 'react'
 import { api } from '../api'
 import type { LLMConfig, MCPServer, Skill } from '../types'
 
@@ -6,6 +7,21 @@ interface Props {
   onClose: () => void
   onLlmChanged?: () => void
 }
+
+const MODEL_PRESETS = [
+  { value: 'deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash' },
+  { value: 'deepseek-flash', label: 'DeepSeek Flash' },
+  { value: 'deepseek-chat', label: 'DeepSeek Chat' },
+  { value: 'deepseek-reasoner', label: 'DeepSeek Reasoner' },
+  { value: 'glm-5.3-flash', label: 'GLM 5.3 Flash' },
+  { value: 'glm-4.7', label: 'GLM 4.7' },
+  { value: 'qwen3-max', label: 'Qwen3 Max' },
+  { value: 'kimi-k2.5', label: 'Kimi K2.5' },
+  { value: 'gpt-5.2', label: 'GPT-5.2' },
+  { value: 'gpt-5-mini', label: 'GPT-5 Mini' },
+] as const
+
+const MODEL_CUSTOM = '__custom__'
 
 const emptyLlm = {
   label: '',
@@ -24,10 +40,31 @@ const emptyLlm = {
 
 export default function SettingsModal({ onClose, onLlmChanged }: Props) {
   const [tab, setTab] = useState<'llm' | 'mcp' | 'skills'>('llm')
+  // 只在“按下与松开都发生在遮罩本身”时关闭。
+  // 仅监听 click 会出现：在 textarea 内拖选文本/拖动滚动条，按下在弹窗内，
+  // 松开落到遮罩上，浏览器把 click 派发给共同祖先 modal-mask，导致输入中途弹窗被关闭。
+  const maskPressedRef = useRef(false)
+
+  const onMaskMouseDown = (e: ReactMouseEvent<HTMLDivElement>) => {
+    maskPressedRef.current = e.target === e.currentTarget
+  }
+
+  const onMaskClick = (e: ReactMouseEvent<HTMLDivElement>) => {
+    if (maskPressedRef.current && e.target === e.currentTarget) onClose()
+    maskPressedRef.current = false
+  }
+
+  useEffect(() => {
+    // 拖选文本时切窗/松手到窗口外，浏览器可能把后续 click 合成为遮罩点击。
+    // 失焦即取消本次资格，恢复焦点后仍必须重新从遮罩按下。
+    const resetMaskPress = () => { maskPressedRef.current = false }
+    window.addEventListener('blur', resetMaskPress)
+    return () => window.removeEventListener('blur', resetMaskPress)
+  }, [])
 
   return (
-    <div className="modal-mask" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-mask" onMouseDown={onMaskMouseDown} onClick={onMaskClick}>
+      <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <h2>我的设置</h2>
           <button className="ghost-btn" onClick={onClose}>
@@ -64,6 +101,7 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
   const [form, setForm] = useState<{ [k: string]: any }>({ ...emptyLlm })
   const [error, setError] = useState<string | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [customModel, setCustomModel] = useState(false)
 
   const load = () => api.listLlmConfigs().then(setList).catch((e) => setError(String(e)))
   useEffect(() => {
@@ -73,6 +111,7 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
   const reset = () => {
     setForm({ ...emptyLlm })
     setEditingId(null)
+    setCustomModel(false)
   }
 
   const save = async () => {
@@ -92,6 +131,7 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
 
   const edit = (c: LLMConfig) => {
     setEditingId(c.id)
+    setCustomModel(false)
     setForm({
       label: c.label,
       wire_api: c.wire_api,
@@ -115,6 +155,29 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
   }
 
   const setF = (k: string, v: any) => setForm((f) => ({ ...f, [k]: v }))
+
+  // 既有配置里可能包含任意网关模型 ID；它们也必须出现在下拉中，
+  // 否则编辑配置时会被误判成“自定义”而丢失当前值。
+  const modelOptions = (() => {
+    const byValue = new Map<string, string>()
+    for (const p of MODEL_PRESETS) byValue.set(p.value, p.label)
+    for (const c of list) {
+      if (c.model && !byValue.has(c.model)) byValue.set(c.model, c.model)
+    }
+    if (form.model && !byValue.has(form.model)) byValue.set(form.model, form.model)
+    return Array.from(byValue, ([value, label]) => ({ value, label }))
+  })()
+  const knownModel = modelOptions.some((m) => m.value === form.model)
+  const modelSelectValue = customModel || !knownModel ? MODEL_CUSTOM : form.model
+  const selectModel = (value: string) => {
+    if (value === MODEL_CUSTOM) {
+      setCustomModel(true)
+      if (knownModel) setF('model', '')
+      return
+    }
+    setCustomModel(false)
+    setF('model', value)
+  }
 
   return (
     <div className="settings-section">
@@ -167,7 +230,24 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
         </label>
         <label>
           <span>模型名</span>
-          <input value={form.model} onChange={(e) => setF('model', e.target.value)} />
+          <select value={modelSelectValue} onChange={(e) => selectModel(e.target.value)}>
+            {modelOptions.map((m) => (
+              <option key={m.value} value={m.value}>{m.label}（{m.value}）</option>
+            ))}
+            <option value={MODEL_CUSTOM}>自定义模型 ID…</option>
+          </select>
+          {modelSelectValue === MODEL_CUSTOM && (
+            <input
+              value={form.model}
+              onChange={(e) => {
+                setCustomModel(true)
+                setF('model', e.target.value)
+              }}
+              placeholder="输入模型 ID，如 my-gateway-model"
+              autoFocus
+            />
+          )}
+          <span className="field-help">可从常见模型中选择，也可选“自定义模型 ID”填写任意网关模型名。</span>
         </label>
         <label>
           <span>上下文窗口</span>

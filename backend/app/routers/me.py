@@ -201,6 +201,7 @@ async def llm_models(user: dict = Depends(get_current_user)):
             "label": r.get("label") or r.get("model"),
             "model": r.get("model", ""),
             "wire_api": r.get("wire_api", ""),
+            "reasoning_effort": r.get("reasoning_effort", "") or "",
             "is_default": bool(r.get("is_default")),
             "source": "user",
         })

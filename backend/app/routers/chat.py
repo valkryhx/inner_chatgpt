@@ -9,7 +9,11 @@ from fastapi.responses import StreamingResponse
 
 from .. import db
 from ..auth import get_current_user
-from ..runtime import get_hub, register_generation, request_stop, unregister_generation
+from ..runtime import (
+    get_hub, register_generation, request_stop, unregister_generation,
+    reserve_generation, release_generation_reservation, cancel_generation,
+    is_generation_live,
+)
 from ..process_registry import stop_generation as stop_code_runs
 from .. import team_store
 from ..schemas import CompactResult, MessageOut, SendMessageIn, StopIn, StopResult
@@ -81,7 +85,43 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 
 async def _event_stream(user_id: str, session_id: str, text: str, generation_id: str, message_id: str,
-                        model_id: str = "") -> AsyncIterator[str]:
+                        model_id: str = "", stop_event: asyncio.Event | None = None) -> AsyncIterator[str]:
+    # Register/capture the current streaming task at the very top.  The
+    # prelude below can await runtime construction and compaction; registering
+    # only after it would leave stop unable to cancel a request that is stuck
+    # before the first model call.
+    if stop_event is None:
+        stop_event = register_generation(user_id, session_id, generation_id)
+
+    # Stop arrived during the pre-stream hand-off.  Still persist both visible
+    # rows so history is consistent, but do not build a runtime or call an LLM.
+    if stop_event.is_set():
+        try:
+            await db.add_message(session_id, "user", content=text)
+            await db.add_message(session_id, "assistant", content="", status="stopped",
+                                 message_id=message_id)
+        except Exception:
+            pass
+        event_id = 1
+        yield sse_frame("message_start", {"message_id": message_id}, event_id)
+        yield sse_frame("done", {"message_id": message_id, "status": "stopped", "model": ""}, event_id + 1)
+        unregister_generation(user_id, session_id, generation_id)
+        try:
+            await team_store.release_generation(user_id, session_id, generation_id)
+        except Exception:
+            pass
+        return
+
+    # Persist the visible turn before the prelude (runtime build / compaction /
+    # sanitize).  Those awaits can take seconds; if the user stops during them,
+    # the stop endpoint must at least find the user row and assistant
+    # placeholder to converge, instead of erasing what they just typed.
+    try:
+        await db.add_message(session_id, "user", content=text)
+        await db.add_message(session_id, "assistant", content="", status="streaming", message_id=message_id)
+    except Exception:
+        pass
+
     hub = get_hub()
     if hub is None:
         await team_store.release_generation(user_id, session_id, generation_id)
@@ -127,10 +167,6 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     except Exception:
         pass
 
-    await db.add_message(session_id, "user", content=text)
-    await db.add_message(session_id, "assistant", content="", status="streaming", message_id=message_id)
-
-    stop_event = register_generation(user_id, session_id, generation_id)
     buffer: list[str] = []
     reasoning_buf: list[str] = []
     tool_steps: list[dict[str, Any]] = []
@@ -364,17 +400,48 @@ async def send_message(session_id: str, body: SendMessageIn, user: dict = Depend
     acquired = await team_store.acquire_generation(user["id"], session_id, generation_id)
     if not acquired:
         active = await team_store.get_active_generation(user["id"], session_id)
-        raise HTTPException(status_code=409, detail={
-            "error": "generation_active",
-            "active_generation_id": active,
-            "hint": "请先停止当前生成，或刷新页面等待其结束。",
-        })
+        # A DB lease is not proof that work is still running: the SSE task can
+        # disappear after a client disconnect, proxy timeout or cancelled task.
+        # Only the in-process task/reservation registry is authoritative.
+        if active and not is_generation_live(user["id"], session_id, active):
+            await team_store.converge_generation_facts(
+                user["id"], session_id, active, status="stale"
+            )
+            await db.mark_stale_streaming_stopped(session_id)
+            acquired = await team_store.acquire_generation(user["id"], session_id, generation_id)
+            if not acquired:
+                active = await team_store.get_active_generation(user["id"], session_id)
+        if not acquired:
+            raise HTTPException(status_code=409, detail={
+                "error": "generation_active",
+                "active_generation_id": active,
+                "hint": "当前仍在生成。请先点击「停止」；若界面已失去连接，可刷新页面后重试。",
+            })
+    # Bridge the hand-off window before StreamingResponse starts iterating.
+    reserve_generation(user["id"], session_id, generation_id)
     message_id = db.new_id("msg")
     count = await db.count_messages(session_id)
     if count == 0 and sess["title"] in ("新会话", "", None):
         await db.update_session(session_id, user["id"], title=body.text.strip().replace("\n", " ")[:24])
+    async def guarded_stream():
+        # Capture the task here, before the first await in _event_stream's
+        # prelude, so the stop endpoint can cancel even a long compaction/build.
+        stop_event = register_generation(user["id"], session_id, generation_id)
+        try:
+            async for chunk in _event_stream(
+                user["id"], session_id, body.text, generation_id, message_id,
+                sess.get("model_id", "") or "", stop_event=stop_event,
+            ):
+                yield chunk
+        finally:
+            # _event_stream normally unregisters in its own finally; this is an
+            # idempotent safety net for early returns (runtime unavailable,
+            # model init failure, or a client disconnect before first yield).
+            unregister_generation(user["id"], session_id, generation_id)
+            release_generation_reservation(user["id"], session_id, generation_id)
+
     return StreamingResponse(
-        _event_stream(user["id"], session_id, body.text, generation_id, message_id, sess.get("model_id", "") or ""),
+        guarded_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
@@ -385,37 +452,109 @@ async def stop_generation(session_id: str, body: StopIn, user: dict = Depends(ge
     sess = await db.get_session(session_id, user["id"])
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
-    try:
-        n = request_stop(user["id"], session_id, body.generation_id)
-    except TypeError:
-        n = request_stop(session_id, body.generation_id)
-    # 级联停止子代理：否则主代理停了、子代理还在后台继续烧钱（设计文档 §9.1）
-    subs = 0
-    try:
-        hub = get_hub()
-        if hub is not None and body.generation_id:
-            try:
-                subs = await hub.stop_subagent_generation(user["id"], session_id, body.generation_id)
-            except TypeError:
-                subs = await hub.stop_subagent_generation(session_id, body.generation_id)
-            await stop_code_runs(user["id"], session_id, body.generation_id)
-    except Exception:
-        pass
 
-    # 停止是异步信号：SSE 生成器可能还没写 `done`。等待一个短窗口，让生成器
-    # finally 落库后直接把快照返回给前端，避免 abort 后立刻 GET 历史拿到空占位。
+    # After a reconnect/refresh the client may not know generation_id. Resolve
+    # the DB lease so stop still targets the actual running generation.
+    generation_id = body.generation_id or await team_store.get_active_generation(user["id"], session_id)
+
+    # Cooperative flag first (graceful path), then cancel the actual asyncio
+    # task. Cancellation is what unblocks an LLM socket read or a tool await.
+    n = 0
+    try:
+        n = request_stop(user["id"], session_id, generation_id)
+    except TypeError:
+        n = request_stop(session_id, generation_id)
+    if generation_id:
+        try:
+            cancel_generation(user["id"], session_id, generation_id)
+        except Exception:
+            pass
+
+    # Cascade to subagents and OS processes regardless of hub availability.
+    # Never tuck code_run cleanup behind generation_id/hub guards.
+    subs = 0
+    hub = get_hub()
+    if hub is not None and generation_id:
+        try:
+            subs = await hub.stop_subagent_generation(user["id"], session_id, generation_id)
+        except TypeError:
+            try:
+                subs = await hub.stop_subagent_generation(session_id, generation_id)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    if generation_id:
+        try:
+            await stop_code_runs(user["id"], session_id, generation_id)
+        except Exception:
+            pass
+
     stop_result = StopResult(ok=True, stopped=n, subagents_stopped=subs)
-    if body.message_id:
-        for _ in range(12):  # up to ~1.2s
+    target_message_id = body.message_id
+    if not target_message_id:
+        try:
+            msgs = await db.list_messages(session_id)
+            target_message_id = next(
+                (m["id"] for m in reversed(msgs)
+                 if m.get("role") == "assistant" and m.get("status") == "streaming"),
+                None,
+            )
+        except Exception:
+            target_message_id = None
+
+    # Wait at most ~1s for the cancelled generator to persist its incremental
+    # snapshot. This keeps stop responsive while preserving already-seen output.
+    if target_message_id:
+        for _ in range(10):
             try:
                 msgs = await db.list_messages(session_id)
-                msg = next((m for m in msgs if m["id"] == body.message_id), None)
+                msg = next((m for m in msgs if m["id"] == target_message_id), None)
                 if msg and msg.get("status") in ("stopped", "complete", "error"):
                     stop_result.message = MessageOut(**msg)
                     break
             except Exception:
                 pass
             await asyncio.sleep(0.1)
+
+        # Hard fallback: a third-party await may ignore cancellation. The user
+        # explicitly stopped, so never leave the UI/bubble in `streaming`.
+        if stop_result.message is None:
+            try:
+                await db.update_message(target_message_id, status="stopped")
+                msgs = await db.list_messages(session_id)
+                msg = next((m for m in msgs if m["id"] == target_message_id), None)
+                if msg:
+                    stop_result.message = MessageOut(**msg)
+            except Exception:
+                pass
+
+    # Explicit termination releases the lease now, not whenever a wedged
+    # generator eventually unwinds. Otherwise the next send gets 409 forever.
+    if generation_id:
+        try:
+            await team_store.converge_generation_facts(
+                user["id"], session_id, generation_id, status="stopped"
+            )
+        except Exception:
+            pass
+        # Always call release as a final, idempotent safety net.  converge_*
+        # already moved an active row to stopped; this also satisfies callers
+        # that replaced release_generation in lightweight tests.
+        try:
+            await team_store.release_generation(user["id"], session_id, generation_id)
+        except Exception:
+            pass
+        try:
+            unregister_generation(user["id"], session_id, generation_id)
+        except Exception:
+            pass
+
+    try:
+        await db.mark_stale_streaming_stopped(session_id)
+    except Exception:
+        pass
+
     return stop_result
 
 

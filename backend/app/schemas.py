@@ -46,6 +46,17 @@ class SessionDetailOut(BaseModel):
     messages: list[MessageOut]
 
 
+class ContextUsageOut(BaseModel):
+    used_tokens: int = 0
+    context_window: int = 0
+    auto_compact_tokens: int = 0
+    hard_limit_tokens: int = 0
+    percent: float = 0.0
+    compact_percent: float = 0.0
+    remaining_to_compact: int = 0
+    compacted: bool = False
+
+
 class CreateSessionIn(BaseModel):
     title: Optional[str] = None
     model_id: Optional[str] = None

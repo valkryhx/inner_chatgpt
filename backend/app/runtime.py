@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Optional
 
 from .agent import UserRuntime
@@ -130,20 +131,114 @@ class RuntimeHub:
 # unique, but owner scoping is still enforced so a caller can never act on a
 # guessed foreign key.
 _stop_events: dict[tuple[str, str, str], asyncio.Event] = {}
+# The streaming response is an asyncio task.  A cooperative flag alone cannot
+# unblock a task that is awaiting an LLM read or a tool dispatch, so keep the
+# task reference too and cancel it explicitly from the stop endpoint.
+_generation_tasks: dict[tuple[str, str, str], asyncio.Task] = {}
+# A request that has acquired the DB lease but whose StreamingResponse has not
+# started iterating yet is still live.  Do not mistake that tiny window for a
+# stale lease when a second tab sends concurrently.
+_generation_reservations: dict[tuple[str, str, str], float] = {}
+# Stop can arrive during the pre-stream prelude (runtime build / compaction),
+# before register_generation has captured the actual asyncio task.  Remember
+# the explicit intent so register_generation returns an already-set event.
+_stop_requested: dict[tuple[str, str, str], float] = {}
+_STOP_INTENT_TTL_S = 300.0
+# A reservation only bridges the tiny gap between accepting an HTTP request
+# and the StreamingResponse task entering the generator.  If a client never
+# consumes the response body, the reservation must not block the session
+# forever.  Thirty seconds is far longer than that hand-off window.
+_RESERVATION_TTL_S = 30.0
 
 
-def has_active_generation(session_id: str) -> bool:
-    return any(sid == session_id for _, sid, _ in _stop_events)
+def _key(user_id: str, session_id: str, generation_id: str) -> tuple[str, str, str]:
+    return (user_id, session_id, generation_id)
+
+
+def _cleanup_expired_reservations() -> None:
+    cutoff = time.monotonic() - _RESERVATION_TTL_S
+    for key, created in list(_generation_reservations.items()):
+        if created < cutoff:
+            _generation_reservations.pop(key, None)
+    intent_cutoff = time.monotonic() - _STOP_INTENT_TTL_S
+    for key, created in list(_stop_requested.items()):
+        if created < intent_cutoff:
+            _stop_requested.pop(key, None)
+
+
+def _is_live_key(key: tuple[str, str, str]) -> bool:
+    """Return true only for a task that can still run, or a fresh hand-off."""
+    task = _generation_tasks.get(key)
+    if task is not None and not task.done():
+        return True
+    if key in _stop_events:
+        # The generator owns the event and removes it in its finally block.
+        # If it is gone while the task is already done, the lease is stale.
+        return False
+    created = _generation_reservations.get(key)
+    if created is None:
+        return False
+    if time.monotonic() - created >= _RESERVATION_TTL_S:
+        _generation_reservations.pop(key, None)
+        return False
+    return True
+
+
+def has_active_generation(session_id: str, user_id: str = "") -> bool:
+    _cleanup_expired_reservations()
+    for key in set(_stop_events) | set(_generation_tasks) | set(_generation_reservations):
+        owner, sid, _gid = key
+        if sid != session_id:
+            continue
+        if user_id and owner != user_id:
+            continue
+        if _is_live_key(key):
+            return True
+    return False
+
+
+def is_generation_live(user_id: str, session_id: str, generation_id: str) -> bool:
+    _cleanup_expired_reservations()
+    return _is_live_key(_key(user_id, session_id, generation_id))
+
+
+def reserve_generation(user_id: str, session_id: str, generation_id: str) -> None:
+    """Mark an accepted request live before its stream task starts iterating."""
+    _generation_reservations[_key(user_id, session_id, generation_id)] = time.monotonic()
+
+
+def release_generation_reservation(user_id: str, session_id: str, generation_id: str) -> None:
+    _generation_reservations.pop(_key(user_id, session_id, generation_id), None)
 
 
 def register_generation(user_id: str, session_id: str, generation_id: str) -> asyncio.Event:
+    key = _key(user_id, session_id, generation_id)
     ev = asyncio.Event()
-    _stop_events[(user_id, session_id, generation_id)] = ev
+    # Consume a tombstone only when the stream actually registers.  A stop can
+    # arrive and call unregister_generation() before this function runs (client
+    # aborts immediately after receiving headers); that must not erase intent.
+    if _stop_requested.pop(key, None) is not None:
+        ev.set()
+    _stop_events[key] = ev
+    _generation_reservations[key] = time.monotonic()
+    task = asyncio.current_task()
+    if task is not None:
+        _generation_tasks[key] = task
     return ev
 
 
 def unregister_generation(user_id: str, session_id: str, generation_id: str) -> None:
-    _stop_events.pop((user_id, session_id, generation_id), None)
+    key = _key(user_id, session_id, generation_id)
+    _stop_events.pop(key, None)
+    _generation_tasks.pop(key, None)
+    _generation_reservations.pop(key, None)
+    # Do not discard a *pending* tombstone here; the pre-stream stop path calls
+    # unregister_generation() before StreamingResponse first iterates, and the
+    # later register_generation() must still observe the stop intent.  However,
+    # once this generation actually registered (event exists / task captured),
+    # unregister marks normal completion and the tombstone must be cleared so a
+    # reused generation id in tests or a future retry does not inherit a stop.
+    _stop_requested.pop(key, None)
 
 
 def request_stop(user_id: str, session_id: str, generation_id: str | None = None) -> int:
@@ -156,4 +251,27 @@ def request_stop(user_id: str, session_id: str, generation_id: str | None = None
             continue
         ev.set()
         n += 1
+    if generation_id:
+        # Record intent even when the stream has not started registering yet.
+        _stop_requested[_key(user_id, session_id, generation_id)] = time.monotonic()
     return n
+
+
+def cancel_generation(user_id: str, session_id: str, generation_id: str) -> int:
+    """Cancel the actual streaming task in addition to setting the stop flag.
+
+    Cancellation is what makes stop reliable while the request is blocked in
+    an LLM socket or a tool wait.  The event flag stays for code paths that
+    still use cooperative checks.
+    """
+    key = _key(user_id, session_id, generation_id)
+    ev = _stop_events.get(key)
+    if ev is not None:
+        ev.set()
+    task = _generation_tasks.get(key)
+    if task is None or task.done():
+        # Pre-stream prelude: make sure register_generation sees the intent.
+        _stop_requested[key] = time.monotonic()
+        return 0
+    task.cancel()
+    return 1

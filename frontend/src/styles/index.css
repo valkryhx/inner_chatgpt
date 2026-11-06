@@ -312,7 +312,12 @@ textarea, input { caret-color: var(--clay); }
 .send-btn:active:not(:disabled) { transform: translateY(1px); }
 .send-btn:disabled { opacity: .45; cursor: default; box-shadow: none; }
 .send-btn.stop { background: var(--danger); box-shadow: 0 1px 2px rgba(191,77,67,0.25); }
-.composer-hint { max-width: calc(var(--measure) + 40px); margin: 8px auto 0; font-size: 11px; color: var(--muted); text-align: center; }
+.composer-hint {
+  max-width: calc(var(--measure) + 40px); margin: 8px auto 0;
+  font-size: 11px; color: var(--muted); text-align: center;
+  line-height: 1.6;
+}
+.composer-hint-sep { margin: 0 6px; color: var(--line-strong); }
 
 /* ===== 多用户：登录页 ===== */
 .booting { height: 100vh; display: flex; align-items: center; justify-content: center; color: var(--muted); }
@@ -457,6 +462,7 @@ textarea, input { caret-color: var(--clay); }
 .form-grid label.checkbox { flex-direction: row; align-items: center; gap: 8px; }
 .form-grid label.checkbox span { font-size: 13px; color: var(--ink); }
 .form-grid label > span { font-size: 12px; color: var(--muted); }
+.field-help { font-size: 11px; color: var(--muted); line-height: 1.5; }
 .form-grid input, .form-grid select {
   padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: var(--r-md);
   background: var(--canvas); color: var(--ink); font-size: 13px; outline: none;
@@ -768,9 +774,11 @@ textarea, input { caret-color: var(--clay); }
   background: var(--clay); box-shadow: 0 0 0 4px var(--clay-soft);
 }
 .team-rail-label {
-  writing-mode: vertical-rl; text-orientation: mixed;
-  font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
-  color: var(--ink-2);
+  writing-mode: horizontal-tb; text-orientation: mixed;
+  padding: 2px 4px; border-radius: 999px;
+  background: var(--canvas); border: 1px solid var(--line);
+  font-size: 9px; font-weight: 700; letter-spacing: .02em;
+  color: var(--ink-2); line-height: 1.35;
 }
 .team-rail-count {
   min-width: 20px; padding: 1px 4px; border-radius: 999px;
@@ -792,7 +800,22 @@ textarea, input { caret-color: var(--clay); }
   font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase;
   color: var(--muted); font-weight: 700;
 }
+.team-heading { min-width: 0; }
+.team-title-row { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
 .team-head h2 { margin: 3px 0 0; font-size: 16px; line-height: 1.3; font-weight: 650; }
+.team-starting-tail {
+  flex-shrink: 0; color: var(--muted); opacity: .78;
+  font-size: 9.5px; font-weight: 450; letter-spacing: .01em;
+  white-space: nowrap;
+}
+.team-stop-btn {
+  margin-left: auto; flex-shrink: 0;
+  border: 1px solid #e3b8b1; border-radius: 999px;
+  background: #fff7f5; color: var(--danger);
+  padding: 3px 8px; font-size: 10.5px; font-weight: 650;
+  transition: background 120ms var(--ease), border-color 120ms var(--ease);
+}
+.team-stop-btn:hover { background: #fde9e5; border-color: #d99a90; }
 .team-status {
   display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
   font-size: 10.5px; color: var(--muted); white-space: nowrap;
@@ -817,6 +840,11 @@ textarea, input { caret-color: var(--clay); }
 .team-tabs button:hover { color: var(--ink-2); background: var(--surface-2); }
 .team-tabs button.active { color: var(--btn); border-bottom-color: var(--btn); }
 .team-content { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px 20px; }
+.team-content-idle { padding-top: 14px; }
+.team-idle-hint {
+  margin: 0; color: var(--muted); font-size: 10.5px; line-height: 1.6;
+  opacity: .78;
+}
 .team-empty {
   padding: 26px 14px; text-align: center; color: var(--muted);
   font-size: 11.5px; line-height: 1.65; border: 1px dashed var(--line-strong);
@@ -882,7 +910,6 @@ textarea, input { caret-color: var(--clay); }
 .team-event-seq { color: var(--muted); font-variant-numeric: tabular-nums; }
 .team-event-name { font-weight: 600; }
 .team-event-detail { color: var(--muted); overflow-wrap: anywhere; }
-.team-toggle { white-space: nowrap; }
 
 @media (max-width: 1100px) {
   .team-panel.is-open { width: 300px; }
@@ -890,5 +917,4 @@ textarea, input { caret-color: var(--clay); }
 }
 @media (max-width: 720px) {
   .team-panel { display: none; }
-  .team-toggle { display: none; }
 }

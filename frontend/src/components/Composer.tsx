@@ -1,13 +1,21 @@
 import { useRef, useState } from 'react'
+import type { ContextUsage } from '../types'
 
 interface Props {
   streaming: boolean
   onSend: (text: string) => void
   onStop: () => void
   onCompact?: (instructions: string) => void
+  contextUsage?: ContextUsage | null
+  modelName?: string
+  reasoningEffort?: string
 }
 
-export default function Composer({ streaming, onSend, onStop, onCompact }: Props) {
+function fmtK(n: number): string {
+  return `${(Math.max(0, n) / 1000).toFixed(1)}k`
+}
+
+export default function Composer({ streaming, onSend, onStop, onCompact, contextUsage, modelName, reasoningEffort }: Props) {
   const [text, setText] = useState('')
   const taRef = useRef<HTMLTextAreaElement>(null)
 
@@ -66,8 +74,23 @@ export default function Composer({ streaming, onSend, onStop, onCompact }: Props
           </button>
         )}
       </div>
-      <div className="composer-hint">
-        自研 Agent 内核 · 工具由 FastMCP 提供 · 会话持久化于 SQLite
+      <div
+        className="composer-hint"
+        title={contextUsage
+          ? `自动压缩阈值 ${fmtK(contextUsage.auto_compact_tokens)} · 上下文窗口 ${fmtK(contextUsage.context_window)}`
+          : undefined}
+      >
+        <span title="当前会话使用的模型">{modelName || '未配置模型'}</span>{' '}
+        <span className="composer-hint-sep">·</span>{' '}
+        <span title={`模型配置中的 reasoning_effort：${(reasoningEffort || 'default').trim() || 'default'}`}>
+          {(reasoningEffort || 'default').trim() || 'default'}
+        </span>{' '}
+        <span className="composer-hint-sep">·</span>{' '}
+        {contextUsage ? (
+          contextUsage.remaining_to_compact <= 0
+            ? <>{fmtK(contextUsage.used_tokens)} / {fmtK(contextUsage.context_window)} · {contextUsage.percent.toFixed(1)}% · 即将自动压缩</>
+            : <>{fmtK(contextUsage.used_tokens)} / {fmtK(contextUsage.context_window)} · {contextUsage.percent.toFixed(1)}% · 距压缩 {fmtK(contextUsage.remaining_to_compact)}</>
+        ) : '上下文统计加载中…'}
       </div>
     </div>
   )
