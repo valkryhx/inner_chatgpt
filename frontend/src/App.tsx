@@ -44,6 +44,7 @@ export default function App() {
   const [activeId, setActiveId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [streaming, setStreaming] = useState(false)
+  const [sendPulse, setSendPulse] = useState(0)
   const [activeStreamMsgId, setActiveStreamMsgId] = useState<string | null>(null)
   const [autoCompacted, setAutoCompacted] = useState<number>(0)
   const [health, setHealth] = useState<{ model: string; mcp_tools: number } | null>(null)
@@ -54,6 +55,9 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const genIdRef = useRef<string>('')
+  // 服务端消息快照不含前端计时字段；按 message id 保存本轮起止时间，
+  // 让其跨 message_start 改 ID、历史刷新、停止快照替换后仍能显示。
+  const runTimesRef = useRef<Map<string, { started: number; finished?: number }>>(new Map())
   // 正在本端流式生成的会话 id；用于阻止历史加载覆盖乐观渲染的消息
   const streamSidRef = useRef<string | null>(null)
 
@@ -122,7 +126,24 @@ export default function App() {
             !!serverMsg.content || !!serverMsg.reasoning || (serverMsg.blocks || []).length > 0
           const localHasVisible =
             !!localMsg.content || !!localMsg.reasoning || (localMsg.blocks || []).length > 0
-          return !serverHasVisible && localHasVisible ? localMsg : serverMsg
+          const merged = !serverHasVisible && localHasVisible ? localMsg : serverMsg
+          const timing = runTimesRef.current.get(merged.id)
+          // 本地已结束而服务端快照仍是 streaming：保留结束态，避免尾部卡在 Working。
+          const keepLocalEnd =
+            localMsg.status !== 'streaming' &&
+            merged.status === 'streaming' &&
+            !!localMsg.run_finished_at
+          return timing || keepLocalEnd
+            ? {
+                ...merged,
+                run_started_at: timing?.started ?? localMsg.run_started_at ?? merged.run_started_at,
+                run_finished_at:
+                  timing?.finished ??
+                  localMsg.run_finished_at ??
+                  merged.run_finished_at,
+                status: keepLocalEnd ? localMsg.status : merged.status,
+              }
+            : merged
         })
       })
     } catch (e) {
@@ -269,19 +290,25 @@ export default function App() {
       status: 'complete',
       created_at: Date.now(),
     }
+    const runStartedAt = Date.now()
+    const localAssistantId = 'local_assistant_' + Date.now()
+    runTimesRef.current.set(localAssistantId, { started: runStartedAt })
     let assistantMsg: Message = {
-      id: 'local_assistant_' + Date.now(),
+      id: localAssistantId,
       session_id: tempSid,
       role: 'assistant',
       content: '',
       reasoning: '',
       blocks: [],
       status: 'streaming',
-      created_at: Date.now(),
+      created_at: runStartedAt,
+      run_started_at: runStartedAt,
     }
-    const localAssistantId = assistantMsg.id
 
-    // 乐观更新：立即渲染用户消息与占位回复，避免等待网络时出现空白
+    // 乐观更新：立即渲染用户消息与占位回复，避免等待网络时出现空白。
+    // sendPulse 让 MessageList 把这次提交识别为“看最新消息”的意图，
+    // 即使提交前用户正在上翻历史，也会立即滚到新消息。
+    setSendPulse((n) => n + 1)
     setStreaming(true)
     setActiveStreamMsgId(localAssistantId)
     setMessages((prev) => [...prev, userMsg, assistantMsg])
@@ -325,7 +352,12 @@ export default function App() {
     let blocks: any[] = []
     const onEvent = (ev: StreamEvent) => {
       if (ev.type === 'message_start') {
-        const updated = { ...assistantMsg, id: ev.message_id }
+        const timing = runTimesRef.current.get(assistantMsg.id)
+        if (timing) {
+          runTimesRef.current.delete(assistantMsg.id)
+          runTimesRef.current.set(ev.message_id, timing)
+        }
+        const updated = { ...assistantMsg, id: ev.message_id, run_started_at: runStartedAt }
         setActiveStreamMsgId(ev.message_id)
         setMessages((prev) =>
           prev.map((x) => (x.id === localAssistantId || x.id === assistantMsg.id ? updated : x)),
@@ -379,10 +411,14 @@ export default function App() {
         setAutoCompacted((n) => n + 1)
       } else if (ev.type === 'done') {
         const status = ev.status === 'stopped' ? 'stopped' : ev.status === 'error' ? 'error' : 'complete'
-        patch(withSummaries({ ...assistantMsg, status }))
+        const finishedAt = Date.now()
+        runTimesRef.current.set(assistantMsg.id, { started: runStartedAt, finished: finishedAt })
+        patch(withSummaries({ ...assistantMsg, status, run_finished_at: finishedAt }))
       } else if (ev.type === 'error') {
+        const finishedAt = Date.now()
+        runTimesRef.current.set(assistantMsg.id, { started: runStartedAt, finished: finishedAt })
         setError(ev.error)
-        patch({ ...assistantMsg, status: 'error' })
+        patch({ ...assistantMsg, status: 'error', run_finished_at: finishedAt })
       }
     }
 
@@ -391,6 +427,18 @@ export default function App() {
     } catch (e) {
       if (!ctrl.signal.aborted) setError(String(e))
     } finally {
+      // 停止/网络中断时服务端不一定来得及发 done；给本地气泡补上结束时间，
+      // 让尾部状态从“执行中”可靠切换为“已停止/可继续输入”。
+      if (assistantMsg.status === 'streaming') {
+        const finishedAt = Date.now()
+        runTimesRef.current.set(assistantMsg.id, { started: runStartedAt, finished: finishedAt })
+        assistantMsg = {
+          ...assistantMsg,
+          status: ctrl.signal.aborted ? 'stopped' : 'error',
+          run_finished_at: finishedAt,
+        }
+        setMessages((prev) => prev.map((m) => (m.id === assistantMsg.id ? assistantMsg : m)))
+      }
       setStreaming(false)
       setActiveStreamMsgId(null)
       streamSidRef.current = null
@@ -532,6 +580,7 @@ export default function App() {
           autoCompacted={autoCompacted}
           activeStreamMsgId={activeStreamMsgId}
           sessionKey={activeId}
+          sendPulse={sendPulse}
         />
         <Composer streaming={streaming} onSend={send} onStop={stop} onCompact={doCompact} />
       </div>

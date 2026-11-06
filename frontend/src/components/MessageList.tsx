@@ -12,6 +12,8 @@ interface Props {
   activeStreamMsgId?: string | null
   /** 会话切换时重置滚动跟随状态。 */
   sessionKey?: string | null
+  /** 每次用户提交时自增；发送是明确的“看最新消息”意图。 */
+  sendPulse?: number
 }
 
 /* ---------- 工具步骤行（L2 过程层）：单行 + 状态点 + 点击展开 ---------- */
@@ -218,6 +220,52 @@ function renderBlocks(
   return out
 }
 
+function formatRunDuration(ms: number): string {
+  const seconds = Math.max(0, ms) / 1000
+  if (seconds < 10) return seconds.toFixed(1) + 's'
+  return Math.round(seconds) + 's'
+}
+
+function RunFooter({ msg, live }: { msg: Message; live: boolean }) {
+  const started = msg.run_started_at || msg.created_at
+  const [now, setNow] = useState(Date.now())
+
+  useEffect(() => {
+    if (!live) return
+    setNow(Date.now())
+    const timer = window.setInterval(() => setNow(Date.now()), 100)
+    return () => window.clearInterval(timer)
+  }, [live, started])
+
+  const finished = msg.run_finished_at
+  if (live) {
+    return (
+      <div className="run-footer is-live" aria-live="polite">
+        <span className="run-footer-mark" />
+        <span>Working</span>
+        <span className="run-footer-dot">·</span>
+        <span className="run-footer-time">{formatRunDuration(now - started)}</span>
+      </div>
+    )
+  }
+  if (!finished) return null
+
+  const label = msg.status === 'stopped' ? 'Stopped' : msg.status === 'error' ? 'Failed' : 'Worked'
+  return (
+    <div className={'run-footer ' + (msg.status === 'error' ? 'is-error' : msg.status === 'stopped' ? 'is-stopped' : 'is-done')}>
+      <span>{label}</span>
+      <span className="run-footer-dot">·</span>
+      <span className="run-footer-time">{formatRunDuration(finished - started)}</span>
+      {msg.status === 'complete' && (
+        <>
+          <span className="run-footer-dot">·</span>
+          <span className="run-footer-hint">可以继续输入</span>
+        </>
+      )}
+    </div>
+  )
+}
+
 function MessageRow({ msg, onImageSettled }: { msg: Message; onImageSettled: () => void }) {
   const isUser = msg.role === 'user'
   const blocks = msg.blocks || []
@@ -273,10 +321,7 @@ function MessageRow({ msg, onImageSettled }: { msg: Message; onImageSettled: () 
             {msg.status === 'error' ? '（生成失败）' : '（未生成回复，可能已中断）'}
           </div>
         )}
-        {msg.status === 'stopped' && hasVisibleContent && <div className="session-meta">（已停止）</div>}
-        {msg.status === 'stopped' && !hasVisibleContent && (
-          <div className="session-meta">（已停止，未生成内容）</div>
-        )}
+        {!isUser && <RunFooter msg={msg} live={isActiveStream} />}
       </div>
     </div>
   )
@@ -285,7 +330,7 @@ function MessageRow({ msg, onImageSettled }: { msg: Message; onImageSettled: () 
 /** 距离底部多少像素以内，仍视为“用户想跟随新内容”。 */
 const FOLLOW_THRESHOLD_PX = 96
 
-export default function MessageList({ messages, streaming, autoCompacted, sessionKey }: Props) {
+export default function MessageList({ messages, streaming, autoCompacted, sessionKey, sendPulse }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const innerRef = useRef<HTMLDivElement>(null)
   const followRef = useRef(true)
@@ -351,6 +396,14 @@ export default function MessageList({ messages, streaming, autoCompacted, sessio
     lastScrollTopRef.current = 0
     schedulePinToBottom('auto')
   }, [sessionKey, schedulePinToBottom])
+
+  // 用户按发送是比“正在浏览历史”更高优先级的意图：立即恢复跟随并贴底，
+  // 保证乐观插入的用户消息第一眼就能看到，而不是停留在旧的历史位置。
+  useLayoutEffect(() => {
+    if (!sendPulse) return
+    followRef.current = true
+    schedulePinToBottom('auto')
+  }, [sendPulse, schedulePinToBottom])
 
   // 每次 DOM 提交后、绘制前贴底。流式阶段每个 delta 都执行，
   // 图片/长文本撑开高度也发生在同一轮布局中，避免下一 tick 才补滚。

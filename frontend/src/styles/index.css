@@ -269,6 +269,25 @@ textarea, input { caret-color: var(--clay); }
   padding: 5px 12px; border-radius: 999px; font-variant-numeric: tabular-nums;
 }
 
+/* 每轮执行的轻量尾注：不抢正文，只回答“还在跑吗 / 现在能继续输入吗”。 */
+.run-footer {
+  display: inline-flex; align-items: center; gap: 6px;
+  align-self: flex-start; margin-top: 1px;
+  color: var(--muted); font-size: 11px; line-height: 1.4;
+  font-variant-numeric: tabular-nums; letter-spacing: .01em;
+  user-select: none;
+}
+.run-footer.is-live { color: var(--ink-2); }
+.run-footer-mark {
+  width: 5px; height: 5px; border-radius: 50%; background: var(--clay);
+  animation: breathe 1.6s ease-in-out infinite;
+}
+.run-footer-dot { color: var(--line-strong); }
+.run-footer-time { color: var(--muted); }
+.run-footer-hint { opacity: .72; }
+.run-footer.is-error { color: var(--danger); }
+.run-footer.is-error .run-footer-time { color: var(--danger); opacity: .7; }
+
 .typing { color: var(--muted); font-size: 13px; padding: 4px 2px; }
 .typing::after { content: '▊'; color: var(--clay); animation: caret 1.1s ease-in-out infinite; margin-left: 2px; }
 @keyframes caret { 0%,100% { opacity: 1; } 50% { opacity: .15; } }

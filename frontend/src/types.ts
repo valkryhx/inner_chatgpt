@@ -107,6 +107,10 @@ export interface Message {
   blocks: MessageBlock[]
   status: 'streaming' | 'complete' | 'error' | 'stopped'
   created_at: number
+  /** 本轮开始时间（前端本地计时，仅当前页面生命周期有效）。 */
+  run_started_at?: number
+  /** 本轮结束时间（前端本地计时，仅当前页面生命周期有效）。 */
+  run_finished_at?: number
 }
 
 export interface SessionDetail {
