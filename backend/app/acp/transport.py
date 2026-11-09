@@ -16,11 +16,18 @@ import json
 import os
 import subprocess
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-__all__ = ["AcpTransportClosed", "AsyncProcHandle", "AcpProcess", "decode_line"]
+__all__ = [
+    "AcpTransportClosed",
+    "AsyncProcHandle",
+    "AcpProcess",
+    "decode_line",
+    "kill_tree_now",
+]
 
 # Windows 上不要给子进程弹控制台窗口。
 _CREATE_NO_WINDOW = 0x08000000
@@ -30,6 +37,12 @@ _READ_BUFFER = 65536
 
 # kill 之后再等这么久收尸。
 _KILL_WAIT_S = 2.0
+
+# 同步杀树后最多等这么久让 ``Popen`` 真的回收（同步路径不能 await）。
+_SYNC_KILL_REAP_S = 2.0
+
+# 同步杀树的回收轮询间隔。
+_SYNC_KILL_POLL_S = 0.02
 
 
 class AcpTransportClosed(RuntimeError):
@@ -86,6 +99,38 @@ class AsyncProcHandle:
     async def wait(self) -> int:
         """等待子进程退出并返回退出码（在后台线程里阻塞）。"""
         return await asyncio.to_thread(self._proc.wait)
+
+
+def kill_tree_now(handle: AsyncProcHandle | None) -> None:
+    """Synchronous best-effort kill used from cancel-safe cleanup paths.
+
+    用户点停止 / 本轮结束这类路径不允许 ``await``，只能在这里同步杀：
+
+    - Windows 用 ``taskkill /T /F`` 杀整棵树（GA 会再拉起子进程）；
+    - POSIX 用 ``killpg``，拿不到进程组时退回 ``kill()``。
+
+    杀完必须轮询到 ``Popen`` 真正回收：``subprocess`` 不会自己更新
+    ``returncode``，只有 ``poll()`` / ``wait()`` 会。不轮询的话调用方看到的
+    ``returncode`` 永远是 ``None``，既判断不了“停掉了”，也留着僵尸进程。
+    等待上限 ``_SYNC_KILL_REAP_S``，正常情况下 taskkill 返回时进程已被回收。
+    """
+    if handle is None or handle.returncode is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(handle.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        try:
+            os.killpg(os.getpgid(handle.pid), 9)
+        except OSError:
+            handle.kill()
+    deadline = time.monotonic() + _SYNC_KILL_REAP_S
+    while handle.poll() is None and time.monotonic() < deadline:
+        time.sleep(_SYNC_KILL_POLL_S)
 
 
 class AcpProcess:
