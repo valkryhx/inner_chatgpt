@@ -100,6 +100,24 @@ def test_second_prompt_is_rejected_locally():
     assert run(scenario())["stopReason"] == "cancelled"
 
 
+def test_prompt_timeout_clears_busy_and_pending():
+    async def scenario():
+        p, c, _ = await make("hang")
+        try:
+            s = await c.new_session(str(Path.cwd()))
+            with pytest.raises(asyncio.TimeoutError):
+                await c.prompt(s["sessionId"], "slow", timeout_s=0.3)
+            cleared = (c._active_prompt is None, c._pending == {})
+            # 第二次必须再次超时而不是 AcpBusyError：只有 finally 真的清了标记才会这样。
+            with pytest.raises(asyncio.TimeoutError):
+                await c.prompt(s["sessionId"], "slow again", timeout_s=0.3)
+            return cleared
+        finally:
+            await c.close()
+
+    assert run(scenario()) == (True, True)
+
+
 def test_prompt_fails_when_process_dies():
     async def scenario():
         p, c, _ = await make("crash")
@@ -125,3 +143,24 @@ def test_jsonrpc_error_is_raised():
             await c.close()
 
     assert run(scenario()) == -32603
+
+
+def test_unknown_request_method_gets_method_not_found():
+    async def scenario():
+        p, c, _ = await make()
+        sent = []
+
+        async def fake_send(msg):
+            sent.append(msg)
+
+        c._process.send = fake_send
+        try:
+            c._dispatch({"jsonrpc": "2.0", "id": "u1", "method": "no/such", "params": {}})
+            await asyncio.sleep(0.05)
+            return sent[-1]
+        finally:
+            await c.close()
+
+    reply = run(scenario())
+    assert reply["id"] == "u1"
+    assert reply["error"]["code"] == -32601
