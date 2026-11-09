@@ -1,8 +1,10 @@
 import asyncio
+import io
 import os
 import sys
 from pathlib import Path
 
+from app.acp import transport as transport_mod
 from app.acp.transport import AcpProcess, AsyncProcHandle, decode_line
 
 FIXTURE = str(Path(__file__).parent / "fixtures" / "fake_ga_bridge.py")
@@ -144,3 +146,40 @@ def test_stderr_tail_snapshot_is_race_free():
         reader.join(5)
         sys.setswitchinterval(old_interval)
     assert 0 < len(p.stderr_tail(10)) <= 10
+
+
+def test_spawn_isolates_the_child_into_its_own_session(monkeypatch):
+    """POSIX 必须 start_new_session：kill_tree_now 用 killpg 杀整组，
+    子进程若与服务端同组，一次停 GA 就会把服务端自己 SIGKILL 掉。
+    Windows 仍然只设 creationflags（不弹窗），不传 start_new_session。"""
+    calls = []
+
+    class FakeProc:
+        pid = 4242
+        returncode = None
+
+        def __init__(self):
+            self.stdin = None
+            self.stdout = io.BytesIO(b"")
+            self.stderr = io.BytesIO(b"")
+
+    def fake_popen(command, **kwargs):
+        calls.append(kwargs)
+        return FakeProc()
+
+    monkeypatch.setattr(transport_mod.subprocess, "Popen", fake_popen)
+
+    async def start_with(name):
+        monkeypatch.setattr(transport_mod.os, "name", name)
+        proc = AcpProcess(["fake-agent"], cwd=".", env={})
+        proc.start()
+        await asyncio.sleep(0)
+        return dict(calls[-1])
+
+    posix = run(start_with("posix"))
+    assert posix["start_new_session"] is True
+    assert "creationflags" not in posix
+
+    windows = run(start_with("nt"))
+    assert windows["creationflags"] == transport_mod._CREATE_NO_WINDOW
+    assert "start_new_session" not in windows

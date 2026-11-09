@@ -192,6 +192,11 @@ class GaSession:
             raise AcpBusyError(
                 f"会话 {self.agent_id} 仍有未完成的 prompt，拒绝并发派任务"
             )
+        if self._stop_requested:
+            # 停止请求先到、prompt 任务后到（manager 的 stop_all_now 是同步的，
+            # create_task 里这一轮可能还没开始跑）：不再发卡片、不重置状态，
+            # 直接收敛成 stopped，否则会把 stopped 翻回 running → errored。
+            return PromptResult(status="stopped")
 
         self._in_flight = True
         try:

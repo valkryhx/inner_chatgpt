@@ -272,13 +272,10 @@ class AcpSessionManager:
     # ---------------------------------------------------------------- 停止
 
     async def stop(self, agent_id: str | None) -> dict[str, Any]:
-        """cancel → 最多等 2s → 硬杀进程树；``None`` 表示全部。"""
+        """cancel → 最多等 2s → 硬杀进程树；``None`` 表示全部（并发停）。"""
         entries = self._select(agent_id)
-        stopped: list[str] = []
-        for aid, entry in entries.items():
-            await self._stop_entry(entry)
-            stopped.append(aid)
-        return {"stopped": stopped}
+        await self._stop_entries(entries)
+        return {"stopped": list(entries)}
 
     async def stop_all(self) -> int:
         """停掉所有会话，返回停掉的会话数。"""
@@ -286,13 +283,12 @@ class AcpSessionManager:
 
     async def stop_generation(self) -> int:
         """停掉本 generation 的全部会话（用户点停止的优雅路径，spec §9.4）。"""
-        entries = [
-            entry
-            for entry in self._entries.values()
+        entries = {
+            aid: entry
+            for aid, entry in self._entries.items()
             if entry.lease.generation_id == self.ctx.generation_id
-        ]
-        for entry in entries:
-            await self._stop_entry(entry)
+        }
+        await self._stop_entries(entries)
         return len(entries)
 
     def stop_all_now(self) -> None:
@@ -348,6 +344,15 @@ class AcpSessionManager:
         if stack is not None:
             await _quietly_aclose(stack)
 
+    async def _stop_entries(self, entries: dict[str, _Entry]) -> None:
+        """并发停多条会话：一条慢会话不能把其它停机会话和 SSE 一起拖住。"""
+        if not entries:
+            return
+        await asyncio.gather(
+            *(self._stop_entry(entry) for entry in entries.values()),
+            return_exceptions=True,
+        )
+
     async def _stop_entry(self, entry: _Entry) -> None:
         session = entry.session
         task = entry.task
@@ -358,7 +363,8 @@ class AcpSessionManager:
         if task is not None and not task.done():
             await asyncio.wait({task}, timeout=_STOP_GRACE_S)
             if not task.done():
-                kill_tree_now(session.process_handle)
+                # 同步杀树最多阻塞 ~2s；绝不能占住事件循环（SSE 是所有用户共用的）。
+                await asyncio.to_thread(kill_tree_now, session.process_handle)
                 # 进程已死，在途 prompt 会以 AcpTransportClosed 立刻收尾。
                 await asyncio.wait({task}, timeout=_KILL_SETTLE_S)
         if session.status not in _TERMINAL_STATUSES:
@@ -415,12 +421,17 @@ class AcpSessionManager:
     @staticmethod
     def _wait_row(agent_id: str, entry: _Entry, since_seq: int) -> dict[str, Any]:
         snap = entry.session.snapshot()
+        events = entry.session.tail(since_seq)
+        # result / full_text 只在 prompt 结束（_finish_prompt）时才拼好；
+        # 进行中的会话必须退回事件日志，否则 ga_wait 的「先看中间文本」永远是空。
         preview = snap["result"] or snap["full_text"]
+        if not preview:
+            preview = "".join(str(event.get("text") or "") for event in events)
         return {
             "agent_id": agent_id,
             "status": snap["status"],
             "last_seq": snap["last_seq"],
-            "events_tail": entry.session.tail(since_seq),
+            "events_tail": events,
             "result_preview": preview[:_PREVIEW_CHARS],
         }
 

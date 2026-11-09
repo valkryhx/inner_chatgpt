@@ -68,6 +68,18 @@ def _buffered(stream: Any) -> Any:
     return stream
 
 
+def _spawn_kwargs() -> dict[str, Any]:
+    """平台相关的 ``Popen`` 参数。
+
+    POSIX 必须 ``start_new_session=True``：:func:`kill_tree_now` 用 ``killpg``
+    杀整个进程组，GA 若与服务端同组，停一条 GA 就会把服务端自己一起 SIGKILL。
+    Windows 仍只设 ``creationflags``（不弹控制台窗口），不传该参数。
+    """
+    if os.name == "nt":
+        return {"creationflags": _CREATE_NO_WINDOW}
+    return {"start_new_session": True}
+
+
 class AsyncProcHandle:
     """``subprocess.Popen`` 的异步外观。
 
@@ -177,7 +189,6 @@ class AcpProcess:
         if self._proc is not None:
             raise RuntimeError("AcpProcess 已经启动过")
         self._loop = asyncio.get_running_loop()
-        flags = _CREATE_NO_WINDOW if os.name == "nt" else 0
         proc = subprocess.Popen(
             self._command,
             cwd=self._cwd,
@@ -186,7 +197,7 @@ class AcpProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
-            creationflags=flags,
+            **_spawn_kwargs(),
         )
         self._proc = proc
         self._handle = AsyncProcHandle(proc)

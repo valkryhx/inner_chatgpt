@@ -1,5 +1,5 @@
 """Minimal ACP agent. Env:
-FAKE_GA_MODE = chunks|tools|permission|hang|crash|malformed|split|error
+FAKE_GA_MODE = chunks|tools|permission|hang|stream_hang|crash|malformed|split|error
 FAKE_GA_STDERR_LINES = int (flood stderr *before* reading stdin)
 FAKE_GA_LOG = path (append every received message as one JSON line)
 """
@@ -75,6 +75,11 @@ def main():
                       "error": {"code": -32603, "message": "fake failure"}})
                 continue
             if MODE == "hang":
+                pending[sid] = rid
+            elif MODE == "stream_hang":
+                # 先流一段文本再挂起：用于验证「进行中也能看到中间文本」。
+                update(sid, {"sessionUpdate": "agent_message_chunk",
+                             "content": {"type": "text", "text": "working..."}})
                 pending[sid] = rid
             elif MODE == "permission":
                 send({"jsonrpc": "2.0", "id": "perm_fake",

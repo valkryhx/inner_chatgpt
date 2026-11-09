@@ -201,3 +201,159 @@ def test_send_creates_new_card(monkeypatch):
     assert len(cards) == 2
     assert cards[0] == cards[1].replace("#2", "#1")
     assert cards[0].endswith("#1") and cards[1].endswith("#2")
+
+
+# ---------------------------------------------------------------- 停止/预览
+# 这些用例不启动真进程：只把 _entries/_sessions 换成假的会话对象，
+# 用来确定性地观察「并发」与「是否把阻塞杀放进线程」。
+
+
+class _FakeGaSession:
+    """只实现 stop/close 路径用到的最小接口。"""
+
+    def __init__(self, agent_id, *, stop_delay=0.0):
+        self.agent_id = agent_id
+        self.status = "running"
+        self.process_handle = object()
+        self.stop_delay = stop_delay
+        self.stop_calls = 0
+
+    async def stop(self):
+        self.stop_calls += 1
+        if self.stop_delay:
+            await asyncio.sleep(self.stop_delay)
+        self.status = "stopped"
+
+    async def close(self):
+        pass
+
+
+def _install_fakes(mgr, sessions, *, tasks=None):
+    import app.acp.manager as manager_mod
+    from app.process_registry import ProcessLease
+
+    mgr._entries.clear()
+    mgr._sessions.clear()
+    for session in sessions:
+        entry = manager_mod._Entry(
+            session=session,
+            lease=ProcessLease(
+                mgr.ctx.user_id,
+                mgr.ctx.session_id,
+                mgr.ctx.generation_id,
+                session.agent_id,
+            ),
+            task=(tasks or {}).get(session.agent_id),
+        )
+        mgr._entries[session.agent_id] = entry
+        mgr._sessions[session.agent_id] = session
+
+
+def test_stop_all_now_before_prompt_task_runs_stays_stopped(monkeypatch):
+    """spawn 的 create_task 与 stop_all_now 之间没有 await：任务晚到时
+    不能再发卡片、也不能把 stopped 翻成 errored。"""
+    monkeypatch.setenv("FAKE_GA_MODE", "hang")
+
+    async def scenario():
+        mgr, buf = make()
+        try:
+            out = await mgr.spawn(task="long")
+            session = mgr._sessions[out["agent_id"]]
+            mgr.stop_all_now()
+            await mgr.wait(out["agent_id"], timeout_s=5)
+            starts = [e for e in buf.events if e["type"] == "subagent_start"]
+            return session.snapshot()["status"], starts
+        finally:
+            await mgr.close_all()
+
+    status, starts = run(scenario())
+    assert status == "stopped"
+    assert starts == []
+
+
+def test_wait_preview_shows_text_while_running(monkeypatch):
+    """进行中的会话也要能 preview 到中间文本（result/full_text 此时还没拼）。"""
+    monkeypatch.setenv("FAKE_GA_MODE", "stream_hang")
+
+    async def scenario():
+        mgr, _ = make()
+        try:
+            out = await mgr.spawn(task="long")
+            r = await mgr.wait(out["agent_id"], timeout_s=1.0)
+            await mgr.stop(out["agent_id"])
+            return r
+        finally:
+            await mgr.close_all()
+
+    r = run(scenario())
+    row = r["agents"][0]
+    assert r["timed_out"] is True
+    assert row["status"] == "running"
+    assert row["result_preview"] == "working..."
+
+
+def test_stop_generation_stops_sessions_concurrently(monkeypatch):
+    async def scenario():
+        mgr, _ = make()
+        try:
+            _install_fakes(
+                mgr,
+                [
+                    _FakeGaSession("ga_a", stop_delay=0.6),
+                    _FakeGaSession("ga_b", stop_delay=0.6),
+                ],
+            )
+            t0 = time.monotonic()
+            count = await mgr.stop_generation()
+            return count, time.monotonic() - t0
+        finally:
+            await mgr.close_all()
+
+    count, elapsed = run(scenario())
+    assert count == 2
+    # 串行约 1.2s；并发约 0.6s，留 0.4s 余量防抖动
+    assert elapsed < 1.0
+
+
+def test_async_stop_runs_killer_off_the_event_loop(monkeypatch):
+    import app.acp.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "_STOP_GRACE_S", 0.01)
+    monkeypatch.setattr(manager_mod, "_KILL_SETTLE_S", 0.01)
+    killed = []
+
+    def slow_kill(handle):
+        killed.append(handle)
+        time.sleep(0.6)  # 同步阻塞：只有放进线程才不会冻住 SSE
+
+    monkeypatch.setattr(manager_mod, "kill_tree_now", slow_kill)
+
+    async def scenario():
+        mgr, _ = make()
+        never = asyncio.create_task(asyncio.sleep(30))
+        try:
+            _install_fakes(mgr, [_FakeGaSession("ga_slow")], tasks={"ga_slow": never})
+            ticks = 0
+
+            async def ticker():
+                nonlocal ticks
+                while True:
+                    await asyncio.sleep(0.01)
+                    ticks += 1
+
+            tick = asyncio.create_task(ticker())
+            try:
+                count = await mgr.stop_generation()
+            finally:
+                tick.cancel()
+                never.cancel()
+                await asyncio.gather(tick, never, return_exceptions=True)
+            return count, ticks, len(killed)
+        finally:
+            await mgr.close_all()
+
+    count, ticks, kills = run(scenario())
+    assert count == 1
+    assert kills == 1
+    # 0.6s 的同步杀若占住事件循环，ticks 几乎不会增长
+    assert ticks >= 10
