@@ -37,3 +37,6 @@ work/
 
 # 零碎资料：仅本地保留，不入 GitHub 仓库（内网资料）
 misc/
+
+# local git worktrees
+.worktrees/
