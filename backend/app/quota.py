@@ -33,6 +33,8 @@ class Limits:
     global_code_runs: int = _env_int("GLOBAL_MAX_CODE_RUNS", 8)
     user_mcp_calls: int = _env_int("USER_MAX_MCP_CALLS", 2)
     global_mcp_calls: int = _env_int("GLOBAL_MAX_MCP_CALLS", 32)
+    user_acp_active: int = _env_int("INNER_ACP_MAX_ACTIVE_USER", 4)
+    global_acp_active: int = _env_int("INNER_ACP_MAX_ACTIVE_GLOBAL", 80)
 
 
 class QuotaExceeded(RuntimeError):
@@ -66,6 +68,8 @@ class QuotaManager:
         self._global_code_runs = asyncio.Semaphore(self.limits.global_code_runs)
         self._user_mcp_calls: dict[str, asyncio.Semaphore] = {}
         self._global_mcp_calls = asyncio.Semaphore(self.limits.global_mcp_calls)
+        self._user_acp_active: dict[str, asyncio.Semaphore] = {}
+        self._global_acp_active = asyncio.Semaphore(self.limits.global_acp_active)
 
     def _user(self, table: dict[str, asyncio.Semaphore], key: str, value: int) -> asyncio.Semaphore:
         sem = table.get(key)
@@ -149,6 +153,18 @@ class QuotaManager:
         sems = [
             self._global_mcp_calls,
             self._user(self._user_mcp_calls, user_id, self.limits.user_mcp_calls),
+        ]
+        lease = await self._acquire_many(sems, timeout_s)
+        try:
+            yield lease
+        finally:
+            lease.release()
+
+    @asynccontextmanager
+    async def acp_active(self, user_id: str, *, timeout_s: float = 2.0) -> AsyncIterator[Lease]:
+        sems = [
+            self._global_acp_active,
+            self._user(self._user_acp_active, user_id, self.limits.user_acp_active),
         ]
         lease = await self._acquire_many(sems, timeout_s)
         try:
