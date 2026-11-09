@@ -21,6 +21,7 @@
 | 内置工具 | `file_read / file_write / file_patch / list_files / code_run / load_skill`，读写限制在个人 workspace |
 | 子代理 Subagent | 进程内 asyncio 运行时：`spawn_agent / wait_agent / read_agent_result / list_agents / close_agent`；子代理继承全部业务工具与 MCP，但不能派生子代理；事件并入主对话 SSE |
 | Agent Team | 持久任务板 + 依赖 `blocked_by` + CAS 版本 + 团队消息 + lead/teammate 角色；右侧 `TeamPanel` 实时展示任务、消息与动态；lead 8 个编排工具，teammate 5 个 |
+| 外部 GenericAgent（ACP） | 以 ACP 拉起本机 GenericAgent 子进程作为外部编码代理：`ga_spawn / ga_wait / ga_result / ga_send / ga_stop` 五个 root-only 工具，事件并入主对话 SSE（`subagent_*`）。**manager 级真 GA E2E 已通过**（哨兵写文件 + 停止级联），但 `preflight()` 探针在真机恒失败（bridge import 时抢占 stdout，**阻塞缺陷待修**），Web UI E2E 未跑；详见 `docs/20261109-ACP-client驱动GenericAgent实施记录.md` |
 | 文件产物 | 任意格式下载：单文件、目录浏览、多选打包 zip；Markdown 本地文件胶囊、工具步骤行下载、右侧工作区面板三入口；Office 文档生成依赖已内置 |
 | 停止可靠性 | 协作停止旗 + `task.cancel` + 子代理/`code_run` 级联三层；陈旧 generation 租约自动收敛，停止后已生成内容保留 |
 | 前端 | React 18 + Vite + TypeScript；暖纸 + 陶土设计系统；Markdown/GFM、图片鉴权渲染、ECharts 图表、子代理卡片、团队面板、文件面板 |
