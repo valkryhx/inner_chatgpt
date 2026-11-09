@@ -100,12 +100,13 @@
 开工前先按 0.3 的文档约定新建设计文档，再动代码；不得把未实现项写进 README / 本文件的能力描述。
 
 **P5：外部 GenericAgent（ACP）—— 已实现，manager 级真 GA E2E 通过（预检缺陷已修，2026-11-09）。**
+（P5 与 P4 并行推进、先于 P4 落地；**P4 仍未开始**，下面的 P4 条目保持原样。）
 
 - 新增 `backend/app/acp/`：自写 JSON-RPC 行传输（`transport`）、握手与请求分发（`client`）、会话状态机与事件映射（`session`）、并发配额/会话名额/进程租约/停止级联（`manager`）、5 个 root-only 工具（`tools`）与只解析环境变量的配置层（`config`）。
 - 与既有 P2/P3 同构：GA 事件并入主对话 SSE（`subagent_start/_event/_end`），GA 进程注册 `ProcessLease`，`/stop` 走「优雅 cancel → 硬杀兜底」。
-- 真 GA manager 级 E2E 通过（HEAD `78c0b4f`，全新进程无缓存预热）：哨兵任务 7.9 s，GA 用 `file_write` 落盘 19 B（哨兵 + GA 自带的行尾换行，文件含哨兵即判通过）；停止后 `process_registry` 硬杀回收（`returncode=1`）。
-- **预检缺陷（E2E 中发现，已修复）**：原探针 `print(b.__file__)` 被真 bridge 在 import 期对 fd 1 / text stdout 的重定向击穿（真机预检恒失败 → `ga_*` 不注册；单测用假模块所以全绿）。`78c0b4f` 改为 `importlib.util.find_spec(<module>).origin`（只解析路径、不执行目标模块），并补了带 stdout 重定向副作用的回归测试；复验：全新进程预检 0.047 s 返回 site-packages 路径 + SHA256 `4e95c64b…`，5 个 `ga_*` 正常注入。详见记录 §5。
-- 未覆盖：Web UI E2E、GA 内部 subagent 事件透出、跨轮续跑（bridge `loadSession: false`）；`tasklist | findstr genericagent_acp_bridge` 对 GA 是假阴性，复核请按命令行过滤（见记录 §4.4）。
+- 真 GA manager 级 E2E 通过（HEAD `78c0b4f`，全新进程无缓存预热），三个场景：① 哨兵 7.9 s，`file_write` 落盘 19 B（哨兵 + GA 自带行尾换行，含哨兵即判通过）；② 多步 15.8 s，`file_read → file_patch → code_run` 共 3 个工具步骤，`calc.py` 被改对、独立复核 `python calc.py` rc=0 / `ALL TESTS PASSED`；③ 长任务停止分层回收（`process_registry` 硬杀后 `returncode=1`），且 `ga_stop` 后 2.7 s 内能再派新任务并复述随机 marker。
+- **预检缺陷（E2E 中发现，已修复）**：原探针 `print(b.__file__)` 被真 bridge 在 import 期对 fd 1 / text stdout 的重定向击穿（真机预检恒失败 → `ga_*` 不注册；单测用假模块所以全绿）。`78c0b4f` 改为 `importlib.util.find_spec(<module>).origin`（只解析路径、不执行目标模块），并补了带 stdout 重定向副作用的回归测试；复验：全新进程预检 0.047 s 返回 site-packages 路径 + SHA256 `4e95c64b…`，5 个 `ga_*` 正常注入。详见记录 §6。
+- 未覆盖：Web UI E2E；DB `blocks` / 「GA 外援」卡片渲染（需完整 turn runtime + UI）；chat / SSE 层「停止后立即发送」（manager 层已证可继续）；GA 内部 subagent 事件透出；跨轮续跑（bridge `loadSession: false`）。另：`tasklist | findstr genericagent_acp_bridge` 对 GA 是假阴性，复核请按命令行过滤（见记录 §5.5）。
 - 详见 `docs/20261109-ACP-client驱动GenericAgent实施记录.md`；设计与工具契约见 `docs/20261109-ACP-client驱动GenericAgent设计与实施.md`。
 
 ### 0.2 必读文档（按顺序）
