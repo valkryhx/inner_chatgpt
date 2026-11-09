@@ -4,6 +4,7 @@ import Markdown from './Markdown'
 
 const ROLE_LABEL: Record<string, string> = {
   general: '通用',
+  ga: 'GA 外援',
 }
 
 const STATUS_LABEL: Record<string, string> = {
