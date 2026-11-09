@@ -357,3 +357,42 @@ def test_async_stop_runs_killer_off_the_event_loop(monkeypatch):
     assert kills == 1
     # 0.6s 的同步杀若占住事件循环，ticks 几乎不会增长
     assert ticks >= 10
+
+def test_preflight_tolerates_bridge_that_redirects_stdout(tmp_path, monkeypatch):
+    """真实 bridge 在 import 时把 fd1 / sys.stdout 重定向到 stderr（bridge:14-45）。
+
+    预检只解析模块路径、不执行目标模块，所以这种 bridge 必须能通过预检；
+    否则一个完全健康的安装会被判成不可用，``ga_*`` 工具永远不注入。
+    """
+    from app.acp.manager import reset_preflight_cache
+
+    name = "ga_bridge_stdout_redirect_stub"
+    stub = tmp_path / f"{name}.py"
+    stub.write_text(
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "# 复刻真实 bridge：import 时把 fd1 / sys.stdout 重定向到 stderr。\n"
+        "sys.stdout = sys.stderr\n"
+        "os.dup2(sys.stderr.fileno(), 1)\n"
+        "print('bridge imported')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    # 探测子进程只继承 build_child_env 的白名单，必须显式允许 PYTHONPATH 才看得到 stub。
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    reset_preflight_cache()
+
+    ctx = AgentContext(user_id="u1", session_id="s1", message_id="m1", generation_id="g1")
+    settings = load_acp_settings({
+        "INNER_ACP_GA_COMMAND": json.dumps([sys.executable, "-m", name]),
+        "INNER_ACP_ENV_ALLOW": "PYTHONPATH",
+    })
+    mgr = AcpSessionManager(ctx=ctx, buffer=RecordingBuffer(), settings=settings)
+    try:
+        path = mgr.preflight()
+    finally:
+        reset_preflight_cache()
+
+    assert path is not None
+    assert Path(path).resolve() == stub.resolve()

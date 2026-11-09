@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # 拿并发名额最多等这么久（spec §9.3：第 5 个 ga_spawn 等 2s 后报并发上限）。
 _QUOTA_WAIT_S = 2.0
 
-# 预检子进程最多等这么久：只做一次 import，正常是百毫秒级。
+# 预检子进程最多等这么久：只解析一次模块路径，正常是百毫秒级。
 _PREFLIGHT_TIMEOUT_S = 15
 
 # 预检结果按命令行缓存（跨 manager 实例复用：每轮都会新建一个 manager）。
@@ -152,15 +152,18 @@ class AcpSessionManager:
     # ---------------------------------------------------------------- 预检
 
     def preflight(self) -> str | None:
-        """检查 GA 的 ACP bridge 能否 import；返回 bridge 文件路径。
+        """检查 GA 的 ACP bridge 是否可定位；返回 bridge 文件路径。
 
-        **同步**方法：只跑一次解释器 import，正常是百毫秒级，失败也在 15s 内返回。
+        **同步**方法：只解析一次模块路径，正常是百毫秒级，失败也在 15s 内返回。
 
         - 自定义命令（不含 ``-m``）没有可探测的模块名 → 返回 ``None``，把问题留给
           真正启动时的可读错误；
         - ``<python> -m <module>`` 形式 → 用**同一个解释器**跑
-          ``import <module> as b; print(b.__file__)``，这样「没装 / 装错 Python /
-          依赖缺失」在 spawn 之前就能判出来（spec §9.5：绝不注入半成品会话）。
+          ``importlib.util.find_spec(<module>).origin``。**只解析路径、不 import
+          目标模块**：真实 bridge 在 import 时会把 fd1 / ``sys.stdout`` 重定向到
+          stderr（bridge:14-45），真的 import 就拿不到路径，健康安装会被误判成不可用。
+          这样「没装 / 装错 Python / 父包缺失」仍然在 spawn 之前就能判出来
+          （spec §9.5：绝不注入半成品会话）。
 
         成功结果按 ``tuple(command)`` 缓存并复用（每轮都会新建 manager，缓存放模块级）；
         失败结果按同样的 key 做**短 TTL** 负缓存（``_PREFLIGHT_FAIL_TTL_S``，默认 30s）：
@@ -192,9 +195,18 @@ class AcpSessionManager:
         # 中文用户名下的安装路径在 GBK 控制台里会被解成乱码。
         env = build_child_env(self.settings)
         env["PYTHONIOENCODING"] = "utf-8"
+        # ⚠️ 只解析模块路径，**绝不执行**目标模块：真实 bridge 在 import 时会把
+        # fd1 / ``sys.stdout`` 重定向到 stderr（bridge:14-45），一旦真的 import，
+        # 探测子进程的 stdout 就是空的，健康安装会被误判成不可用、ga_* 工具永远不注入。
+        # ``find_spec`` 只加载父包（必要时），不执行目标模块本身。
+        probe = (
+            "import importlib.util as u; "
+            f"s = u.find_spec({module!r}); "
+            "print(s.origin if s else '')"
+        )
         try:
             proc = subprocess.run(
-                [command[0], "-c", f"import {module} as b; print(b.__file__)"],
+                [command[0], "-c", probe],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -212,7 +224,12 @@ class AcpSessionManager:
 
         path = (proc.stdout or "").strip()
         if proc.returncode != 0 or not path:
-            detail = (proc.stderr or "").strip()[-800:] or "无输出"
+            # 注意：``find_spec`` 对「找不到的顶层模块」返回 None 而不是抛异常，
+            # 所以 stdout 是空行、stderr 也是空的。这时必须自己把模块名写进错误，
+            # 否则模型只会看到「无输出」而无法自救。
+            detail = (proc.stderr or "").strip()[-800:] or (
+                f"未找到模块 {module}；确认 GA 装在该 Python 环境（{command[0]}）里"
+            )
             raise _remember_preflight_failure(
                 key, AcpUnavailableError(f"GenericAgent ACP bridge 不可用: {detail}")
             )
