@@ -412,7 +412,7 @@ def test_close_terminates_process_and_wait_is_async():
         await p.close(grace_s=0.2)
         return await asyncio.wait_for(handle.wait(), 5)
 
-    assert run(scenario()) is not None
+    assert isinstance(run(scenario()), int)
 
 
 def test_unknown_line_does_not_kill_reader():
@@ -973,7 +973,14 @@ from app.acp.config import load_acp_settings
 from app.acp.manager import AcpLimitError, AcpSessionManager
 from app.quota import Limits, QuotaExceeded, QuotaManager
 from app.subagent.context import AgentContext
-from app.subagent.events import EventBuffer
+
+
+class RecordingBuffer:
+    def __init__(self):
+        self.events = []
+
+    def put(self, ev):
+        self.events.append(ev)
 
 FIXTURE = str(Path(__file__).parent / "fixtures" / "fake_ga_bridge.py")
 
@@ -989,7 +996,7 @@ def make(**extra):
         **extra,
     }
     ctx = AgentContext(user_id="u1", session_id="s1", message_id="m1", generation_id="g1")
-    buf = EventBuffer()
+    buf = RecordingBuffer()
     return AcpSessionManager(ctx=ctx, buffer=buf, settings=load_acp_settings(env)), buf
 
 
