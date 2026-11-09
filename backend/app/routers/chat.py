@@ -26,7 +26,7 @@ from ..subagent.session import build_turn_runtime, prepare_turn_team
 _SUBAGENT_EVENT_ID = "__subagent__"
 
 
-async def _merged_events(main_gen, buffer, host, stop_event=None):
+async def _merged_events(main_gen, buffer, host, stop_event=None, extra=None):
     """Merge main and child events; wait briefly for live children at main EOF.
 
     A root model can legitimately finish its response immediately after
@@ -37,12 +37,17 @@ async def _merged_events(main_gen, buffer, host, stop_event=None):
     """
     q: asyncio.Queue = asyncio.Queue()
 
-    def has_active() -> bool:
-        fn = getattr(host, "has_active", None)
+    def _active(obj) -> bool:
+        fn = getattr(obj, "has_active", None)
         try:
             return bool(fn()) if callable(fn) else False
         except Exception:
             return False
+
+    def has_active() -> bool:
+        # ACP sessions (``extra``) live outside the subagent host but belong to
+        # the same turn, so the stream must stay open while either is running.
+        return _active(host) or _active(extra)
 
     def drain_timeout() -> float:
         try:
@@ -82,9 +87,14 @@ async def _merged_events(main_gen, buffer, host, stop_event=None):
                     deadline = asyncio.get_running_loop().time() + drain_timeout()
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
-                    stop_all = getattr(host, "stop_all", None)
-                    if callable(stop_all):
-                        await stop_all()
+                    for target in (host, extra):
+                        stop_all = getattr(target, "stop_all", None)
+                        if not callable(stop_all):
+                            continue
+                        try:
+                            await stop_all()
+                        except Exception:
+                            logger.warning("drain-timeout stop failed", exc_info=True)
                     break
                 timeout = min(0.25, remaining)
             try:
@@ -135,6 +145,12 @@ async def _settle_turn(turn, user_id: str, session_id: str, generation_id: str,
 
     A fresh task is outside the anyio cancel scope, so these awaits can finish.
     """
+    acp_close = getattr(getattr(turn, "acp", None), "close_all", None)
+    if callable(acp_close):
+        try:
+            await acp_close()
+        except BaseException:
+            pass
     try:
         await turn.host.close_all()
     except BaseException:
@@ -176,6 +192,13 @@ async def _cleanup_turn(turn, hub, user_id: str, session_id: str, generation_id:
             stop_now()
     except BaseException:
         logger.warning("stop subagent tasks failed", exc_info=True)
+    acp = getattr(turn, "acp", None)
+    acp_stop_now = getattr(acp, "stop_all_now", None)
+    try:
+        if callable(acp_stop_now):
+            acp_stop_now()
+    except BaseException:
+        logger.warning("stop ACP sessions failed", exc_info=True)
     try:
         hub.unregister_subagent_host(user_id, session_id, generation_id, team_id)
     except TypeError:
@@ -204,6 +227,25 @@ async def _cleanup_turn(turn, hub, user_id: str, session_id: str, generation_id:
         await turn.host.close_all()
     except BaseException:
         logger.warning("close subagent host was interrupted", exc_info=True)
+        _schedule_settle()
+        return
+    acp_interrupted = False
+    acp_close = getattr(acp, "close_all", None)
+    if callable(acp_close):
+        try:
+            await acp_close()
+        except BaseException:
+            logger.warning("close ACP sessions was interrupted", exc_info=True)
+            acp_interrupted = True
+    # Drop the hub registration so a finished generation can never be stopped
+    # (or closed) twice through /stop.
+    unregister_acp = getattr(hub, "unregister_acp_manager", None)
+    if callable(unregister_acp):
+        try:
+            unregister_acp(user_id, session_id, generation_id)
+        except BaseException:
+            logger.warning("unregister ACP manager failed", exc_info=True)
+    if acp_interrupted:
         _schedule_settle()
         return
     if turn.team is not None:
@@ -401,7 +443,8 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
             if not getattr(turn_ur, "user_id", ""):
                 turn_ur.user_id = user_id
             events = _merged_events(run_agent_stream(turn_ur, session_id, text, stop_event),
-                                    turn.buffer, turn.host, stop_event)
+                                    turn.buffer, turn.host, stop_event,
+                                    extra=getattr(turn, "acp", None))
         else:
             events = run_agent_stream(ur, session_id, text, stop_event)
 
@@ -622,6 +665,16 @@ async def stop_generation(session_id: str, body: StopIn, user: dict = Depends(ge
                 pass
         except Exception:
             pass
+    if hub is not None and generation_id:
+        # Graceful stop before the hard kill below: the ACP client cancels its
+        # own turn and answers the pending prompt, so nothing is orphaned once
+        # the code runs are terminated.
+        stop_acp = getattr(hub, "stop_acp_generation", None)
+        if callable(stop_acp):
+            try:
+                await stop_acp(user["id"], session_id, generation_id)
+            except Exception:
+                pass
     if generation_id:
         try:
             await stop_code_runs(user["id"], session_id, generation_id)
