@@ -26,6 +26,23 @@ from ..subagent.session import build_turn_runtime, prepare_turn_team
 _SUBAGENT_EVENT_ID = "__subagent__"
 
 
+def _register_acp_manager(hub, user_id: str, session_id: str, generation_id: str,
+                          turn) -> None:
+    """Publish the turn's ACP manager so ``/stop`` can reach it.
+
+    Without this the graceful ``hub.stop_acp_generation`` is a no-op in
+    production and the only remaining kill path is the turn's own cleanup.
+    """
+    register = getattr(hub, "register_acp_manager", None)
+    acp = getattr(turn, "acp", None)
+    if not callable(register) or acp is None:
+        return
+    try:
+        register(user_id, session_id, generation_id, acp)
+    except BaseException:
+        logger.warning("register ACP manager failed", exc_info=True)
+
+
 async def _merged_events(main_gen, buffer, host, stop_event=None, extra=None):
     """Merge main and child events; wait briefly for live children at main EOF.
 
@@ -140,7 +157,7 @@ logger = logging.getLogger(__name__)
 
 
 async def _settle_turn(turn, user_id: str, session_id: str, generation_id: str,
-                       status: str) -> None:
+                       status: str, hub=None) -> None:
     """Background fallback used when the request task was cancelled mid-cleanup.
 
     A fresh task is outside the anyio cancel scope, so these awaits can finish.
@@ -164,6 +181,14 @@ async def _settle_turn(turn, user_id: str, session_id: str, generation_id: str,
         await team_store.release_generation(user_id, session_id, generation_id)
     except BaseException:
         pass
+    # Backup: ``_cleanup_turn`` already pops this synchronously, but a turn that
+    # never reached it must not leave the manager registered forever.
+    unregister_acp = getattr(hub, "unregister_acp_manager", None)
+    if callable(unregister_acp):
+        try:
+            unregister_acp(user_id, session_id, generation_id)
+        except BaseException:
+            pass
 
 
 async def _cleanup_turn(turn, hub, user_id: str, session_id: str, generation_id: str,
@@ -199,6 +224,15 @@ async def _cleanup_turn(turn, hub, user_id: str, session_id: str, generation_id:
             acp_stop_now()
     except BaseException:
         logger.warning("stop ACP sessions failed", exc_info=True)
+    # Drop the hub registration here rather than after an await: the async
+    # section below can be interrupted (host.close_all is its own await), and a
+    # registration left behind would leak one hub entry per stopped turn.
+    unregister_acp = getattr(hub, "unregister_acp_manager", None)
+    if callable(unregister_acp):
+        try:
+            unregister_acp(user_id, session_id, generation_id)
+        except BaseException:
+            logger.warning("unregister ACP manager failed", exc_info=True)
     try:
         hub.unregister_subagent_host(user_id, session_id, generation_id, team_id)
     except TypeError:
@@ -214,7 +248,8 @@ async def _cleanup_turn(turn, hub, user_id: str, session_id: str, generation_id:
     # team_end is emitted once rather than once here and once again there.
     def _schedule_settle() -> None:
         try:
-            asyncio.create_task(_settle_turn(turn, user_id, session_id, generation_id, status))
+            asyncio.create_task(
+                _settle_turn(turn, user_id, session_id, generation_id, status, hub))
         except BaseException:
             logger.warning("schedule turn settle failed", exc_info=True)
 
@@ -237,14 +272,6 @@ async def _cleanup_turn(turn, hub, user_id: str, session_id: str, generation_id:
         except BaseException:
             logger.warning("close ACP sessions was interrupted", exc_info=True)
             acp_interrupted = True
-    # Drop the hub registration so a finished generation can never be stopped
-    # (or closed) twice through /stop.
-    unregister_acp = getattr(hub, "unregister_acp_manager", None)
-    if callable(unregister_acp):
-        try:
-            unregister_acp(user_id, session_id, generation_id)
-        except BaseException:
-            logger.warning("unregister ACP manager failed", exc_info=True)
     if acp_interrupted:
         _schedule_settle()
         return
@@ -408,6 +435,9 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
             # signature. Production RuntimeHub always uses the five-argument form.
             hub.register_subagent_host(session_id, generation_id, turn.host)
         await prepare_turn_team(turn, team_ctx)
+        # Register only once the turn is fully built: a failure above drops the
+        # turn, and the stream's finally would then never clean it up.
+        _register_acp_manager(hub, user_id, session_id, generation_id, turn)
     except Exception:
         turn = None
 
@@ -638,13 +668,28 @@ async def stop_generation(session_id: str, body: StopIn, user: dict = Depends(ge
     # the DB lease so stop still targets the actual running generation.
     generation_id = body.generation_id or await team_store.get_active_generation(user["id"], session_id)
 
-    # Cooperative flag first (graceful path), then cancel the actual asyncio
-    # task. Cancellation is what unblocks an LLM socket read or a tool await.
+    # Cooperative flag first, then the graceful ACP stop, and only after that
+    # the hard kill.  Cancellation is what unblocks an LLM socket read or a tool
+    # await, but it also runs the turn's synchronous cleanup
+    # (``acp.stop_all_now``); cancelling before the graceful stop would therefore
+    # preempt it and leave the ACP client with an unanswered prompt.
     n = 0
     try:
         n = request_stop(user["id"], session_id, generation_id)
     except TypeError:
         n = request_stop(session_id, generation_id)
+
+    hub = get_hub()
+    if hub is not None and generation_id:
+        # Bounded: a wedged ACP client must never delay the hard kill below.
+        stop_acp = getattr(hub, "stop_acp_generation", None)
+        if callable(stop_acp):
+            try:
+                await asyncio.wait_for(
+                    stop_acp(user["id"], session_id, generation_id), timeout=2.0)
+            except Exception:
+                pass
+
     if generation_id:
         try:
             cancel_generation(user["id"], session_id, generation_id)
@@ -654,7 +699,6 @@ async def stop_generation(session_id: str, body: StopIn, user: dict = Depends(ge
     # Cascade to subagents and OS processes regardless of hub availability.
     # Never tuck code_run cleanup behind generation_id/hub guards.
     subs = 0
-    hub = get_hub()
     if hub is not None and generation_id:
         try:
             subs = await hub.stop_subagent_generation(user["id"], session_id, generation_id)
@@ -665,16 +709,6 @@ async def stop_generation(session_id: str, body: StopIn, user: dict = Depends(ge
                 pass
         except Exception:
             pass
-    if hub is not None and generation_id:
-        # Graceful stop before the hard kill below: the ACP client cancels its
-        # own turn and answers the pending prompt, so nothing is orphaned once
-        # the code runs are terminated.
-        stop_acp = getattr(hub, "stop_acp_generation", None)
-        if callable(stop_acp):
-            try:
-                await stop_acp(user["id"], session_id, generation_id)
-            except Exception:
-                pass
     if generation_id:
         try:
             await stop_code_runs(user["id"], session_id, generation_id)
