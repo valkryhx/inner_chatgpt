@@ -160,6 +160,17 @@ class GaSession:
         self.status = "stopped"
         await self._cancel_quietly()
 
+    def mark_stopped(self) -> None:
+        """**同步**把会话标成 stopped，不发 cancel（供不能 await 的清理路径用）。
+
+        置上 ``_stop_requested`` 之后，在途 prompt 因管道关闭失败时会收敛成
+        ``stopped`` 而不是 ``errored``（spec §9.4：用户停止 = stopped）。
+        已经进入终态的会话不再改写状态（``completed`` 保持 ``completed``）。
+        """
+        self._stop_requested = True
+        if self.status not in _TERMINAL_STATUSES:
+            self.status = "stopped"
+
     async def close(self) -> None:
         """关闭底层传输。进程句柄保留，供租约用到 ``close_all``。"""
         client = self._client

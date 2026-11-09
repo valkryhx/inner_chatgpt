@@ -54,7 +54,25 @@ def test_spawn_and_wait_completes(monkeypatch):
     r, active = run(scenario())
     assert r["status"] == "completed"
     assert r["result"] == "hello world"
+    assert r["stop_reason"] == "end_turn"
     assert active is False
+
+
+def test_timeout_reports_stop_reason(monkeypatch):
+    monkeypatch.setenv("FAKE_GA_MODE", "hang")
+
+    async def scenario():
+        mgr, _ = make()
+        try:
+            out = await mgr.spawn(task="slow", timeout_s=0.3)
+            await mgr.wait(out["agent_id"], timeout_s=10)
+            return await mgr.result(out["agent_id"])
+        finally:
+            await mgr.close_all()
+
+    r = run(scenario())
+    assert r["status"] == "stopped"
+    assert r["stop_reason"] == "timeout"
 
 
 def test_spawn_uses_user_workspace(tmp_path, monkeypatch):
@@ -133,17 +151,20 @@ def test_stop_all_now_kills_process_synchronously(monkeypatch):
         mgr, _ = make()
         try:
             out = await mgr.spawn(task="long")
-            handle = mgr._sessions[out["agent_id"]].process_handle
+            session = mgr._sessions[out["agent_id"]]
+            handle = session.process_handle
             mgr.stop_all_now()
             for _ in range(50):
                 if handle.returncode is not None:
-                    return True
+                    return True, session.snapshot()["status"]
                 await asyncio.sleep(0.1)
-            return False
+            return False, session.snapshot()["status"]
         finally:
             await mgr.close_all()
 
-    assert run(scenario()) is True
+    killed, status = run(scenario())
+    assert killed is True
+    assert status == "stopped"
 
 
 def test_crash_marks_errored(monkeypatch):

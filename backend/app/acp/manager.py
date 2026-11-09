@@ -90,6 +90,9 @@ class AcpSessionManager:
         self._sessions: dict[str, GaSession] = {}
         # agent_id -> 运行期记账；与 _sessions 同步增删。
         self._entries: dict[str, _Entry] = {}
+        # agent_id -> 最近一次 prompt 的 stopReason（``GaSession.snapshot()`` 不含它，
+        # 但 ``prompt()`` 返回的 PromptResult 有，spec §7.2 的 ga_result 要透出）。
+        self._stop_reasons: dict[str, str] = {}
 
     # ------------------------------------------------------------ 公开查询
 
@@ -191,6 +194,8 @@ class AcpSessionManager:
             self.quota.acp_active(self.ctx.user_id, timeout_s=_QUOTA_WAIT_S)
         )
         entry.prompt_seq += 1
+        # 新 prompt 的 stopReason 还没到，先清掉上一次的，避免读到陈旧值。
+        self._stop_reasons.pop(agent_id, None)
         # 新卡片要展示新的任务书（GaSession.prompt 发 subagent_start 时读 self.task）。
         entry.session.task = text
         entry.quota_stack = stack
@@ -244,6 +249,7 @@ class AcpSessionManager:
             "status": snap["status"],
             "prompts": snap["prompts"],
             "result": text,
+            "stop_reason": self._stop_reasons.get(agent_id, ""),
             "tool_calls": snap["tool_calls"],
             "error": snap["error"],
         }
@@ -292,15 +298,13 @@ class AcpSessionManager:
     def stop_all_now(self) -> None:
         """同步硬杀所有会话；**不 await**，供 cancel-safe 的清理路径调用。
 
-        这里不能 ``await session.stop()``，所以直接把会话标成 stop-requested：
-        ``GaSession`` 只在 ``_stop_requested`` 为真时把「管道被关」收敛成
-        ``stopped``，否则会误记成 ``errored``（spec §9.4 要求用户停止 = stopped）。
+        不能 ``await session.stop()``，所以用 ``GaSession.mark_stopped()``：
+        它同步置上 stop-requested，让在途 prompt 因管道关闭失败时收敛成
+        ``stopped`` 而不是 ``errored``（spec §9.4：用户停止 = stopped）。
         """
         for entry in list(self._entries.values()):
             session = entry.session
-            session._stop_requested = True
-            if session.status not in _TERMINAL_STATUSES:
-                session.status = "stopped"
+            session.mark_stopped()
             kill_tree_now(session.process_handle)
 
     async def close_all(self) -> None:
@@ -309,6 +313,7 @@ class AcpSessionManager:
         entries = list(self._entries.items())
         self._entries.clear()
         self._sessions.clear()
+        self._stop_reasons.clear()
         for _, entry in entries:
             await _quietly(entry.session.close())
             await _quietly(unregister(entry.lease))
@@ -316,11 +321,12 @@ class AcpSessionManager:
     # ---------------------------------------------------------------- 内部
 
     async def _run_prompt(self, entry: _Entry, text: str, timeout_s: float) -> None:
-        """包一层任务：无论成败都释放名额、清掉 task 引用。"""
+        """包一层任务：记 stopReason，无论成败都释放名额、清掉 task 引用。"""
         try:
-            await entry.session.prompt(
+            result = await entry.session.prompt(
                 text, prompt_seq=entry.prompt_seq, timeout_s=timeout_s
             )
+            self._stop_reasons[entry.session.agent_id] = result.stop_reason
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - GaSession 已收敛成终态并发过 subagent_end
@@ -369,6 +375,7 @@ class AcpSessionManager:
         finally:
             self._entries.pop(agent_id, None)
             self._sessions.pop(agent_id, None)
+            self._stop_reasons.pop(agent_id, None)
             await _quietly(unregister(entry.lease))
 
     def _check_open_cap(self) -> None:
