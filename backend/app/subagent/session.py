@@ -14,12 +14,15 @@
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .. import team_store
+from ..acp.config import load_acp_settings
 from ..agent_loop import AgentLoop
 from ..builtin_tools import build_builtin_tools
 from ..scope import TeamScope
@@ -31,6 +34,11 @@ from .context import AgentContext
 from .events import EventBuffer
 from .host import SubagentHost
 from .tools import build_subagent_tools
+
+if TYPE_CHECKING:  # 只为类型标注引入，运行期按需延迟导入（见 build_turn_runtime）
+    from ..acp.manager import AcpSessionManager
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TURNS = 300
 
@@ -46,6 +54,8 @@ class TurnRuntime:
     user_id: str = ""
     team: TeamHost | None = None
     team_id: str = ""
+    # 本轮的 GA 会话集合；未启用 / 预检失败时为 None（spec §11.3）。
+    acp: AcpSessionManager | None = None
 
 
 def _max_turns() -> int:
@@ -136,6 +146,31 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext) -> TurnRuntime:
 
         tool.call = observed
 
+    # 2c) ACP / GA：只有 root 的 registry 注入 5 个 ga_* 工具；子代理与 teammate
+    #     在别处装配自己的 registry，因此天然拿不到（spec §7.1）。
+    #     预检是准入闸（spec §11.3）：bridge import 不通就**整组不注入**，
+    #     绝不把半个会话交给模型。preflight 是同步的（一次 import，正常百毫秒级），
+    #     放进线程避免阻塞事件循环。
+    acp: AcpSessionManager | None = None
+    acp_settings = load_acp_settings()
+    if acp_settings.enabled:
+        try:
+            from ..acp.manager import AcpSessionManager
+            from ..acp.tools import build_acp_tools
+
+            manager = AcpSessionManager(ctx=team_ctx, buffer=buffer, settings=acp_settings)
+            await asyncio.to_thread(manager.preflight)
+            # 先整体构造再统一 add：中途抛异常不能留下「一半 ga_* 工具」。
+            acp_tools = build_acp_tools(manager)
+        except Exception as exc:  # noqa: BLE001 - GA 不可用不能拖垮本轮
+            logger.warning(
+                "ACP 不可用，本轮不注入 ga_* 工具：%s: %s", type(exc).__name__, exc
+            )
+        else:
+            for t in acp_tools:
+                merged.add(t)
+            acp = manager
+
     # 3) 独立的 AgentLoop：**必须挂主对话的 history_store**，
     #    否则主对话的 assistant/tool 消息不会落 session_history，下一轮上下文就丢了。
     #    （子代理用独立的侧链表，与这里无关。）
@@ -157,6 +192,7 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext) -> TurnRuntime:
         user_id=team_ctx.user_id,
         team=team_host,
         team_id=team_id,
+        acp=acp,
     )
 
 
