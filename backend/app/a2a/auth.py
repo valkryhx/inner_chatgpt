@@ -48,4 +48,6 @@ async def authenticate(authorization: Optional[str], agent_id: str,
         "agent_id": agent_id,
         "user": user,
         "token": token,
+        # 能力档位随身份一起下发：建 token 时定死，运行期不再询问任何人。
+        "tool_policy": token.get("tool_policy") or "full",
     }

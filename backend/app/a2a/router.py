@@ -1,6 +1,7 @@
 """A2A JSON-RPC endpoint, per-user AgentCard and token-management API."""
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -8,6 +9,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..auth import get_current_user
+from ..tool_policy import POLICIES, describe as describe_policy, normalize as normalize_policy
 from . import auth, cards, config, service, store, tokens
 from .errors import A2AError, internal_error, invalid_params, task_not_found
 
@@ -22,6 +24,26 @@ def _base_url(request: Request) -> str:
 def _require_enabled() -> None:
     if not config.enabled():
         raise HTTPException(status_code=404, detail="a2a_disabled")
+
+
+async def _audit(identity: dict, method: str, outcome: str, *, task_id: str = "",
+                 detail: str = "", started: float = 0.0) -> None:
+    """审计是旁路：写失败也绝不能影响 JSON-RPC 结果。"""
+    try:
+        token = identity.get("token") or {}
+        await store.record_audit(
+            user_id=identity["user_id"],
+            agent_id=identity["agent_id"],
+            token_id=str(token.get("id") or ""),
+            method=method,
+            task_id=task_id,
+            tool_policy=identity.get("tool_policy") or "",
+            outcome=outcome,
+            detail=detail,
+            latency_ms=int((time.monotonic() - started) * 1000) if started else 0,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @router.get("/.well-known/agent-card.json")
@@ -49,6 +71,7 @@ async def agent_card_at_base(agent_id: str, request: Request):
 @router.post("/a2a/{agent_id}")
 async def jsonrpc(agent_id: str, request: Request):
     _require_enabled()
+    started = time.monotonic()
     try:
         body = await request.json()
     except Exception:
@@ -69,6 +92,7 @@ async def jsonrpc(agent_id: str, request: Request):
         request.headers.get("authorization"), agent_id, params.get("tenant")
     )
     method = body["method"]
+
     if method in ("SendStreamingMessage", "SubscribeToTask"):
         try:
             if method == "SendStreamingMessage":
@@ -80,28 +104,42 @@ async def jsonrpc(agent_id: str, request: Request):
                 row = await store.get_task(identity["user_id"], agent_id, task_id)
                 if row is None:
                     raise task_not_found(task_id)
-                if row["state"] in service._TERMINAL:
-                    raise A2AError(-32004, "task is not streamable",
-                                   data={"taskId": task_id})
+                # 终态任务同样可以订阅：stream_row 会把最终 artifact + 终态
+                # status 发完后关流。服务重启被标 FAILED 的任务也能看到原因，
+                # 不再是 -32004 死路。
         except A2AError as exc:
+            await _audit(identity, method, "error", started=started,
+                         task_id=str(params.get("id") or ""),
+                         detail=f"{exc.code} {exc.message}")
             return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": exc.to_jsonrpc()},
                                 status_code=exc.http_status)
+        await _audit(identity, method, "stream", task_id=row.get("task_id", ""),
+                     started=started)
         return StreamingResponse(
             service.stream_row(row, req_id),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                      "Connection": "keep-alive"},
         )
+
     try:
         result = await service.handle_method(identity, method, params)
+        task_id = str(result.get("id") or "") if isinstance(result, dict) else ""
         if method == "SendMessage":
             result = {"task": result}
     except A2AError as exc:
+        await _audit(identity, method, "error", started=started,
+                     task_id=str(params.get("id") or ""),
+                     detail=f"{exc.code} {exc.message}")
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "error": exc.to_jsonrpc()},
                             status_code=exc.http_status)
     except Exception as exc:  # noqa: BLE001
+        await _audit(identity, method, "error", started=started,
+                     task_id=str(params.get("id") or ""),
+                     detail=f"{type(exc).__name__}: {exc}")
         return JSONResponse({"jsonrpc": "2.0", "id": req_id,
                              "error": internal_error(f"{type(exc).__name__}: {exc}").to_jsonrpc()})
+    await _audit(identity, method, "ok", task_id=task_id, started=started)
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
 
@@ -109,6 +147,7 @@ class TokenIn(BaseModel):
     name: str = ""
     scopes: list[str] = Field(default_factory=lambda: ["chat"])
     expires_in_days: Optional[int] = 90
+    tool_policy: str = "full"
 
 
 @api_router.get("/agent")
@@ -121,6 +160,7 @@ async def my_agent(request: Request, user: dict = Depends(get_current_user)):
         "url": f"{base}/a2a/{agent['agent_id']}",
         "card_url": f"{base}/a2a/{agent['agent_id']}/.well-known/agent-card.json",
         "tenant": agent["agent_id"],
+        "tool_policies": [{"id": p, "description": describe_policy(p)} for p in POLICIES],
     }
 
 
@@ -139,9 +179,14 @@ async def create_token(body: TokenIn, request: Request, user: dict = Depends(get
     unsupported = sorted(set(body.scopes or []) - {"chat"})
     if unsupported:
         raise HTTPException(status_code=400, detail=f"unsupported_scope: {', '.join(unsupported)}")
+    try:
+        level = normalize_policy(body.tool_policy)
+    except ValueError:
+        raise HTTPException(status_code=400,
+                            detail=f"unsupported_tool_policy: {body.tool_policy}")
     raw, info = await tokens.create_token(
         user["id"], name=body.name, scopes=body.scopes,
-        expires_in_days=body.expires_in_days,
+        expires_in_days=body.expires_in_days, tool_policy=level,
     )
     info = dict(info)
     info.pop("token_hash", None)

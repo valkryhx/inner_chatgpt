@@ -109,10 +109,21 @@
 - 未覆盖：Web UI E2E；DB `blocks` / 「GA 外援」卡片渲染（需完整 turn runtime + UI）；chat / SSE 层「停止后立即发送」（manager 层已证可继续）；GA 内部 subagent 事件透出；跨轮续跑（bridge `loadSession: false`）。另：`tasklist | findstr genericagent_acp_bridge` 对 GA 是假阴性，复核请按命令行过滤（见记录 §5.5）。
 - 详见 `docs/20261109-ACP-client驱动GenericAgent实施记录.md`；设计与工具契约见 `docs/20261109-ACP-client驱动GenericAgent设计与实施.md`。
 
+**P6：A2A 接入（对外调用面）—— Phase 1/2 + 生产硬化基础已完成（2026-11-10）。**
+
+- 新增 `backend/app/a2a/`：每用户身份与卡片（`store` / `cards`）、哈希 Bearer token 与三重绑定（`tokens` / `auth`）、JSON-RPC 与 SSE（`router` / `service` / `stream`）、进程内事件日志（`events`）、配置（`config`）。默认关闭，`INNER_A2A_ENABLED=true` 才暴露。
+- **权限模型是静态的、按 token 的**：`backend/app/tool_policy.py` 定义 `full` / `read_only` / `chat_only` 三档，建 token 时定死，`build_turn_runtime(..., tool_policy=)` 在装配 registry 时过滤。**不做逐次人工审批**——Hlaudz 默认 full access。
+- 并发配额（`INNER_A2A_MAX_ACTIVE_TASKS_PER_USER` / `..._GLOBAL`，超限 429 + `-32010`）与审计表 `a2a_audit`（最近 2 万行）已生效。
+- 终态任务可 `SubscribeToTask`：发 `task` → 最终 artifact → 终态 status 后关流；重启被标 `FAILED` 的任务同样可见原因。
+- 验证：`backend/tests/test_a2a_mvp.py`（13）+ `backend/tests/test_a2a_policy.py`（12），后端全量 271 passed；真实 A2A CLI v0.4.0 E2E（同步/流式/订阅/取消/幂等/配额/档位）。
+- 详见 `docs/20261110-A2A使用文档.md`、`docs/20261110-A2A-MVP实施记录.md`；协议调研见 `docs/20261109-A2A协议接入调研与设计.md`。
+
 ### 0.2 必读文档（按顺序）
 
 | 文档 | 用途 |
 |---|---|
+| `docs/20261110-A2A使用文档.md` | **A2A 使用文档（含本机实跑任务 id）**：每用户 endpoint/token、能力档位、配额、审计、流式与终态订阅 |
+| `docs/20261110-A2A-MVP实施记录.md` | **A2A 实施记录**：方法集、数据模型、安全模型、测试与真实 E2E |
 | `docs/20261109-项目现状与文档刷新.md` | **文档刷新记录（最新）**：按 `main@3b9c68f` 核对的能力快照、README/AGENTS/实现原理的修改清单、未纳入项与后续建议 |
 | `docs/20261106-AgentTeam轮次与跨轮任务恢复修复.md` | **Team 轮次/恢复修复**：subagent 默认轮数 300、`max_turns` 全链路透传、跨 generation 任务板快照恢复、主轮结束后等待 teammate、真实测试清单 |
 | `docs/20261106-AgentTeam侧栏展开状态稳定修复.md` | **Team 侧栏展开状态稳定修复**：SSE `team_event` 协议错位、展开壳与数据解耦、展开偏好持久化、真实浏览器 E2E |

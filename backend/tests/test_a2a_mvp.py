@@ -113,7 +113,7 @@ def _fake_stream(text="hello world"):
     from app.sse import sse_frame
 
     async def stream(user_id, session_id, text_in, generation_id, message_id,
-                     model_id="", stop_event=None):
+                     model_id="", stop_event=None, tool_policy="full"):
         yield sse_frame("message_start", {"message_id": message_id})
         yield sse_frame("text_delta", {"text": text})
         yield sse_frame("done", {"message_id": message_id, "status": "complete", "model": "fake"})
@@ -166,7 +166,7 @@ def _stream_fake(texts=("hello ", "world")):
     from app.sse import sse_frame
 
     async def stream(user_id, session_id, text_in, generation_id, message_id,
-                     model_id="", stop_event=None):
+                     model_id="", stop_event=None, tool_policy="full"):
         yield sse_frame("message_start", {"message_id": message_id})
         for text in texts:
             yield sse_frame("text_delta", {"text": text})
@@ -262,7 +262,7 @@ def test_cancel_task_calls_existing_stop_path(isolated_db, monkeypatch):
     seen: dict = {}
 
     async def stream(user_id, session_id, text, generation_id, message_id,
-                     model_id="", stop_event=None):
+                     model_id="", stop_event=None, tool_policy="full"):
         from app.sse import sse_frame
         yield sse_frame("message_start", {"message_id": message_id})
         await asyncio.Event().wait()

@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS a2a_tokens (
     token_hash   TEXT NOT NULL UNIQUE,
     prefix       TEXT NOT NULL DEFAULT '',
     scopes       TEXT NOT NULL DEFAULT '["chat"]',
+    tool_policy  TEXT NOT NULL DEFAULT 'full',
     created_at   INTEGER NOT NULL,
     last_used_at INTEGER,
     expires_at   INTEGER,
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS a2a_tasks (
     session_id    TEXT NOT NULL,
     message_id    TEXT NOT NULL,
     generation_id TEXT NOT NULL,
+    tool_policy   TEXT NOT NULL DEFAULT 'full',
     state         TEXT NOT NULL,
     artifacts     TEXT NOT NULL DEFAULT '[]',
     error         TEXT NOT NULL DEFAULT '',
@@ -51,6 +53,20 @@ CREATE INDEX IF NOT EXISTS idx_a2a_tasks_scope
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_message
     ON a2a_tasks(agent_id, context_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_a2a_tasks_state ON a2a_tasks(state);
+CREATE TABLE IF NOT EXISTS a2a_audit (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    user_id     TEXT NOT NULL,
+    agent_id    TEXT NOT NULL,
+    token_id    TEXT NOT NULL DEFAULT '',
+    method      TEXT NOT NULL,
+    task_id     TEXT NOT NULL DEFAULT '',
+    tool_policy TEXT NOT NULL DEFAULT '',
+    outcome     TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '',
+    latency_ms  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_a2a_audit_user ON a2a_audit(user_id, ts DESC);
 """
 
 
@@ -67,6 +83,14 @@ async def init_tables() -> None:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.executescript(_SCHEMA)
+        # 老库升级：CREATE TABLE IF NOT EXISTS 不会补列，必须显式 ALTER。
+        for table in ("a2a_tokens", "a2a_tasks"):
+            cur = await conn.execute(f"PRAGMA table_info({table})")
+            cols = {r[1] for r in await cur.fetchall()}
+            if "tool_policy" not in cols:
+                await conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN tool_policy TEXT NOT NULL DEFAULT 'full'"
+                )
         await conn.execute(
             "UPDATE a2a_tasks SET state='TASK_STATE_FAILED', error='server restart', updated_at=? "
             "WHERE state IN ('TASK_STATE_SUBMITTED','TASK_STATE_WORKING')",
@@ -137,16 +161,17 @@ async def get_agent_by_agent_id(agent_id: str) -> Optional[dict[str, Any]]:
     return _row_to_agent(row) if row else None
 
 async def create_token(*, user_id: str, agent_id: str, name: str, token_hash: str,
-                       prefix: str, scopes: list[str], expires_at: Optional[int]) -> dict[str, Any]:
+                       prefix: str, scopes: list[str], expires_at: Optional[int],
+                       tool_policy: str = "full") -> dict[str, Any]:
     tid = new_id("a2at")
     ts = now_ms()
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
         await conn.execute(
             "INSERT INTO a2a_tokens(id,user_id,agent_id,name,token_hash,prefix,scopes,"
-            "created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            "tool_policy,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (tid, user_id, agent_id, name, token_hash, prefix,
-             json.dumps(scopes, ensure_ascii=False), ts, expires_at),
+             json.dumps(scopes, ensure_ascii=False), tool_policy, ts, expires_at),
         )
         await conn.commit()
         cur = await conn.execute("SELECT * FROM a2a_tokens WHERE id=?", (tid,))
@@ -189,15 +214,16 @@ async def revoke_token(user_id: str, token_id: str) -> bool:
 
 async def create_task(*, task_id: str, context_id: str, user_id: str, agent_id: str,
                       session_id: str, message_id: str, generation_id: str,
-                      state: str = "TASK_STATE_SUBMITTED") -> dict[str, Any]:
+                      state: str = "TASK_STATE_SUBMITTED",
+                      tool_policy: str = "full") -> dict[str, Any]:
     ts = now_ms()
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
         await conn.execute(
             "INSERT INTO a2a_tasks(task_id,context_id,user_id,agent_id,session_id,message_id,"
-            "generation_id,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "generation_id,tool_policy,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (task_id, context_id, user_id, agent_id, session_id, message_id,
-             generation_id, state, ts, ts),
+             generation_id, tool_policy, state, ts, ts),
         )
         await conn.commit()
         cur = await conn.execute("SELECT * FROM a2a_tasks WHERE task_id=?", (task_id,))
@@ -282,3 +308,52 @@ async def find_task_by_message_any(agent_id: str, message_id: str) -> Optional[d
         )
         row = await cur.fetchone()
     return _row_to_task(row) if row else None
+_ACTIVE_STATES = ("TASK_STATE_SUBMITTED", "TASK_STATE_WORKING")
+AUDIT_MAX_ROWS = 20000
+
+
+async def count_active(user_id: str, exclude_task_id: str = "") -> tuple[int, int]:
+    """返回 (该用户活跃任务数, 全局活跃任务数)，供并发配额判定。"""
+    placeholders = ",".join("?" * len(_ACTIVE_STATES))
+    sql = f"SELECT COUNT(*) FROM a2a_tasks WHERE state IN ({placeholders})"
+    vals: list[Any] = list(_ACTIVE_STATES)
+    if exclude_task_id:
+        sql += " AND task_id<>?"
+        vals.append(exclude_task_id)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("PRAGMA busy_timeout=5000;")
+        cur = await conn.execute(sql, vals)
+        total = int((await cur.fetchone())[0])
+        cur = await conn.execute(sql + " AND user_id=?", vals + [user_id])
+        mine = int((await cur.fetchone())[0])
+    return mine, total
+
+
+async def record_audit(*, user_id: str, agent_id: str, method: str, outcome: str,
+                       token_id: str = "", task_id: str = "", tool_policy: str = "",
+                       detail: str = "", latency_ms: int = 0) -> None:
+    """一次 JSON-RPC 调用一行。审计失败不能影响主链路。"""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("PRAGMA busy_timeout=5000;")
+        await conn.execute(
+            "INSERT INTO a2a_audit(ts,user_id,agent_id,token_id,method,task_id,"
+            "tool_policy,outcome,detail,latency_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (now_ms(), user_id, agent_id, token_id, method, task_id, tool_policy,
+             outcome, str(detail)[:500], int(latency_ms)),
+        )
+        cur = await conn.execute("SELECT MAX(id) FROM a2a_audit")
+        max_id = int((await cur.fetchone())[0] or 0)
+        if max_id > AUDIT_MAX_ROWS:
+            await conn.execute("DELETE FROM a2a_audit WHERE id<=?", (max_id - AUDIT_MAX_ROWS,))
+        await conn.commit()
+
+
+async def list_audit(user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM a2a_audit WHERE user_id=? ORDER BY ts DESC, id DESC LIMIT ?",
+            (user_id, max(1, min(500, int(limit)))),
+        )
+        rows = await cur.fetchall()
+    return [dict(r) for r in rows]

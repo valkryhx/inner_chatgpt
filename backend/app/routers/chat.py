@@ -330,7 +330,8 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 
 async def _event_stream(user_id: str, session_id: str, text: str, generation_id: str, message_id: str,
-                        model_id: str = "", stop_event: asyncio.Event | None = None) -> AsyncIterator[str]:
+                        model_id: str = "", stop_event: asyncio.Event | None = None,
+                        tool_policy: str = "full") -> AsyncIterator[str]:
     # Register/capture the current streaming task at the very top.  The
     # prelude below can await runtime construction and compaction; registering
     # only after it would leave stop unable to cancel a request that is stuck
@@ -466,7 +467,7 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     turn = None
     team_ctx = ctx
     try:
-        turn = await build_turn_runtime(ur, ctx)
+        turn = await build_turn_runtime(ur, ctx, tool_policy=tool_policy)
         # build_turn_runtime creates the server-owned team id. All host and
         # child contexts must use that same id; never trust a tool argument.
         if getattr(turn, "team_id", ""):

@@ -170,7 +170,7 @@ def test_event_stream_builds_subagent_block(monkeypatch):
 
     hub = FakeHub()
     monkeypatch.setattr(chat, "get_hub", lambda: hub)
-    async def _fake_turn_runtime(ur, ctx):
+    async def _fake_turn_runtime(ur, ctx, tool_policy="full"):
         return FakeTurn()
 
     monkeypatch.setattr(chat, "build_turn_runtime", _fake_turn_runtime)
@@ -359,7 +359,8 @@ def test_team_event_is_forwarded_in_main_sse(monkeypatch):
 
     hub = FakeHub()
     monkeypatch.setattr(chat, "get_hub", lambda: hub)
-    monkeypatch.setattr(chat, "build_turn_runtime", lambda ur, ctx: _async(FakeTurn()))
+    monkeypatch.setattr(chat, "build_turn_runtime",
+                        lambda ur, ctx, tool_policy="full": _async(FakeTurn()))
     monkeypatch.setattr(chat, "prepare_turn_team", lambda turn, ctx: _async(None))
     monkeypatch.setattr(db, "add_message", fake_add_message)
     monkeypatch.setattr(db, "update_message", fake_update_message)

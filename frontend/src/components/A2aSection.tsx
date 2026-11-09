@@ -12,6 +12,7 @@ export default function A2aSection() {
   const [tokens, setTokens] = useState<A2AToken[]>([])
   const [name, setName] = useState('claude-code')
   const [days, setDays] = useState('90')
+  const [policy, setPolicy] = useState('full')
   const [created, setCreated] = useState<A2ATokenCreated | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -45,9 +46,15 @@ export default function A2aSection() {
     setError(null)
     setCreated(null)
     try {
-      const payload: { name?: string; scopes: string[]; expires_in_days?: number | null } = {
+      const payload: {
+        name?: string
+        scopes: string[]
+        expires_in_days?: number | null
+        tool_policy?: string
+      } = {
         name: name.trim() || 'a2a-client',
         scopes: ['chat'],
+        tool_policy: policy,
       }
       payload.expires_in_days = days.trim() === '' ? null : Math.max(1, parseInt(days, 10) || 90)
       const token = await api.createA2AToken(payload)
@@ -113,9 +120,20 @@ export default function A2aSection() {
           <span>有效期（天，空=不过期）</span>
           <input type="number" min={1} value={days} onChange={(e) => setDays(e.target.value)} />
         </label>
-        <label className="full checkbox">
-          <input type="checkbox" checked readOnly />
-          <span>MVP 默认只授予 <code>chat</code> scope；文件/工具/子 agent scope 暂不开放</span>
+        <label className="full">
+          <span>能力档位（建 token 时定死，运行期不再弹审批）</span>
+          <select value={policy} onChange={(e) => setPolicy(e.target.value)}>
+            {(agent?.tool_policies && agent.tool_policies.length > 0
+              ? agent.tool_policies
+              : [
+                  { id: 'full', description: '完整权限：内置文件/执行工具 + MCP + 子代理编排 + GA' },
+                  { id: 'read_only', description: '只读：file_read / list_files / load_skill' },
+                  { id: 'chat_only', description: '纯对话：不注入任何工具' },
+                ]
+            ).map((p) => (
+              <option key={p.id} value={p.id}>{p.id} — {p.description}</option>
+            ))}
+          </select>
         </label>
       </div>
 
@@ -151,7 +169,8 @@ export default function A2aSection() {
                 <b>{t.name || '(unnamed)'}</b>
                 {revoked && <span className="tag">已撤销</span>}
                 <div className="cfg-meta">
-                  {t.prefix}… · scopes: {(t.scopes || []).join(', ') || '—'} · 创建 {fmt(t.created_at)}
+                  {t.prefix}… · scopes: {(t.scopes || []).join(', ') || '—'}
+                  {' · '}能力 {t.tool_policy || 'full'} · 创建 {fmt(t.created_at)}
                   {' · '}最近使用 {fmt(t.last_used_at)}
                   {t.expires_at ? ` · 过期 ${fmt(t.expires_at)}` : ' · 不过期'}
                 </div>

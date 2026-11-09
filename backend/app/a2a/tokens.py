@@ -6,6 +6,7 @@ import secrets
 import time
 from typing import Any, Optional
 
+from ..tool_policy import normalize as normalize_policy
 from . import store
 
 PREFIX = "hlz_a2a_"
@@ -20,7 +21,10 @@ def generate_token() -> str:
 
 
 async def create_token(user_id: str, name: str = "", scopes: Optional[list[str]] = None,
-                       expires_in_days: Optional[int] = 90) -> tuple[str, dict[str, Any]]:
+                       expires_in_days: Optional[int] = 90,
+                       tool_policy: str = "full") -> tuple[str, dict[str, Any]]:
+    # 未知档位在这里就报错，绝不把脏值写进库后靠运行期兜底。
+    level = normalize_policy(tool_policy)
     agent = await store.ensure_agent(user_id)
     raw = generate_token()
     expires_at = None
@@ -34,5 +38,6 @@ async def create_token(user_id: str, name: str = "", scopes: Optional[list[str]]
         prefix=raw[:12],
         scopes=scopes or ["chat"],
         expires_at=expires_at,
+        tool_policy=level,
     )
     return raw, info

@@ -320,6 +320,8 @@ export interface A2AAgentInfo {
   url: string
   card_url: string
   tenant: string
+  /** full / read_only / chat_only，附人话说明 */
+  tool_policies?: { id: string; description: string }[]
 }
 
 export interface A2AToken {
@@ -329,6 +331,8 @@ export interface A2AToken {
   name: string
   prefix: string
   scopes: string[]
+  /** 建 token 时定死的能力档位，运行期不再询问 */
+  tool_policy?: string
   created_at: number
   last_used_at?: number | null
   expires_at?: number | null

@@ -11,6 +11,7 @@ from .. import db, team_store
 from ..routers import chat
 from ..runtime import release_generation_reservation, reserve_generation
 from ..schemas import StopIn
+from ..tool_policy import normalize as normalize_policy
 from . import config, events, store, stream
 from .errors import A2AError, invalid_params, task_not_cancelable, task_not_found
 
@@ -106,7 +107,8 @@ async def _resolve_session(identity: dict[str, Any], message: dict[str, Any], te
     return sess["id"]
 
 
-async def _run_task(row: dict[str, Any], text: str, model_id: str) -> None:
+async def _run_task(row: dict[str, Any], text: str, model_id: str,
+                    tool_policy: str = "full") -> None:
     task_id = row["task_id"]
     started = False
     text_parts: list[str] = []
@@ -127,7 +129,7 @@ async def _run_task(row: dict[str, Any], text: str, model_id: str) -> None:
         events.publish(task_id, {"type": "status", "state": "TASK_STATE_WORKING"})
         async for raw in chat._event_stream(
             row["user_id"], row["session_id"], text, row["generation_id"],
-            row["message_id"], model_id,
+            row["message_id"], model_id, tool_policy=tool_policy,
         ):
             event, payload = _parse_frame(raw)
             if event == "text_delta":
@@ -187,8 +189,9 @@ async def _run_task(row: dict[str, Any], text: str, model_id: str) -> None:
                                  "error": error_text, "content": content})
 
 
-def _spawn(row: dict[str, Any], text: str, model_id: str) -> asyncio.Task:
-    task = asyncio.create_task(_run_task(row, text, model_id))
+def _spawn(row: dict[str, Any], text: str, model_id: str,
+           tool_policy: str = "full") -> asyncio.Task:
+    task = asyncio.create_task(_run_task(row, text, model_id, tool_policy))
     _BACKGROUND_TASKS.add(task)
     _TASK_HANDLES[row["task_id"]] = task
 
@@ -201,6 +204,19 @@ def _spawn(row: dict[str, Any], text: str, model_id: str) -> asyncio.Task:
     return task
 
 
+async def _enforce_quota(identity: dict[str, Any]) -> None:
+    """并发配额：只拦新建任务，幂等重放不受影响。"""
+    mine, total = await store.count_active(identity["user_id"])
+    limit_user = config.max_active_per_user()
+    if mine >= limit_user:
+        raise A2AError(-32010, "too many active tasks for this agent",
+                       http_status=429, data={"active": mine, "limit": limit_user})
+    limit_global = config.max_active_global()
+    if total >= limit_global:
+        raise A2AError(-32010, "too many active tasks on this server",
+                       http_status=429, data={"active": total, "limit": limit_global})
+
+
 async def _prepare_task(identity: dict[str, Any], params: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     message, text = _extract_text(params)
     message_id = str(message.get("messageId") or store.new_id("amsg"))
@@ -210,16 +226,21 @@ async def _prepare_task(identity: dict[str, Any], params: dict[str, Any]) -> tup
         existing = await store.find_task_by_message_any(identity["agent_id"], message_id)
         if existing:
             return existing, True
-    session_id = await _resolve_session(identity, message, text)
+    session_id = ""
     if message.get("contextId"):
+        session_id = await _resolve_session(identity, message, text)
         existing = await store.find_task_by_message(identity["agent_id"], session_id, message_id)
         if existing:
             return existing, True
+    await _enforce_quota(identity)
+    if not session_id:
+        session_id = await _resolve_session(identity, message, text)
 
     sess = await db.get_session(session_id, identity["user_id"])
     model_id = (sess or {}).get("model_id", "") or ""
     task_id = store.new_id("task")
     generation_id = store.new_id("g_a2a")
+    level = normalize_policy(identity.get("tool_policy"))
     row = await store.create_task(
         task_id=task_id,
         context_id=session_id,
@@ -228,8 +249,9 @@ async def _prepare_task(identity: dict[str, Any], params: dict[str, Any]) -> tup
         session_id=session_id,
         message_id=message_id,
         generation_id=generation_id,
+        tool_policy=level,
     )
-    _spawn(row, text, model_id)
+    _spawn(row, text, model_id, level)
     return row, False
 
 

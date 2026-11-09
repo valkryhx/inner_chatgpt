@@ -210,7 +210,12 @@ export const api = {
   // ---------------- A2A per-user access ----------------
   getA2AAgent: () => request<A2AAgentInfo>('/a2a/agent'),
   listA2ATokens: () => request<{ tokens: A2AToken[] }>('/a2a/tokens'),
-  createA2AToken: (body: { name?: string; scopes?: string[]; expires_in_days?: number | null }) =>
+  createA2AToken: (body: {
+    name?: string
+    scopes?: string[]
+    expires_in_days?: number | null
+    tool_policy?: string
+  }) =>
     request<A2ATokenCreated>('/a2a/tokens', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
