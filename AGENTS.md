@@ -83,14 +83,28 @@
 - 停止链路加固：`/stop` 同时 set event + cancel task + 级联子代理/code_run；发送/读路径自动收敛无 live task 的陈旧租约；前端本地优先停止。详见 `docs/20261106-Agent停止卡死与陈旧租约自愈.md`。
 - Windows `--reload` 下 `code_run` 的 SelectorEventLoop 子进程兼容层。
 
-**P4（下一步）：** 计划模式 → goal → hooks。浏览器控制暂不做。
+**P3 后续补强 —— 已完成（2026-11-06）：**
+
+- **任意格式文件下载**：`/api/me/workspace-file`、`/workspace-files`、`/workspace-zip` 三端点；
+  前端 `FileChip` / `WorkspacePanel` / 工具步骤下载三入口；Office 生成依赖内置；
+  154 项单测 + 16 项真实 E2E。详见 `docs/20261106-任意格式文件下载实施记录.md`。
+- **Web 自测 14 项 Bug 修复**：子代理角色、Team 配额泄漏、压缩不变量、前端可见性等逐条修复；
+  详见 `docs/20261106-Web自测Bug修复记录.md`。
+- **停止/续任务加固**：协作旗 + `task.cancel` + 子代理/`code_run` 级联；陈旧 generation 租约自愈；
+  停止后继续发送、图片滚动、首帧可见等前端修复。
+- **文档刷新（2026-11-09）**：按 `main@3b9c68f` 重写 `README.md`，补全 `docs/20261106-项目功能实现原理.md`
+  的 Team / 文件下载 / 配额 / 进程守卫章节。详见 `docs/20261109-项目现状与文档刷新.md`。
+
+**P4（下一步，未开始）：** 计划模式 → goal → hooks。浏览器控制暂不做。
 路线图见 `docs/20261105-去LangChain依赖-决策记录.md`。
+开工前先按 0.3 的文档约定新建设计文档，再动代码；不得把未实现项写进 README / 本文件的能力描述。
 
 ### 0.2 必读文档（按顺序）
 
 | 文档 | 用途 |
 |---|---|
-| `docs/20261106-AgentTeam轮次与跨轮任务恢复修复.md` | **Team 轮次/恢复修复（最新）**：subagent 默认轮数 300、`max_turns` 全链路透传、跨 generation 任务板快照恢复、主轮结束后等待 teammate、真实测试清单 |
+| `docs/20261109-项目现状与文档刷新.md` | **文档刷新记录（最新）**：按 `main@3b9c68f` 核对的能力快照、README/AGENTS/实现原理的修改清单、未纳入项与后续建议 |
+| `docs/20261106-AgentTeam轮次与跨轮任务恢复修复.md` | **Team 轮次/恢复修复**：subagent 默认轮数 300、`max_turns` 全链路透传、跨 generation 任务板快照恢复、主轮结束后等待 teammate、真实测试清单 |
 | `docs/20261106-AgentTeam侧栏展开状态稳定修复.md` | **Team 侧栏展开状态稳定修复**：SSE `team_event` 协议错位、展开壳与数据解耦、展开偏好持久化、真实浏览器 E2E |
 | `docs/20261106-Agent停止卡死与陈旧租约自愈.md` | **停止可靠性（最新）**：协作停 + task.cancel + 资源级联三层停止、进程内 generation registry、reservation TTL、陈旧 active 租约自愈、前端本地优先停止、真实 LLM E2E |
 | `docs/20261106-changelog-AgentTeamP3.md` | **P3 已完成清单 + 真实 E2E 验收（最新，先读这份）** |
@@ -110,7 +124,12 @@
 | `docs/20261105-changelog-侧栏身份区与设置弹窗.md` | **侧栏身份区重做 + 设置弹窗定高**：全名替字母头像、整行可点进设置、登出降级为次要动作；modal 固定高度，切 tab 不跳尺寸 |
 | `docs/20261105-Skill目录包导入与公用技能设计与实施.md` | **Skill 目录包导入 + 公用技能层**：三层模型 builtin/shared/user、zip 安全解压（穿越/软链/炸弹防护）、`backend/skills_shared/` 公用目录、已导入 2 个 Codex 技能 |
 | `docs/20261105-Subagent调研与设计方案.md` | **P2 设计文档（已实施）**：GA 进程树 vs Aivory 子任务 的调研对比、进程内 asyncio subagent 架构、`AgentContext` 多租户贯穿、5 个编排工具契约、停止/超时/失败语义、前端 subagent block、6 阶段实施蓝本与测试计划 |
-| `docs/20261106-Web自测Bug修复记录.md` | **Web 自测 14 项 Bug 修复记录（最新）**：子代理角色/Team 配额泄漏/压缩不变量/前端可见性逐条根因、改动文件、真实环境复验命令 |
+| `docs/20261106-Web自测Bug修复记录.md` | **Web 自测 14 项 Bug 修复记录**：子代理角色/Team 配额泄漏/压缩不变量/前端可见性逐条根因、改动文件、真实环境复验命令 |
+| `docs/20261106-Web自测Bug清单.md` | **Web 自测 Bug 清单（原始）**：14 项问题的复现步骤、现象与影响面，配合修复记录阅读 |
+| `docs/20261106-停止后继续发送白屏修复.md` | 停止后继续发送白屏的根因与修复 |
+| `docs/20261106-图片消息滚动跟随修复.md` | 图片渲染后自动滚动跟随修复 |
+| `docs/20261106-主Agent轮数上限提升至300.md` | 主 Agent 轮数上限从默认值提升到 300 的说明 |
+| `docs/20261106-发送首帧可见与执行尾注.md` | 发送后首帧可见与执行尾注展示 |
 | `docs/20261106-Web自测Bug修复-测试方案.md` | **修复验收测试方案**：pytest / API / Playwright 三层用例矩阵、一键运行（`work/claude_test_and_review/_fix_verify_all.py`）、验收标准与已知限制 |
 | `docs/20261106-任意格式文件下载实施记录.md` | **任意格式文件下载（最新，已实施）**：`workspace-file/-files/-zip` 三端点、FileChip/WorkspacePanel/步骤下载、Office 依赖、154 项单测 + 16 项真实 E2E 证据 |
 | `docs/20261106-任意格式文件下载设计方案.md` | **任意格式文件下载设计**：workspace 通用下载端点、目录列表与打包、Markdown/工具步骤/文件面板三入口、安全边界与 P1–P5 实施测试计划 |
