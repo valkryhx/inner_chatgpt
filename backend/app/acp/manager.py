@@ -14,6 +14,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import logging
+import subprocess
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -29,10 +32,19 @@ from .config import AcpSettings, build_child_env
 from .session import GaSession
 from .transport import kill_tree_now
 
-__all__ = ["AcpLimitError", "AcpSessionManager"]
+__all__ = ["AcpLimitError", "AcpSessionManager", "AcpUnavailableError"]
+
+logger = logging.getLogger(__name__)
 
 # 拿并发名额最多等这么久（spec §9.3：第 5 个 ga_spawn 等 2s 后报并发上限）。
 _QUOTA_WAIT_S = 2.0
+
+# 预检子进程最多等这么久：只做一次 import，正常是百毫秒级。
+_PREFLIGHT_TIMEOUT_S = 15
+
+# 预检结果按命令行缓存（跨 manager 实例复用：每轮都会新建一个 manager）。
+# 只缓存成功结果，失败每次重试——装好依赖后无需重启进程。
+_PREFLIGHT_CACHE: dict[tuple[str, ...], str] = {}
 
 # ga_stop：先发 session/cancel，最多等这么久；仍未返回就硬杀进程树（spec §9.4）。
 _STOP_GRACE_S = 2.0
@@ -51,6 +63,10 @@ _SPAWN_NOTE = "用 ga_wait / ga_result 收结果；本轮结束会停止未完�
 
 class AcpLimitError(RuntimeError):
     """打开会话数超过单用户上限（spec §9.3 的第二道闸）。"""
+
+
+class AcpUnavailableError(RuntimeError):
+    """GA 的 ACP bridge 不可用（预检没 import 到模块 / 自定义命令起不来）。"""
 
 
 @dataclass
@@ -103,6 +119,69 @@ class AcpSessionManager:
             for entry in self._entries.values()
         )
 
+    # ---------------------------------------------------------------- 预检
+
+    def preflight(self) -> str | None:
+        """检查 GA 的 ACP bridge 能否 import；返回 bridge 文件路径。
+
+        **同步**方法：只跑一次解释器 import，正常是百毫秒级，失败也在 15s 内返回。
+
+        - 自定义命令（不含 ``-m``）没有可探测的模块名 → 返回 ``None``，把问题留给
+          真正启动时的可读错误；
+        - ``<python> -m <module>`` 形式 → 用**同一个解释器**跑
+          ``import <module> as b; print(b.__file__)``，这样「没装 / 装错 Python /
+          依赖缺失」在 spawn 之前就能判出来（spec §9.5：绝不注入半成品会话）。
+
+        成功结果按 ``tuple(command)`` 缓存并复用（每轮都会新建 manager，缓存放模块级）；
+        失败**不**缓存——装好依赖后无需重启进程。
+        """
+        command = list(self.settings.command)
+        if "-m" not in command:
+            return None
+        index = command.index("-m")
+        if index + 1 >= len(command):
+            # 命令本身残缺（``-m`` 后面没模块名）：交给启动路径报错，预检不猜。
+            return None
+        module = command[index + 1]
+
+        key = tuple(command)
+        cached = _PREFLIGHT_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+        # 子进程环境与 GA 会话一致（白名单），并强制 UTF-8 输出：
+        # 中文用户名下的安装路径在 GBK 控制台里会被解成乱码。
+        env = build_child_env(self.settings)
+        env["PYTHONIOENCODING"] = "utf-8"
+        try:
+            proc = subprocess.run(
+                [command[0], "-c", f"import {module} as b; print(b.__file__)"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_PREFLIGHT_TIMEOUT_S,
+                env=env,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise AcpUnavailableError(
+                f"GenericAgent ACP bridge 不可用: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        path = (proc.stdout or "").strip()
+        if proc.returncode != 0 or not path:
+            detail = (proc.stderr or "").strip()[-800:] or "无输出"
+            raise AcpUnavailableError(f"GenericAgent ACP bridge 不可用: {detail}")
+
+        try:
+            digest = _sha256_of(path)
+        except OSError as exc:  # 路径解不出来 / 不可读：可用性不受影响，只丢摘要
+            logger.warning("ACP 预检：无法计算 bridge 摘要（%s）：%s", path, exc)
+        else:
+            logger.info("ACP 预检通过：%s sha256=%s", path, digest)
+        _PREFLIGHT_CACHE[key] = path
+        return path
+
     # ---------------------------------------------------------------- 派活
 
     async def spawn(
@@ -114,6 +193,7 @@ class AcpSessionManager:
         timeout_s: float = 0.0,
     ) -> dict[str, Any]:
         """建会话 + 后台发一次 prompt，**立刻返回**（不阻塞主对话）。"""
+        self.preflight()
         text = (task or "").strip()
         if not text:
             raise ValueError("task 不能为空")
@@ -437,6 +517,15 @@ class AcpSessionManager:
 
 
 # --------------------------------------------------------------- 小工具
+
+
+def _sha256_of(path: str) -> str:
+    """算文件摘要（分块读，避免把大文件整读进内存）。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 async def _quietly(coro: Any) -> None:
