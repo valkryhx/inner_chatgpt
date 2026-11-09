@@ -23,7 +23,14 @@ from typing import Any
 
 from .client import AcpBusyError, AcpClient, AcpError
 from .config import AcpSettings
-from .transport import AcpProcess, AcpTransportClosed, AsyncProcHandle
+from .transport import (
+    STDERR_TAIL_LINES,
+    AcpProcess,
+    AcpTransportClosed,
+    AsyncProcHandle,
+    kill_tree_now,
+    stderr_suffix,
+)
 
 __all__ = ["GaSession", "PromptResult"]
 
@@ -35,6 +42,16 @@ _TEXT_LIMIT = 400
 
 # 停一条已死进程时的兜底等待，不能把停止路径挂死。
 _CANCEL_TIMEOUT_S = 5.0
+
+# prompt 超时后的收场宽限（spec §9.3 / §13.1：cancel → 2s → 杀进程）。
+_STOP_GRACE_S = 2.0
+
+# 宽限期内轮询进程是否已退出的间隔。
+_STOP_POLL_S = 0.05
+
+# 进程刚崩时 stderr 读线程可能还差最后几行：错误路径上最多等这么久（10×20ms）。
+_STDERR_SETTLE_TRIES = 10
+_STDERR_SETTLE_SLEEP_S = 0.02
 
 # prompt 结果里代表“被取消”的 stopReason。
 _CANCELLED_STOP_REASONS = frozenset({"cancelled", "canceled"})
@@ -153,8 +170,12 @@ class GaSession:
         self.status = "running"
 
     async def stop(self) -> None:
-        """发 ``session/cancel`` 并把状态标成 stopped；死进程不报错。"""
-        if self._stop_requested:
+        """发 ``session/cancel`` 并把状态标成 stopped；死进程不报错。
+
+        已经进入终态的会话是 no-op：一次晚到的 ``ga_stop`` / ``ga_result close=true``
+        不能把 ``completed`` 降级成 ``stopped``（spec §9.2：终态只允许进入一次）。
+        """
+        if self._stop_requested or self.status in _TERMINAL_STATUSES:
             return
         self._stop_requested = True
         self.status = "stopped"
@@ -234,24 +255,22 @@ class GaSession:
                 self.error = f"timeout: 超过 {timeout_s:g}s"
                 stop_reason = "timeout"
                 self.status = "stopped"
-                await self._cancel_quietly()
+                # spec §9.3 / §13.1：cancel → 2s 宽限 → 仍未退出就硬杀进程树。
+                await self._cancel_then_kill()
             except AcpTransportClosed as exc:
                 if self._stop_requested:
                     # 用户停止 / 关管道导致的正常收尾，不是故障（spec §6.6 / §9.4）。
                     self.status = "stopped"
                 else:
-                    self.error = f"{type(exc).__name__}: {exc}"
-                    self.status = "errored"
+                    await self._fail(f"{type(exc).__name__}: {exc}")
             except AcpError as exc:
-                self.error = f"{type(exc).__name__}: {exc}"
-                self.status = "errored"
+                await self._fail(f"{type(exc).__name__}: {exc}")
             except asyncio.CancelledError:
                 self.error = self.error or "cancelled"
                 self.status = "stopped"
                 raise
             except Exception as exc:  # noqa: BLE001 - 任何异常都必须收敛成终态
-                self.error = f"{type(exc).__name__}: {exc}"
-                self.status = "errored"
+                await self._fail(f"{type(exc).__name__}: {exc}")
 
             self._finish_prompt()
             return PromptResult(
@@ -285,6 +304,13 @@ class GaSession:
             "error": self.error,
             "last_seq": self._seq,
         }
+
+    def stderr_tail(self, n: int = 20) -> list[str]:
+        """底层进程 stderr 环形缓冲的最后 ``n`` 行（spec §9.5 / §11.3）。"""
+        process = self._process
+        if process is None:
+            return []
+        return process.stderr_tail(n)
 
     def tail(self, since_seq: int, limit: int = 8) -> list[dict[str, Any]]:
         """取 ``seq > since_seq`` 的最近 ``limit`` 条事件日志。"""
@@ -469,6 +495,59 @@ class GaSession:
         if text:
             entry["text"] = text[:_TEXT_LIMIT]
         self._event_log.append(entry)
+
+    async def _fail(self, text: str) -> None:
+        """进入 ``errored``：错误文本补上 stderr 末 20 行（spec §9.5 / §11.3）。"""
+        self.error = await self._with_stderr_tail(text)
+        self.status = "errored"
+
+    async def _with_stderr_tail(self, text: str) -> str:
+        tail = self.stderr_tail(STDERR_TAIL_LINES)
+        if not tail and self._process_exited():
+            # 进程带着最后几行 stderr 崩掉时，读线程可能还没把它们写进环形缓冲。
+            for _ in range(_STDERR_SETTLE_TRIES):
+                await asyncio.sleep(_STDERR_SETTLE_SLEEP_S)
+                tail = self.stderr_tail(STDERR_TAIL_LINES)
+                if tail:
+                    break
+        return text + stderr_suffix(tail)
+
+    def _process_exited(self) -> bool:
+        handle = self.process_handle
+        if handle is None:
+            return False
+        try:
+            return handle.poll() is not None
+        except OSError:
+            return True
+
+    async def _cancel_then_kill(self) -> None:
+        """超时收场：cancel → 宽限 ``_STOP_GRACE_S`` → 仍未退出就硬杀进程树。
+
+        同步的 :func:`kill_tree_now` 含收尸轮询，必须丢进线程里跑，不能占住事件循环。
+        """
+        await self._cancel_quietly()
+        handle = self.process_handle
+        if handle is None:
+            return
+        if await self._wait_exit(handle, _STOP_GRACE_S):
+            return
+        await asyncio.to_thread(kill_tree_now, handle)
+
+    @staticmethod
+    async def _wait_exit(handle: AsyncProcHandle, timeout_s: float) -> bool:
+        """在事件循环上轮询 ``poll()``（不额外占线程等 ``wait()``）。"""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(timeout_s))
+        while True:
+            try:
+                if handle.poll() is not None:
+                    return True
+            except OSError:
+                return True
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(_STOP_POLL_S)
 
     async def _cancel_quietly(self) -> None:
         client, session_id = self._client, self._session_id

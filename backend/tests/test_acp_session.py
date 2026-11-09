@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from app.acp.config import load_acp_settings
@@ -99,6 +100,29 @@ def test_stop_marks_stopped():
     assert run(scenario()) == ("stopped", "stopped")
 
 
+def test_timeout_kills_process_when_cancel_is_ignored():
+    """spec §9.3 / §13.1：cancel 后 2s 仍未收敛就必须硬杀进程树。"""
+
+    async def scenario():
+        events = []
+        s = make("ignore_cancel", events)
+        await s.start()
+        try:
+            r = await s.prompt("hi", prompt_seq=1, timeout_s=0.3)
+            handle = s.process_handle
+            deadline = time.monotonic() + 10
+            while handle.returncode is None and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+            return r, s.status, handle.returncode
+        finally:
+            await s.close()
+
+    r, status, returncode = run(scenario())
+    assert r.status == "stopped"
+    assert status == "stopped"
+    assert returncode is not None
+
+
 def test_process_death_marks_errored():
     async def scenario():
         events = []
@@ -140,6 +164,28 @@ def test_protocol_error_marks_errored():
     ends = [e for e in events if e["type"] == "subagent_end"]
     assert len(ends) == 1
     assert ends[0]["status"] == "errored"
+
+
+def test_stderr_crash_error_carries_the_stderr_tail():
+    """spec §9.5 / §11.3：进程带着 stderr 崩掉时，错误里要有最后几行。"""
+
+    async def scenario():
+        events = []
+        s = make("stderr_crash", events)
+        await s.start()
+        try:
+            r = await s.prompt("boom", prompt_seq=1, timeout_s=10)
+            return r, s.snapshot(), events
+        finally:
+            await s.close()
+
+    r, snap, events = run(scenario())
+    assert r.status == "errored"
+    assert "[FAKE-GA-STDERR-CRASH-MARKER]" in r.error
+    assert "[FAKE-GA-STDERR-CRASH-MARKER]" in snap["error"]
+    ends = [e for e in events if e["type"] == "subagent_end"]
+    assert len(ends) == 1
+    assert "[FAKE-GA-STDERR-CRASH-MARKER]" in ends[0]["error"]
 
 
 def test_timeout_cancels_ga_and_marks_stopped(tmp_path):

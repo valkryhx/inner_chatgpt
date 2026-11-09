@@ -25,8 +25,11 @@ __all__ = [
     "AcpTransportClosed",
     "AsyncProcHandle",
     "AcpProcess",
+    "STDERR_TAIL_CHARS",
+    "STDERR_TAIL_LINES",
     "decode_line",
     "kill_tree_now",
+    "stderr_suffix",
 ]
 
 # Windows 上不要给子进程弹控制台窗口。
@@ -43,6 +46,10 @@ _SYNC_KILL_REAP_S = 2.0
 
 # 同步杀树的回收轮询间隔。
 _SYNC_KILL_POLL_S = 0.02
+
+# 报错时回显 stderr 的尾部规模（spec §9.5 / §11.3：最近 20 行、约 2KB）。
+STDERR_TAIL_LINES = 20
+STDERR_TAIL_CHARS = 2048
 
 
 class AcpTransportClosed(RuntimeError):
@@ -113,7 +120,7 @@ class AsyncProcHandle:
         return await asyncio.to_thread(self._proc.wait)
 
 
-def kill_tree_now(handle: AsyncProcHandle | None) -> None:
+def kill_tree_now(handle: AsyncProcHandle | None, wait_s: float | None = None) -> None:
     """Synchronous best-effort kill used from cancel-safe cleanup paths.
 
     用户点停止 / 本轮结束这类路径不允许 ``await``，只能在这里同步杀：
@@ -121,10 +128,14 @@ def kill_tree_now(handle: AsyncProcHandle | None) -> None:
     - Windows 用 ``taskkill /T /F`` 杀整棵树（GA 会再拉起子进程）；
     - POSIX 用 ``killpg``，拿不到进程组时退回 ``kill()``。
 
-    杀完必须轮询到 ``Popen`` 真正回收：``subprocess`` 不会自己更新
+    杀完默认必须轮询到 ``Popen`` 真正回收：``subprocess`` 不会自己更新
     ``returncode``，只有 ``poll()`` / ``wait()`` 会。不轮询的话调用方看到的
     ``returncode`` 永远是 ``None``，既判断不了“停掉了”，也留着僵尸进程。
     等待上限 ``_SYNC_KILL_REAP_S``，正常情况下 taskkill 返回时进程已被回收。
+
+    ``wait_s`` 覆盖收尸等待（``0.0`` = 只把 kill 发出去、立刻返回）：
+    批量停多条会话时，逐条各等 2s 会让同步清理路径卡上 ``2N`` 秒，
+    调用方应传一个小值再共享一个收尸窗口。
     """
     if handle is None or handle.returncode is not None:
         return
@@ -140,9 +151,20 @@ def kill_tree_now(handle: AsyncProcHandle | None) -> None:
             os.killpg(os.getpgid(handle.pid), 9)
         except OSError:
             handle.kill()
-    deadline = time.monotonic() + _SYNC_KILL_REAP_S
+    reap_s = _SYNC_KILL_REAP_S if wait_s is None else max(0.0, float(wait_s))
+    deadline = time.monotonic() + reap_s
     while handle.poll() is None and time.monotonic() < deadline:
         time.sleep(_SYNC_KILL_POLL_S)
+
+
+def stderr_suffix(lines: Sequence[str], header: str = "GA stderr") -> str:
+    """把 stderr 尾部拼成可直接追加到错误文本后的片段（空列表 → 空串）。"""
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    if len(body) > STDERR_TAIL_CHARS:
+        body = body[-STDERR_TAIL_CHARS:]
+    return f"\n{header}（末 {len(lines)} 行）：\n{body}"
 
 
 class AcpProcess:

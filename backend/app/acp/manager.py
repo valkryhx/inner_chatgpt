@@ -31,7 +31,7 @@ from ..subagent.context import AgentContext
 from ..subagent.events import EventBuffer
 from .config import AcpSettings, build_child_env
 from .session import GaSession
-from .transport import kill_tree_now
+from .transport import STDERR_TAIL_LINES, kill_tree_now, stderr_suffix
 
 __all__ = [
     "AcpLimitError",
@@ -73,6 +73,14 @@ _STOP_GRACE_S = 2.0
 
 # 硬杀之后再给在途 prompt 一点时间收敛成终态（进程已死，它只会立刻失败）。
 _KILL_SETTLE_S = 2.0
+
+# stop_all_now 的共享收尸窗口：所有会话共用一个上限，而不是每条各等 2s。
+_STOP_ALL_NOW_REAP_S = 1.0
+_STOP_ALL_NOW_POLL_S = 0.02
+
+# spawn 失败时等 stderr 读线程把最后几行写完的上限（10×20ms）。
+_STDERR_SETTLE_TRIES = 10
+_STDERR_SETTLE_SLEEP_S = 0.02
 
 # ga_wait 的 result_preview 长度。
 _PREVIEW_CHARS = 400
@@ -301,8 +309,10 @@ class AcpSessionManager:
                 # CancelledError / KeyboardInterrupt / SystemExit 原样上抛。
                 raise
             # bridge 起不来时给一个可读错误，绝不注入半成品会话（spec §9.5）。
+            stderr_tail = await _stderr_tail_settled(session)
             raise RuntimeError(
                 f"启动 GenericAgent 失败：{type(exc).__name__}: {exc}"
+                + stderr_suffix(stderr_tail)
             ) from exc
 
         entry = _Entry(
@@ -404,10 +414,15 @@ class AcpSessionManager:
                 "需要全文请传 full=true 或调大 max_chars"
             )
         if close:
+            # 关会话会把仍在跑的 prompt 收敛成终态；但已有的终态（例如正常
+            # completed）不能被关闭动作降级成 stopped（spec §9.2：终态只进一次）。
+            status_before = payload["status"]
             await self._close_session(agent_id)
             payload["closed"] = True
-            # 关会话会把仍在跑的 prompt 收敛成终态，状态以关完之后的为准。
-            payload["status"] = entry.session.snapshot()["status"]
+            if status_before in _TERMINAL_STATUSES:
+                payload["status"] = status_before
+            else:
+                payload["status"] = entry.session.snapshot()["status"]
         return payload
 
     # ---------------------------------------------------------------- 停止
@@ -438,11 +453,28 @@ class AcpSessionManager:
         不能 ``await session.stop()``，所以用 ``GaSession.mark_stopped()``：
         它同步置上 stop-requested，让在途 prompt 因管道关闭失败时收敛成
         ``stopped`` 而不是 ``errored``（spec §9.4：用户停止 = stopped）。
+
+        同步路径只要求「kill 已经发出去」：逐条各等 2s 收尸会让 N 条会话卡住
+        ``2N`` 秒并冻住事件循环，所以这里以 ``wait_s=0.0`` 发完全部 kill，
+        再共享一个很短的收尸窗口；真正的硬杀兜底是 ``ProcessLease``。
         """
-        for entry in list(self._entries.values()):
-            session = entry.session
-            session.mark_stopped()
-            kill_tree_now(session.process_handle)
+        entries = list(self._entries.values())
+        for entry in entries:
+            entry.session.mark_stopped()
+        handles = [
+            handle
+            for handle in (entry.session.process_handle for entry in entries)
+            if _pollable(handle)
+        ]
+        if not handles:
+            return
+        for handle in handles:
+            kill_tree_now(handle, wait_s=0.0)
+        deadline = time.monotonic() + _STOP_ALL_NOW_REAP_S
+        while time.monotonic() < deadline:
+            if all(_has_exited(handle) for handle in handles):
+                return
+            time.sleep(_STOP_ALL_NOW_POLL_S)
 
     async def close_all(self) -> None:
         """本轮结束的收尾：停掉 → 关传输 → 交还租约 → 清表。"""
@@ -578,6 +610,31 @@ class AcpSessionManager:
 
 
 # --------------------------------------------------------------- 小工具
+
+
+async def _stderr_tail_settled(session: GaSession | None) -> list[str]:
+    """取 stderr 末几行；进程刚退出时读线程可能还差最后几行，给它一点时间。"""
+    if session is None:
+        return []
+    lines = session.stderr_tail(STDERR_TAIL_LINES)
+    for _ in range(_STDERR_SETTLE_TRIES):
+        if lines:
+            break
+        await asyncio.sleep(_STDERR_SETTLE_SLEEP_S)
+        lines = session.stderr_tail(STDERR_TAIL_LINES)
+    return lines
+
+
+def _pollable(handle: Any) -> bool:
+    """同步清理路径只处理能 ``poll()`` 的句柄（测试替身可能没有）。"""
+    return handle is not None and callable(getattr(handle, "poll", None))
+
+
+def _has_exited(handle: Any) -> bool:
+    try:
+        return handle.poll() is not None
+    except OSError:
+        return True
 
 
 def _sha256_of(path: str) -> str:

@@ -58,6 +58,47 @@ def test_spawn_and_wait_completes(monkeypatch):
     assert active is False
 
 
+def test_result_close_keeps_completed_status(monkeypatch):
+    """ga_result(close=true) 不能把正常完成的会话降级成 stopped（终态只进一次）。"""
+    monkeypatch.setenv("FAKE_GA_MODE", "chunks")
+
+    async def scenario():
+        mgr, _ = make()
+        try:
+            aid = (await mgr.spawn(task="say hi"))["agent_id"]
+            await mgr.wait(aid, timeout_s=10)
+            return await mgr.result(aid, close=True)
+        finally:
+            await mgr.close_all()
+
+    r = run(scenario())
+    assert r["closed"] is True
+    assert r["status"] == "completed"
+    assert r["result"] == "hello world"
+
+
+def test_ga_stop_on_completed_session_keeps_completed(monkeypatch):
+    """已完成会话再 ga_stop 仍是 completed：stop() 对终态必须是 no-op。"""
+    monkeypatch.setenv("FAKE_GA_MODE", "chunks")
+
+    async def scenario():
+        mgr, _ = make()
+        try:
+            aid = (await mgr.spawn(task="say hi"))["agent_id"]
+            await mgr.wait(aid, timeout_s=10)
+            before = await mgr.result(aid)
+            await mgr.stop(aid)
+            after = await mgr.result(aid)
+            return before, after
+        finally:
+            await mgr.close_all()
+
+    before, after = run(scenario())
+    assert before["status"] == "completed"
+    assert after["status"] == "completed"
+    assert after["result"] == before["result"] == "hello world"
+
+
 def test_timeout_reports_stop_reason(monkeypatch):
     monkeypatch.setenv("FAKE_GA_MODE", "hang")
 
@@ -167,6 +208,44 @@ def test_stop_all_now_kills_process_synchronously(monkeypatch):
     assert status == "stopped"
 
 
+def test_stop_all_now_shares_one_reap_budget(monkeypatch):
+    """同步清理路径不能每条会话各阻塞 2s：kill 只发出、收尸共享一个短窗口。"""
+    import app.acp.manager as manager_mod
+
+    calls = []
+
+    def slow_kill(handle, wait_s=None):
+        calls.append(wait_s)
+        # 旧实现根本不传 wait_s（= 每条会话固定阻塞 2s 收尸）。
+        time.sleep(2.0 if wait_s is None else wait_s)
+        handle.exited = True
+
+    monkeypatch.setattr(manager_mod, "kill_tree_now", slow_kill)
+
+    async def scenario():
+        mgr, _ = make()
+        handles = [_FakeHandle(), _FakeHandle()]
+        try:
+            _install_fakes(
+                mgr,
+                [
+                    _FakeGaSession("ga_a", handle=handles[0]),
+                    _FakeGaSession("ga_b", handle=handles[1]),
+                ],
+            )
+            t0 = time.monotonic()
+            mgr.stop_all_now()
+            return time.monotonic() - t0, handles
+        finally:
+            await mgr.close_all()
+
+    elapsed, handles = run(scenario())
+    # 旧实现两条会话串行 4s；新实现只发 kill（wait_s=0）再共享短窗口。
+    assert elapsed < 1.0
+    assert calls == [0.0, 0.0]
+    assert all(handle.exited for handle in handles)
+
+
 def test_crash_marks_errored(monkeypatch):
     monkeypatch.setenv("FAKE_GA_MODE", "crash")
 
@@ -180,6 +259,29 @@ def test_crash_marks_errored(monkeypatch):
             await mgr.close_all()
 
     assert run(scenario())["status"] == "errored"
+
+
+def test_spawn_failure_includes_stderr_tail():
+    """spec §9.5 / §11.3：spawn 失败的错误文本要带 stderr 最后几行。"""
+    marker = "GA_SPAWN_STDERR_MARKER_7f3c"
+    command = json.dumps([
+        sys.executable,
+        "-c",
+        f"import sys; sys.stderr.write({marker!r} + '\\n'); sys.exit(2)",
+    ])
+
+    async def scenario():
+        mgr, _ = make(INNER_ACP_GA_COMMAND=command)
+        try:
+            with pytest.raises(RuntimeError) as excinfo:
+                await mgr.spawn(task="boom")
+            return str(excinfo.value)
+        finally:
+            await mgr.close_all()
+
+    message = run(scenario())
+    assert "启动 GenericAgent 失败" in message
+    assert marker in message
 
 
 def test_send_creates_new_card(monkeypatch):
@@ -208,13 +310,23 @@ def test_send_creates_new_card(monkeypatch):
 # 用来确定性地观察「并发」与「是否把阻塞杀放进线程」。
 
 
+class _FakeHandle:
+    """只有 poll() 的假进程句柄：被杀之后才算退出。"""
+
+    def __init__(self):
+        self.exited = False
+
+    def poll(self):
+        return 0 if self.exited else None
+
+
 class _FakeGaSession:
     """只实现 stop/close 路径用到的最小接口。"""
 
-    def __init__(self, agent_id, *, stop_delay=0.0):
+    def __init__(self, agent_id, *, stop_delay=0.0, handle=None):
         self.agent_id = agent_id
         self.status = "running"
-        self.process_handle = object()
+        self.process_handle = handle if handle is not None else object()
         self.stop_delay = stop_delay
         self.stop_calls = 0
 
@@ -222,6 +334,9 @@ class _FakeGaSession:
         self.stop_calls += 1
         if self.stop_delay:
             await asyncio.sleep(self.stop_delay)
+        self.status = "stopped"
+
+    def mark_stopped(self):
         self.status = "stopped"
 
     async def close(self):

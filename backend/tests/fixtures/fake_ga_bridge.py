@@ -1,6 +1,8 @@
 """Minimal ACP agent. Env:
 FAKE_GA_MODE = chunks|tools|permission|hang|stream_hang|crash|malformed|split|error
+               |ignore_cancel|stderr_crash
 FAKE_GA_STDERR_LINES = int (flood stderr *before* reading stdin)
+FAKE_GA_STDERR_MARKER = marker line written by stderr_crash (defaults to a fixed one)
 FAKE_GA_LOG = path (append every received message as one JSON line)
 """
 import json
@@ -10,6 +12,8 @@ import time
 
 MODE = os.environ.get("FAKE_GA_MODE", "chunks")
 LOG = os.environ.get("FAKE_GA_LOG")
+STDERR_MARKER = os.environ.get(
+    "FAKE_GA_STDERR_MARKER", "[FAKE-GA-STDERR-CRASH-MARKER]")
 
 
 def log(obj):
@@ -46,6 +50,11 @@ def main():
         sid = params.get("sessionId")
         if MODE == "crash" and method == "session/prompt":
             os._exit(3)
+        if MODE == "stderr_crash" and method == "session/prompt":
+            # 最后一行 stderr 必须能被 ga_result.error 回显出来（spec §9.5）。
+            sys.stderr.write(STDERR_MARKER + "\n")
+            sys.stderr.flush()
+            os._exit(3)
         if MODE == "malformed":
             sys.stdout.write("this is not json\n")
             sys.stdout.flush()
@@ -74,7 +83,7 @@ def main():
                 send({"jsonrpc": "2.0", "id": rid,
                       "error": {"code": -32603, "message": "fake failure"}})
                 continue
-            if MODE == "hang":
+            if MODE in ("hang", "ignore_cancel"):
                 pending[sid] = rid
             elif MODE == "stream_hang":
                 # 先流一段文本再挂起：用于验证「进行中也能看到中间文本」。
@@ -109,6 +118,9 @@ def main():
                                      "content": {"type": "text", "text": chunk}})
                 send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
         elif method == "session/cancel":
+            if MODE == "ignore_cancel":
+                # 故意不回答在途 prompt：调用方必须靠 2s 宽限后的硬杀收场。
+                continue
             for s, prid in list(pending.items()):
                 send({"jsonrpc": "2.0", "id": prid, "result": {"stopReason": "cancelled"}})
                 pending.pop(s)
