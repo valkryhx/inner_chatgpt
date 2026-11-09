@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import logging
 import subprocess
+import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -32,7 +33,12 @@ from .config import AcpSettings, build_child_env
 from .session import GaSession
 from .transport import kill_tree_now
 
-__all__ = ["AcpLimitError", "AcpSessionManager", "AcpUnavailableError"]
+__all__ = [
+    "AcpLimitError",
+    "AcpSessionManager",
+    "AcpUnavailableError",
+    "reset_preflight_cache",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +49,24 @@ _QUOTA_WAIT_S = 2.0
 _PREFLIGHT_TIMEOUT_S = 15
 
 # 预检结果按命令行缓存（跨 manager 实例复用：每轮都会新建一个 manager）。
-# 只缓存成功结果，失败每次重试——装好依赖后无需重启进程。
+# 成功结果永久缓存（装好就不变）；失败结果只缓存 _PREFLIGHT_FAIL_TTL_S 这么久的
+# 「短 TTL」——坏安装不能让每一轮都 spawn 一次解释器（mount 每轮都会 await 预检，
+# 并发轮次还会一起占满默认线程池），装好依赖后又能自动恢复、无需重启进程。
 _PREFLIGHT_CACHE: dict[tuple[str, ...], str] = {}
+
+# 失败缓存：(monotonic 时间戳, 错误文本)。存文本而不是异常对象，避免复用带
+# 陈旧 traceback 的异常实例。
+_PREFLIGHT_FAIL_CACHE: dict[tuple[str, ...], tuple[float, str]] = {}
+
+# 失败结果的缓存时长（秒）；测试可 monkeypatch 成本模块属性。
+_PREFLIGHT_FAIL_TTL_S = 30.0
+
+
+def reset_preflight_cache() -> None:
+    """清空预检的成功 / 失败缓存（测试隔离，也给运维一个手动重试的入口）。"""
+    _PREFLIGHT_CACHE.clear()
+    _PREFLIGHT_FAIL_CACHE.clear()
+
 
 # ga_stop：先发 session/cancel，最多等这么久；仍未返回就硬杀进程树（spec §9.4）。
 _STOP_GRACE_S = 2.0
@@ -67,6 +89,14 @@ class AcpLimitError(RuntimeError):
 
 class AcpUnavailableError(RuntimeError):
     """GA 的 ACP bridge 不可用（预检没 import 到模块 / 自定义命令起不来）。"""
+
+
+def _remember_preflight_failure(
+    key: tuple[str, ...], error: AcpUnavailableError
+) -> AcpUnavailableError:
+    """把失败写进短 TTL 缓存，并把 error 原样返回，方便调用方 ``raise``。"""
+    _PREFLIGHT_FAIL_CACHE[key] = (time.monotonic(), str(error))
+    return error
 
 
 @dataclass
@@ -133,7 +163,8 @@ class AcpSessionManager:
           依赖缺失」在 spawn 之前就能判出来（spec §9.5：绝不注入半成品会话）。
 
         成功结果按 ``tuple(command)`` 缓存并复用（每轮都会新建 manager，缓存放模块级）；
-        失败**不**缓存——装好依赖后无需重启进程。
+        失败结果按同样的 key 做**短 TTL** 负缓存（``_PREFLIGHT_FAIL_TTL_S``，默认 30s）：
+        坏安装不会让每一轮都付一次解释器启动，装好依赖后自动恢复、无需重启进程。
         """
         command = list(self.settings.command)
         if "-m" not in command:
@@ -148,6 +179,14 @@ class AcpSessionManager:
         cached = _PREFLIGHT_CACHE.get(key)
         if cached is not None:
             return cached
+
+        failed = _PREFLIGHT_FAIL_CACHE.get(key)
+        if failed is not None:
+            raised_at, message = failed
+            if time.monotonic() - raised_at < _PREFLIGHT_FAIL_TTL_S:
+                # 直接复用上次的结论，不再 spawn 探测子进程。
+                raise AcpUnavailableError(message)
+            _PREFLIGHT_FAIL_CACHE.pop(key, None)
 
         # 子进程环境与 GA 会话一致（白名单），并强制 UTF-8 输出：
         # 中文用户名下的安装路径在 GBK 控制台里会被解成乱码。
@@ -164,14 +203,19 @@ class AcpSessionManager:
                 env=env,
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            raise AcpUnavailableError(
-                f"GenericAgent ACP bridge 不可用: {type(exc).__name__}: {exc}"
+            raise _remember_preflight_failure(
+                key,
+                AcpUnavailableError(
+                    f"GenericAgent ACP bridge 不可用: {type(exc).__name__}: {exc}"
+                ),
             ) from exc
 
         path = (proc.stdout or "").strip()
         if proc.returncode != 0 or not path:
             detail = (proc.stderr or "").strip()[-800:] or "无输出"
-            raise AcpUnavailableError(f"GenericAgent ACP bridge 不可用: {detail}")
+            raise _remember_preflight_failure(
+                key, AcpUnavailableError(f"GenericAgent ACP bridge 不可用: {detail}")
+            )
 
         try:
             digest = _sha256_of(path)

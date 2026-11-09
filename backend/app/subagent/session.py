@@ -159,7 +159,7 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext) -> TurnRuntime:
             from ..acp.tools import build_acp_tools
 
             manager = AcpSessionManager(ctx=team_ctx, buffer=buffer, settings=acp_settings)
-            await asyncio.to_thread(manager.preflight)
+            bridge = await asyncio.to_thread(manager.preflight)
             # 先整体构造再统一 add：中途抛异常不能留下「一半 ga_* 工具」。
             acp_tools = build_acp_tools(manager)
         except Exception as exc:  # noqa: BLE001 - GA 不可用不能拖垮本轮
@@ -167,6 +167,16 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext) -> TurnRuntime:
                 "ACP 不可用，本轮不注入 ga_* 工具：%s: %s", type(exc).__name__, exc
             )
         else:
+            if bridge is None:
+                # 自定义命令（不含 -m）没有可探测的模块：不启动 GA 就无法判定可用性，
+                # 因此照常注入但必须显式告警，绝不能让 §11.3 的闸静默放行。
+                # 只记可执行文件，不把整条命令行（可能含参数里的密钥）写进日志。
+                logger.warning(
+                    "ACP 预检闸已跳过：自定义命令无可探测模块，无法在不启动 GA 的前提下"
+                    "判定可用性；5 个 ga_* 工具仍已注入，首个 ga_spawn 才会暴露启动错误。"
+                    "可执行文件=%s",
+                    acp_settings.command[0] if acp_settings.command else "",
+                )
             for t in acp_tools:
                 merged.add(t)
             acp = manager
