@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from . import db
 from .config import ROOT_DIR, llm_yaml_available, load_llm_settings
 from .routers import auth, chat, me, media, sessions, skills, team, workspace_files
+from .a2a import router as a2a_router
 from .runtime import RuntimeHub, set_hub
 from .schemas import HealthOut
 
@@ -18,6 +19,8 @@ from .schemas import HealthOut
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_db()
+    from .a2a import store as a2a_store
+    await a2a_store.init_tables()
     # 子代理侧链表：幂等建表 + 把上次进程遗留的 running 收敛为 errored
     try:
         from .subagent import store as subagent_store
@@ -59,6 +62,8 @@ app.include_router(skills.router)
 app.include_router(media.router)
 app.include_router(workspace_files.router)
 app.include_router(team.router)
+app.include_router(a2a_router.router)
+app.include_router(a2a_router.api_router)
 
 
 @app.get("/api/health", response_model=HealthOut)

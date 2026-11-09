@@ -1,4 +1,7 @@
 import type {
+  A2AAgentInfo,
+  A2AToken,
+  A2ATokenCreated,
   AuthResponse,
   ContextUsage,
   LLMConfig,
@@ -203,6 +206,18 @@ export const api = {
       body: JSON.stringify({ raw }),
     }),
   mcpExport: () => request<{ json: string }>('/me/mcp-servers/export'),
+
+  // ---------------- A2A per-user access ----------------
+  getA2AAgent: () => request<A2AAgentInfo>('/a2a/agent'),
+  listA2ATokens: () => request<{ tokens: A2AToken[] }>('/a2a/tokens'),
+  createA2AToken: (body: { name?: string; scopes?: string[]; expires_in_days?: number | null }) =>
+    request<A2ATokenCreated>('/a2a/tokens', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  revokeA2AToken: (id: string) =>
+    request<{ ok: boolean }>(`/a2a/tokens/${id}/revoke`, { method: 'POST' }),
 
   // ---------------- workspace 文件 ----------------
   workspaceFiles: (path = '', depth = 2, limit = 500) =>

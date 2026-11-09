@@ -22,6 +22,7 @@
 | 子代理 Subagent | 进程内 asyncio 运行时：`spawn_agent / wait_agent / read_agent_result / list_agents / close_agent`；子代理继承全部业务工具与 MCP，但不能派生子代理；事件并入主对话 SSE |
 | Agent Team | 持久任务板 + 依赖 `blocked_by` + CAS 版本 + 团队消息 + lead/teammate 角色；右侧 `TeamPanel` 实时展示任务、消息与动态；lead 8 个编排工具，teammate 5 个 |
 | 外部 GenericAgent（ACP） | 以 ACP 拉起本机 GenericAgent 子进程作为外部编码代理：`ga_spawn / ga_wait / ga_result / ga_send / ga_stop` 五个 root-only 工具，事件并入主对话 SSE（`subagent_*`）。**manager 级真 GA E2E 已通过**：预检 + 工具注入、哨兵写文件、多步（读 → 改 → 跑，3 个工具步骤）、长任务停止与停止后立刻继续；预检用 `importlib.util.find_spec` 解析路径、不 import bridge（避开其 import 期 stdout 重定向），真机返回 site-packages 路径与 SHA256。Web UI E2E 未跑，DB blocks / 卡片渲染与 chat 层「停止后立即发送」未在该层验证；详见 `docs/20261109-ACP-client驱动GenericAgent实施记录.md` |
+| A2A 接入 | 每用户独立 `agent_id` / URL / Bearer token；JSON-RPC `SendMessage` / `SendStreamingMessage` (SSE) / `GetTask` / `ListTasks` / `CancelTask` / `SubscribeToTask`；默认关闭（`INNER_A2A_ENABLED=true` 才暴露）；管理入口「设置 → A2A 接入」；详见 `docs/20261110-A2A-MVP实施记录.md` |
 | 文件产物 | 任意格式下载：单文件、目录浏览、多选打包 zip；Markdown 本地文件胶囊、工具步骤行下载、右侧工作区面板三入口；Office 文档生成依赖已内置 |
 | 停止可靠性 | 协作停止旗 + `task.cancel` + 子代理/`code_run` 级联三层；陈旧 generation 租约自动收敛，停止后已生成内容保留 |
 | 前端 | React 18 + Vite + TypeScript；暖纸 + 陶土设计系统；Markdown/GFM、图片鉴权渲染、ECharts 图表、子代理卡片、团队面板、文件面板 |
@@ -58,6 +59,7 @@
    [`docs/20261106-项目功能实现原理.md`](docs/20261106-项目功能实现原理.md)
 3. **全部设计、实施、审计与 changelog**：[`docs/`](docs/)
 4. **本次文档刷新记录**：[`docs/20261109-项目现状与文档刷新.md`](docs/20261109-项目现状与文档刷新.md)
+5. **A2A 使用文档（含本机验收实例）**：[`docs/20261110-A2A使用文档.md`](docs/20261110-A2A使用文档.md)
 
 ---
 
@@ -100,6 +102,7 @@ python run.py                        # http://127.0.0.1:8000
 
 - 健康检查：`GET http://127.0.0.1:8000/api/health`（`model` 为空表示 Hlaudz 没有可选的 `llm.yaml` 兜底，属正常）
 - 若 `frontend/dist` 存在，后端会自动在 `/` 托管前端（单端口访问）。
+- 需要 A2A 时，启动前设置 `INNER_A2A_ENABLED=true` 和 `INNER_A2A_PUBLIC_BASE_URL`（例如 `http://127.0.0.1:8000`），再在「设置 → A2A 接入」创建 token。
 
 ### 后端启动（日常）
 

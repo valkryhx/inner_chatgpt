@@ -40,3 +40,9 @@ misc/
 
 # local git worktrees
 .worktrees/
+
+# 本地 A2A/调试截图（不入库）
+temp/
+
+# 本地 Claude Code 配置（含机器相关的 skills symlink，不入库）
+.claude/

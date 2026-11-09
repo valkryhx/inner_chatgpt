@@ -311,3 +311,33 @@ export interface WorkspaceListing {
   truncated: boolean
   limit: number
 }
+
+
+/* ---------- A2A per-user access ---------- */
+
+export interface A2AAgentInfo {
+  agent_id: string
+  url: string
+  card_url: string
+  tenant: string
+}
+
+export interface A2AToken {
+  id: string
+  user_id: string
+  agent_id: string
+  name: string
+  prefix: string
+  scopes: string[]
+  created_at: number
+  last_used_at?: number | null
+  expires_at?: number | null
+  revoked_at?: number | null
+}
+
+export interface A2ATokenCreated extends A2AToken {
+  token: string
+  url: string
+  card_url: string
+  warning: string
+}

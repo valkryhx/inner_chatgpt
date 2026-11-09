@@ -685,3 +685,11 @@ async def delete_mcp_server(user_id: str, server_id: str) -> bool:
         cur = await conn.execute("DELETE FROM user_mcp_servers WHERE id=? AND user_id=?", (server_id, user_id))
         await conn.commit()
     return cur.rowcount > 0
+
+
+async def get_message(message_id: str) -> Optional[dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("SELECT * FROM messages WHERE id=?", (message_id,))
+        row = await cur.fetchone()
+    return _row_to_message(row) if row else None

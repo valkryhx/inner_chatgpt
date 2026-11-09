@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "a2a-cli": {
+      "source": "a2aproject/a2a-cli",
+      "sourceType": "github",
+      "skillPath": "skills/a2a-cli/SKILL.md",
+      "computedHash": "54cdb952705073478b3d7b325fc9c1cc624c970f3a42ea939a06ed50afa052f1"
+    }
+  }
+}
