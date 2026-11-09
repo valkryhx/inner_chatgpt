@@ -63,13 +63,16 @@ class AcpSettings:
     stderr_lines: int
     env_allow: tuple[str, ...]
     mcp_config: str
+    llm_no: str = ""
 
 
 def _text(env: Mapping[str, str], name: str, default: str = "") -> str:
+    """取字符串变量；缺失或 strip 后为空都回落默认值。"""
     raw = env.get(name)
     if raw is None:
         return default
-    return raw.strip()
+    stripped = raw.strip()
+    return stripped or default
 
 
 def _int(env: Mapping[str, str], name: str, default: int) -> int:
@@ -99,27 +102,42 @@ def _strip_quotes(token: str) -> str:
     return token
 
 
-def _parse_command(env: Mapping[str, str]) -> list[str]:
+def _parse_command(env: Mapping[str, str], llm_no: str = "") -> list[str]:
     """``INNER_ACP_GA_COMMAND`` 优先；为空时回落 ``-m`` 形式。
 
-    JSON 数组形式以 ``[`` 开头，否则按 shlex 处理；解析失败按空处理（即不启用）。
+    JSON 数组形式以 ``[`` 开头，否则按 shlex 处理；两种形式解析失败都按空处理
+    （即不启用），绝不把解析异常抛给启动路径。
+
+    ``llm_no`` 非空时追加 ``--llm-no <n>``；显式命令里已经带了就不再追加。
     """
     raw = _text(env, "INNER_ACP_GA_COMMAND")
+    command: list[str]
     if raw:
         if raw.startswith("["):
             try:
                 parsed = json.loads(raw)
             except ValueError:
                 parsed = None
-            if isinstance(parsed, list):
-                return [str(item) for item in parsed if str(item)]
-            return []
-        return [t for t in (_strip_quotes(t) for t in shlex.split(raw, posix=False)) if t]
+            if not isinstance(parsed, list):
+                return []
+            command = [str(item) for item in parsed if str(item)]
+        else:
+            try:
+                tokens = shlex.split(raw, posix=False)
+            except ValueError:
+                return []
+            command = [t for t in (_strip_quotes(t) for t in tokens) if t]
+    else:
+        python = _text(env, "INNER_ACP_GA_PYTHON")
+        command = [python, "-m", GA_BRIDGE_MODULE] if python else []
 
-    python = _text(env, "INNER_ACP_GA_PYTHON")
-    if python:
-        return [python, "-m", GA_BRIDGE_MODULE]
-    return []
+    if command and llm_no and not _has_llm_no(command):
+        command = command + ["--llm-no", llm_no]
+    return command
+
+
+def _has_llm_no(command: list[str]) -> bool:
+    return any(token == "--llm-no" or token.startswith("--llm-no=") for token in command)
 
 
 def _parse_env_allow(env: Mapping[str, str]) -> tuple[str, ...]:
@@ -132,7 +150,8 @@ def _parse_env_allow(env: Mapping[str, str]) -> tuple[str, ...]:
 def load_acp_settings(env: Mapping[str, str] | None = None) -> AcpSettings:
     """从环境变量解析 ACP 设置；``env`` 缺省为 ``os.environ``。"""
     e = os.environ if env is None else env
-    command = _parse_command(e)
+    llm_no = _text(e, "INNER_ACP_GA_LLM_NO")
+    command = _parse_command(e, llm_no)
     return AcpSettings(
         enabled=bool(command),
         command=command,
@@ -148,6 +167,7 @@ def load_acp_settings(env: Mapping[str, str] | None = None) -> AcpSettings:
         stderr_lines=_int(e, "INNER_ACP_STDERR_LINES", 200),
         env_allow=_parse_env_allow(e),
         mcp_config=_text(e, "INNER_ACP_GA_MCP_CONFIG"),
+        llm_no=llm_no,
     )
 
 

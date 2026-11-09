@@ -54,3 +54,60 @@ def test_child_env_allow_list_and_mcp_override():
     assert env["FOO"] == "1"
     assert "BAR" not in env
     assert env["GA_MCP_CONFIG"] == "empty.json"
+
+
+def test_shlex_command_with_quoted_path():
+    s = load_acp_settings({
+        "INNER_ACP_GA_COMMAND": '"C:/Program Files/ga/python.exe" -m x',
+    })
+    assert s.enabled is True
+    assert s.command == ["C:/Program Files/ga/python.exe", "-m", "x"]
+
+
+def test_unbalanced_quotes_disables_without_raising():
+    s = load_acp_settings({
+        "INNER_ACP_GA_PYTHON": "python",
+        "INNER_ACP_GA_COMMAND": '"C:/Program Files/ga/python.exe -m x',
+    })
+    assert s.enabled is False
+    assert s.command == []
+
+
+def test_invalid_json_command_disables_without_fallback():
+    s = load_acp_settings({
+        "INNER_ACP_GA_PYTHON": "python",
+        "INNER_ACP_GA_COMMAND": '["C:/ga/python.exe",',
+    })
+    assert s.enabled is False
+    assert s.command == []
+
+
+def test_blank_text_falls_back_to_defaults():
+    s = load_acp_settings({
+        "INNER_ACP_GA_PYTHON": "python",
+        "INNER_ACP_MODE": "   ",
+        "INNER_ACP_PERMISSION": "  ",
+        "INNER_ACP_WORKDIR_MODE": "\t",
+    })
+    assert (s.mode, s.permission, s.workdir_mode) == ("full_access", "allow", "workspace")
+
+
+def test_llm_no_appended_to_python_command():
+    s = load_acp_settings({"INNER_ACP_GA_PYTHON": "python", "INNER_ACP_GA_LLM_NO": "0"})
+    assert s.llm_no == "0"
+    assert s.command == ["python", "-m", "frontends.acp.genericagent_acp_bridge",
+                         "--llm-no", "0"]
+
+
+def test_llm_no_default_empty_and_not_appended():
+    s = load_acp_settings({"INNER_ACP_GA_PYTHON": "python"})
+    assert s.llm_no == ""
+    assert "--llm-no" not in s.command
+
+
+def test_llm_no_not_duplicated_in_explicit_command():
+    s = load_acp_settings({
+        "INNER_ACP_GA_COMMAND": '["C:/ga/python.exe","-m","x","--llm-no","2"]',
+        "INNER_ACP_GA_LLM_NO": "5",
+    })
+    assert s.command == ["C:/ga/python.exe", "-m", "x", "--llm-no", "2"]
