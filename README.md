@@ -1,6 +1,6 @@
 # Hlaudz — 多用户 Web Agent 平台（自研 Agent 内核）
 
-> **一句话**：多用户、会话隔离的 Web Agent 服务 —— FastAPI + React，**不依赖 LangChain / LangGraph**，
+> **一句话**：Hlaudz 是多用户、会话隔离的 Web Agent 服务 —— FastAPI + React，**不依赖 LangChain / LangGraph**，
 > 支持用户自带模型、MCP 工具、Skill、子代理（Subagent）、Agent Team 协作、产物文件下载与 SSE 流式输出。
 
 > **文档快照**：2026-11-09 · 代码基线 `main@3b9c68f`（P3 + 文件下载 + Web 自测修复已完成）
@@ -63,12 +63,12 @@
 ## 4. 环境要求
 
 - Python 3.12（命令用 `python`）
-- Node.js 20+（本机实测 v25.2.1；原文档写 v24，v24/v25 均可）
+- Node.js 20+（已验证 v24 / v25）
 - 依赖见 `backend/requirements.txt`（版本已固定）与 `frontend/package.json`
 
-> **数据库与 `llm.yaml` 均为本机运行时数据，不入库。**
+> **数据库与 `llm.yaml` 均为 Hlaudz 运行时数据，不入库。**
 > - 干净 clone 后首次启动会自动创建空的 `backend/data/app.db`（无用户/会话）。
-> - `llm.yaml` 是**可选**的本机兜底模型配置（含真实 key），缺失时用户各自在页面配置模型即可。
+> - `llm.yaml` 是**可选**的 Hlaudz 兜底模型配置（含真实 key），缺失时用户各自在页面配置模型即可。
 > - 模型 key 由每个用户在页面里自行填写；仓库不携带任何 key。
 
 ---
@@ -97,7 +97,7 @@ python run.py                        # http://127.0.0.1:8000
 3. 回到会话页，新建会话即可对话。
 4. 需要工具能力时，在「设置 → 我的 MCP」粘贴 `mcp.json`；需要技能时在「设置 → 我的 Skills」导入 zip 或新建。
 
-- 健康检查：`GET http://127.0.0.1:8000/api/health`（`model` 为空表示本机没有可选的 `llm.yaml` 兜底，属正常）
+- 健康检查：`GET http://127.0.0.1:8000/api/health`（`model` 为空表示 Hlaudz 没有可选的 `llm.yaml` 兜底，属正常）
 - 若 `frontend/dist` 存在，后端会自动在 `/` 托管前端（单端口访问）。
 
 ### 后端启动（日常）
@@ -237,7 +237,7 @@ Office 生成依赖已固定：`python-docx`、`openpyxl`、`python-pptx`。任�
 
 ## 9. 配置 MCP（标准 mcp.json 粘贴）
 
-MCP 配置采用业界通用的 `mcp.json`（`mcpServers` 对象）格式，与 Claude Desktop / GenericAgent 一致。
+MCP 配置采用业界通用的 `mcp.json`（`mcpServers` 对象）格式，与 Claude Desktop 等通用客户端一致。
 打开「设置 → 我的 MCP」，把 JSON 粘进文本框，点「保存（按 name 合并）」即可
 （解析代码见 `backend/app/mcp_config.py`）。也支持「导入 / 导出」整份配置。
 
@@ -437,13 +437,13 @@ npm run build
 
 ---
 
-## 14. 测试账号（本机开发库）
+## 14. 测试账号（开发数据库）
 
-`backend/data/app.db` 不入库；干净 clone 后没有任何账号。本机开发库当前包含：
+`backend/data/app.db` 不入库；干净 clone 后没有任何账号。开发数据库当前包含：
 
 | 用户名 | 密码 | 说明 |
 |---|---|---|
-| `test` | `12345678` | 已配置默认模型与 `exa` / `sqlbot` MCP（以本机实际数据为准） |
+| `test` | `12345678` | 已配置默认模型与 `exa` / `sqlbot` MCP（以实际数据库为准） |
 
 ```bash
 # 快速验证登录（返回 access_token）
@@ -465,6 +465,6 @@ curl -s -X POST http://127.0.0.1:8000/api/auth/login \
 - **上下文压缩**：软线自动摘要（CJK-aware）+ 手动压缩 + 硬线裁剪；压缩/裁剪/停止都不会产生孤立 tool 消息。
 - **安全边界**：`code_run` 是受控子进程（cwd 限制 / 超时 / 输出截断 / Python audit hook 写入守卫），
   **不是 OS 级沙箱**；文件读写与下载限制在个人 workspace；MCP 可连接任意用户配置的远程服务。
-- **密钥存储**：用户 APIKey 存在 SQLite 明文列（本机 MVP）；仓库不携带任何 key，`llm.yaml` 与 `backend/data/` 不入库。
+- **密钥存储**：用户 APIKey 存在 SQLite 明文列（MVP）；仓库不携带任何 key，`llm.yaml` 与 `backend/data/` 不入库。
 - **依赖边界**：不引入 LangChain / LangGraph；MCP 由 `fastmcp.Client` 直接接入并封装为自研 `Tool`。
 
