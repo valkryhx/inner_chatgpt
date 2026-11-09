@@ -29,6 +29,30 @@ class RuntimeHub:
         # 活跃的子代理宿主：key = (user_id, session_id, generation_id, team_id)
         # 用户 id 必须参与键，防止只猜 session/generation 就能影响别人。
         self._subagent_hosts: dict[tuple[str, str, str, str], "object"] = {}
+        # 本代 ACP manager：key = (user_id, session_id, generation_id)
+        # 与 subagent hosts 同构，用户 id 参与键，/stop 不能作用于别人的会话。
+        self._acp_managers: dict[tuple[str, str, str], "object"] = {}
+
+    # ---------------- acp managers ----------------
+    def register_acp_manager(self, user_id: str, session_id: str, generation_id: str,
+                             manager: "object") -> None:
+        self._acp_managers[(user_id, session_id, generation_id)] = manager
+
+    def unregister_acp_manager(self, user_id: str, session_id: str, generation_id: str) -> None:
+        self._acp_managers.pop((user_id, session_id, generation_id), None)
+
+    def get_acp_manager(self, user_id: str, session_id: str, generation_id: str):
+        return self._acp_managers.get((user_id, session_id, generation_id))
+
+    async def stop_acp_generation(self, user_id: str, session_id: str, generation_id: str) -> int:
+        """优雅停止该代的 ACP 会话；未知代或 manager 抛错都返回 0。"""
+        mgr = self._acp_managers.get((user_id, session_id, generation_id))
+        if mgr is None:
+            return 0
+        try:
+            return await mgr.stop_generation()
+        except Exception:
+            return 0
 
     # ---------------- subagent hosts ----------------
     def register_subagent_host(self, user_id: str, session_id: str, generation_id: str,
@@ -78,6 +102,12 @@ class RuntimeHub:
             except Exception:
                 pass
         self._subagent_hosts.clear()
+        for mgr in list(self._acp_managers.values()):
+            try:
+                await mgr.close_all()
+            except Exception:
+                pass
+        self._acp_managers.clear()
         for key in list(self._runtimes.keys()):
             await self._runtimes[key].close()
         self._runtimes.clear()
