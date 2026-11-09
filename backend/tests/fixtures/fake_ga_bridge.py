@@ -1,5 +1,5 @@
 """Minimal ACP agent. Env:
-FAKE_GA_MODE = chunks|tools|permission|hang|crash|malformed
+FAKE_GA_MODE = chunks|tools|permission|hang|crash|malformed|split|error
 FAKE_GA_STDERR_LINES = int (flood stderr *before* reading stdin)
 FAKE_GA_LOG = path (append every received message as one JSON line)
 """
@@ -70,6 +70,10 @@ def main():
         elif method == "session/set_mode":
             send({"jsonrpc": "2.0", "id": rid, "result": {"modeId": params.get("modeId")}})
         elif method == "session/prompt":
+            if MODE == "error":
+                send({"jsonrpc": "2.0", "id": rid,
+                      "error": {"code": -32603, "message": "fake failure"}})
+                continue
             if MODE == "hang":
                 pending[sid] = rid
             elif MODE == "permission":
