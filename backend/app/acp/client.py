@@ -58,10 +58,12 @@ class AcpClient:
         *,
         permission: str = "allow",
         on_update: Callable[[str, dict[str, Any]], None] | None = None,
+        on_permission: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._process = process
         self._permission = permission
         self._on_update = on_update
+        self._on_permission = on_permission
 
         self._next_id = 1
         self._pending: dict[Any, asyncio.Future[dict[str, Any]]] = {}
@@ -196,6 +198,14 @@ class AcpClient:
     def _handle_request(self, rid: Any, method: str, params: dict[str, Any]) -> None:
         if method == "session/request_permission":
             self.permission_requests.append(params)
+            # 先通知调用方（卡片要发 tool_start/tool_result 配对），再自动应答；
+            # 回调异常不能影响应答，否则 GA 会死等（spec §6.5）。
+            callback = self._on_permission
+            if callback is not None:
+                try:
+                    callback(params)
+                except Exception as exc:  # noqa: BLE001 - 回调异常不能打断协议
+                    self._log(f"on_permission 回调异常：{exc!r}")
             option = "allow_once" if self._permission == "allow" else "reject_once"
             self._send_soon(
                 {

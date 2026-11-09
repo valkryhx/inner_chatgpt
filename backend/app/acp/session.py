@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .client import AcpClient, AcpError
+from .client import AcpBusyError, AcpClient, AcpError
 from .config import AcpSettings
 from .transport import AcpProcess, AcpTransportClosed, AsyncProcHandle
 
@@ -43,6 +44,9 @@ _FAILED_TOOL_STATUSES = frozenset({"failed", "error"})
 
 # 整个 prompt 没有任何文本事件时，subagent_end 带的占位结果。
 _NO_TEXT_RESULT = "（GA 未返回文本）"
+
+# 终态集合：进入后不再接受任何 update（spec §9.2：终态只允许进入一次）。
+_TERMINAL_STATUSES = frozenset({"completed", "errored", "stopped"})
 
 
 @dataclass
@@ -104,6 +108,9 @@ class GaSession:
         self._tail_parts: list[str] = []
         self._saw_text = False
         self._stop_requested = False
+        self._in_flight = False
+        self._ended = False
+        self._dropped = 0
 
     # ------------------------------------------------------------- 生命周期
 
@@ -128,6 +135,7 @@ class GaSession:
             process,
             permission=self.settings.permission,
             on_update=self._on_update,
+            on_permission=self._on_permission,
         )
         self._client = client
         await client.start()
@@ -146,6 +154,8 @@ class GaSession:
 
     async def stop(self) -> None:
         """发 ``session/cancel`` 并把状态标成 stopped；死进程不报错。"""
+        if self._stop_requested:
+            return
         self._stop_requested = True
         self.status = "stopped"
         await self._cancel_quietly()
@@ -166,62 +176,80 @@ class GaSession:
         client, session_id = self._client, self._session_id
         if client is None or session_id is None:
             raise RuntimeError("GaSession 尚未启动")
+        if self._in_flight:
+            # 并发派任务在本地就拒掉：不改状态、不发新卡片，上一张卡片继续跑。
+            raise AcpBusyError(
+                f"会话 {self.agent_id} 仍有未完成的 prompt，拒绝并发派任务"
+            )
 
-        self._prompt_seq = int(prompt_seq)
-        self._card_id = f"{self.agent_id}#{self._prompt_seq}"
-        self._full_parts = []
-        self._tail_parts = []
-        self._saw_text = False
-        self._stop_requested = False
-        self.full_text = ""
-        self.result = ""
-        self.error = ""
-        self.status = "running"
-
-        self._publish(
-            {
-                "type": "subagent_start",
-                "agent_id": self._card_id,
-                "name": self._display_name(),
-                "role": "ga",
-                "task": self.task,
-            }
-        )
-
-        stop_reason = ""
+        self._in_flight = True
         try:
-            result = await client.prompt(session_id, text, timeout_s=timeout_s)
-            stop_reason = str(result.get("stopReason") or "")
-            if self._stop_requested or stop_reason in _CANCELLED_STOP_REASONS:
-                self.status = "stopped"
-            else:
-                self.status = "completed"
-        except asyncio.TimeoutError:
-            self.error = f"timeout: 超过 {timeout_s:g}s"
-            stop_reason = "timeout"
-            self.status = "stopped"
-            await self._cancel_quietly()
-        except AcpTransportClosed as exc:
-            self.error = f"{type(exc).__name__}: {exc}"
-            self.status = "errored"
-        except AcpError as exc:
-            self.error = f"{type(exc).__name__}: {exc}"
-            self.status = "errored"
-        except asyncio.CancelledError:
-            self.error = self.error or "cancelled"
-            self.status = "stopped"
-            self._finish_prompt()
-            raise
+            self._prompt_seq = int(prompt_seq)
+            self._card_id = f"{self.agent_id}#{self._prompt_seq}"
+            self._full_parts = []
+            self._tail_parts = []
+            self._saw_text = False
+            self._stop_requested = False
+            self._ended = False
+            self.full_text = ""
+            self.result = ""
+            self.error = ""
+            self.status = "running"
 
-        self._finish_prompt()
-        return PromptResult(
-            status=self.status,
-            result=self.result,
-            full_text=self.full_text,
-            stop_reason=stop_reason,
-            tool_calls=self._tool_calls,
-            error=self.error,
-        )
+            self._publish(
+                {
+                    "type": "subagent_start",
+                    "agent_id": self._card_id,
+                    "name": self._display_name(),
+                    "role": "ga",
+                    "task": self.task,
+                }
+            )
+
+            stop_reason = ""
+            try:
+                result = await client.prompt(session_id, text, timeout_s=timeout_s)
+                stop_reason = str(result.get("stopReason") or "")
+                if self._stop_requested or stop_reason in _CANCELLED_STOP_REASONS:
+                    self.status = "stopped"
+                else:
+                    self.status = "completed"
+            except asyncio.TimeoutError:
+                self.error = f"timeout: 超过 {timeout_s:g}s"
+                stop_reason = "timeout"
+                self.status = "stopped"
+                await self._cancel_quietly()
+            except AcpTransportClosed as exc:
+                if self._stop_requested:
+                    # 用户停止 / 关管道导致的正常收尾，不是故障（spec §6.6 / §9.4）。
+                    self.status = "stopped"
+                else:
+                    self.error = f"{type(exc).__name__}: {exc}"
+                    self.status = "errored"
+            except AcpError as exc:
+                self.error = f"{type(exc).__name__}: {exc}"
+                self.status = "errored"
+            except asyncio.CancelledError:
+                self.error = self.error or "cancelled"
+                self.status = "stopped"
+                raise
+            except Exception as exc:  # noqa: BLE001 - 任何异常都必须收敛成终态
+                self.error = f"{type(exc).__name__}: {exc}"
+                self.status = "errored"
+
+            self._finish_prompt()
+            return PromptResult(
+                status=self.status,
+                result=self.result,
+                full_text=self.full_text,
+                stop_reason=stop_reason,
+                tool_calls=self._tool_calls,
+                error=self.error,
+            )
+        finally:
+            self._in_flight = False
+            # 异常路径也必须收尾；_finish_prompt 幂等，正常路径不会重复发。
+            self._finish_prompt()
 
     # ------------------------------------------------------------- 查询接口
 
@@ -258,6 +286,13 @@ class GaSession:
 
     def _on_update(self, session_id: str | None, update: dict[str, Any]) -> None:
         """把一条 ``session/update`` 翻成 buffer 事件 + 本地日志。"""
+        if self.status in _TERMINAL_STATUSES:
+            # spec §9.2：终态只允许进入一次，迟到的事件丢弃并记日志。
+            self._dropped += 1
+            self._log(
+                f"终态 {self.status} 后丢弃 update：{update.get('sessionUpdate')!r}"
+            )
+            return
         kind = update.get("sessionUpdate")
         if kind == "agent_message_chunk":
             self._on_text_chunk(update)
@@ -326,10 +361,70 @@ class GaSession:
             }
         )
 
+    def _on_permission(self, params: dict[str, Any]) -> None:
+        """自动应答的权限请求：发一对 ``tool_start`` / ``tool_result``（spec §6.5）。
+
+        缺了 ``tool_result``，``SubagentCard`` 的步骤会永远停在 running 圆点。
+        """
+        if self.status in _TERMINAL_STATUSES:
+            self._dropped += 1
+            self._log(f"终态 {self.status} 后丢弃 permission 请求")
+            return
+        tool = params.get("toolCall")
+        if not isinstance(tool, dict):
+            tool = {}
+        tool_id = str(tool.get("toolCallId") or "")
+        title = str(tool.get("title") or tool_id or "unknown")
+        name = f"permission:{title}"
+        allowed = self.settings.permission == "allow"
+        content = "allowed" if allowed else "denied"
+        raw_input = tool.get("rawInput")
+        if not isinstance(raw_input, dict):
+            raw_input = {}
+        self._append_log("tool_start", name=name, text=_brief_input(raw_input))
+        self._publish(
+            {
+                "type": "subagent_event",
+                "agent_id": self._card_id,
+                "event": {
+                    "type": "tool_start",
+                    "id": tool_id,
+                    "name": name,
+                    "input": raw_input,
+                },
+            }
+        )
+        self._append_log("tool_result", name=name, text=content)
+        self._publish(
+            {
+                "type": "subagent_event",
+                "agent_id": self._card_id,
+                "event": {
+                    "type": "tool_result",
+                    "id": tool_id,
+                    "name": name,
+                    "content": content,
+                    "is_error": not allowed,
+                },
+            }
+        )
+
+    @staticmethod
+    def _log(text: str) -> None:
+        """内部告警走 stderr，不污染 stdout 的 JSON-RPC 流。"""
+        try:
+            sys.stderr.write(f"[acp-session] {text}\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+
     # --------------------------------------------------------------- 内部
 
     def _finish_prompt(self) -> None:
-        """收敛两份文本、累加 prompts、发 ``subagent_end``。"""
+        """收敛两份文本、累加 prompts、发 ``subagent_end``（幂等）。"""
+        if self._ended:
+            return
+        self._ended = True
         self.full_text = "".join(self._full_parts)
         tail = "".join(self._tail_parts)
         self.result = tail or self.full_text
