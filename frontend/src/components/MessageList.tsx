@@ -5,6 +5,7 @@ import ChartView from './ChartView'
 import Markdown from './Markdown'
 import SubagentCard from './SubagentCard'
 import { basename, downloadWorkspaceFile } from '../files'
+import { toolState } from '../toolState'
 
 interface Props {
   messages: Message[]
@@ -52,24 +53,22 @@ function prettyJson(input: unknown): string {
   }
 }
 
-function toolState(block: ToolBlock): 'running' | 'failed' | 'done' {
-  if (block.result === undefined) return 'running'
-  if (block.result.startsWith('[工具执行错误]')) return 'failed'
-  return 'done'
-}
-
-function StepRow({ block, onOpenWorkspace }: { block: ToolBlock; onOpenWorkspace?: () => void }) {
+function StepRow({ block, interrupted, onOpenWorkspace }: {
+  block: ToolBlock
+  interrupted: boolean
+  onOpenWorkspace?: () => void
+}) {
   const [open, setOpen] = useState(false)
   const [dlBusy, setDlBusy] = useState(false)
   const [dlErr, setDlErr] = useState('')
-  const state = toolState(block)
+  const state = toolState(block, interrupted)
   const argSummary = summarizeInput(block.input)
   const input = block.input as Record<string, unknown> | undefined
   const filePath = block.name === 'file_write' || block.name === 'file_patch'
     ? (typeof input?.path === 'string' ? input.path : '')
     : ''
   // 完成态只靠绿点表达，不再重复写“完成”，避免整列噪音
-  const stateLabel = state === 'running' ? '运行中' : state === 'failed' ? '失败' : ''
+  const stateLabel = state === 'running' ? '运行中' : state === 'stopped' ? '已中断' : state === 'failed' ? '失败' : ''
 
   const download = async () => {
     if (!filePath || dlBusy) return
@@ -140,21 +139,26 @@ function StepRow({ block, onOpenWorkspace }: { block: ToolBlock; onOpenWorkspace
   )
 }
 
-function StepGroup({ blocks, onOpenWorkspace }: { blocks: ToolBlock[]; onOpenWorkspace?: () => void }) {
-  const states = blocks.map(toolState)
+function StepGroup({ blocks, interrupted, onOpenWorkspace }: {
+  blocks: ToolBlock[]
+  interrupted: boolean
+  onOpenWorkspace?: () => void
+}) {
+  const states = blocks.map((b) => toolState(b, interrupted))
   const running = states.includes('running')
   const failed = states.includes('failed')
-  const summary = running ? '运行中' : failed ? '有失败' : '全部完成'
+  const stopped = states.includes('stopped')
+  const summary = running ? '运行中' : failed ? '有失败' : stopped ? '已中断' : '全部完成'
   return (
     <div className="step-group">
       {blocks.length > 1 && (
         <div className="step-group-head">
           <span>{blocks.length} 个步骤</span>
-          <span className={'step-group-sum ' + (running ? 'running' : failed ? 'failed' : 'done')}>{summary}</span>
+          <span className={'step-group-sum ' + (running ? 'running' : failed ? 'failed' : stopped ? 'stopped' : 'done')}>{summary}</span>
         </div>
       )}
       {blocks.map((b, i) => (
-        <StepRow key={b.id || 'tool_' + i} block={b} onOpenWorkspace={onOpenWorkspace} />
+        <StepRow key={b.id || 'tool_' + i} block={b} interrupted={interrupted} onOpenWorkspace={onOpenWorkspace} />
       ))}
     </div>
   )
@@ -216,6 +220,7 @@ function renderBlocks(
   blocks: MessageBlock[],
   isUser: boolean,
   streaming: boolean,
+  interrupted: boolean,
   onImageSettled: () => void,
   onOpenWorkspace?: () => void,
 ): ReactNode[] {
@@ -233,7 +238,7 @@ function renderBlocks(
         group.push(blocks[j] as ToolBlock)
         j++
       }
-      out.push(<StepGroup key={'tg_' + i} blocks={group} onOpenWorkspace={onOpenWorkspace} />)
+      out.push(<StepGroup key={'tg_' + i} blocks={group} interrupted={interrupted} onOpenWorkspace={onOpenWorkspace} />)
       i = j
       continue
     }
@@ -360,7 +365,7 @@ function MessageRow({ msg, onImageSettled, onOpenWorkspace }: {
     <div className={'msg ' + (isUser ? 'user' : 'assistant') + (msg.status === 'error' ? ' has-error' : '')}>
       <div className="bubble-col">
         {hasReasoning && !hasReasoningBlocks && <ReasoningSection text={msg.reasoning} live={isActiveStream} />}
-        {renderBlocks(blocks, isUser, isActiveStream, onImageSettled, onOpenWorkspace)}
+        {renderBlocks(blocks, isUser, isActiveStream, !isActiveStream, onImageSettled, onOpenWorkspace)}
         {!hasTextBlocks && msg.content && (
           isUser ? (
             <div className="bubble">{msg.content}</div>

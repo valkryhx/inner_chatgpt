@@ -1,12 +1,13 @@
 # ACP Client 驱动 GenericAgent —— 实施记录（2026-11-09）
 
-> 一句话摘要：ACP 客户端在本机真 GA 上做了 **manager 级 E2E**（不开浏览器、不启后端），
+> 一句话摘要：ACP 客户端在本机真 GA 上先做了 **manager 级 E2E**（不开浏览器、不启后端），
 > 覆盖设计文档的三个验收场景：**预检与工具注入、哨兵写文件、多步（读 → 改 → 跑）、
 > 长任务与停止**。全部在**全新进程、不预热任何缓存**的条件下通过；停止之后立刻再派新任务
 > 也能跑通。期间发现的阻塞缺陷（预检探针被 bridge 的 stdout 重定向击穿）**已修复并复验**
-> （commit `78c0b4f`）。
+> （commit `78c0b4f`）。随后又在主工作树补跑 **Web 真实 E2E**（真浏览器登录 + 真后端 +
+> 真 GA + DB 持久化 + 卡片渲染 + UI 停止），结果见 §9。
 
-> 日期：2026-11-09 · 状态：manager 级 E2E 全通过（含 1 个已修缺陷）· 设计文档：
+> 日期：2026-11-09 · 状态：manager 级 E2E + **Web 真实 E2E** 均通过；§9 的 3 个观察项已于同日仅在内层修复（见 §10）· 设计文档：
 > `docs/20261109-ACP-client驱动GenericAgent设计与实施.md`
 
 ---
@@ -24,11 +25,11 @@
 | `agentInfo.version` | `0.1.0`（`agentInfo.name` = `genericagent-acp`，`title` = `GenericAgent`） |
 | GA 模型配置 | `%APPDATA%/GenericAgent/llm.yaml`（18 个 profile，active=#16；**内容未读取、未落盘**） |
 | 配置 | `INNER_ACP_GA_PYTHON=C:/anaconda3/python.exe`、`INNER_ACP_MODE=full_access`（只有这两个开关） |
-| 验收级别 | **manager / 工具层**（进程内构造 `AcpSessionManager` + `build_acp_tools`），不是 Web UI E2E |
+| 验收级别 | **manager / 工具层**（§2–§6）+ **Web 真实 E2E**（§9：真浏览器登录、真后端、真 GA、SSE、DB 与卡片） |
 
-为什么不是浏览器 E2E：本任务明确「浏览器 + 登录流超出本工作树范围」，因此把整条 ACP 栈
-（transport → client → session → manager → `ga_*` 工具层）按真实注入顺序跑通，
-事件进自建的最小 recorder（只有 `put()`，与 `EventBuffer` 同签名）。
+§2–§6 先做 manager 级的原因：最初把整条 ACP 栈（transport → client → session → manager →
+`ga_*` 工具层）按真实注入顺序在进程内跑通，事件进自建的最小 recorder（只有 `put()`，与
+`EventBuffer` 同签名），便于逐层隔离；浏览器 + 登录流后来在主工作树补跑并通过（§9）。
 
 ---
 
@@ -310,9 +311,9 @@ stdout」，§11.3 的探针却仍用 `print`，属实现与已知事实冲突�
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| Web UI E2E | **未跑** | 浏览器 + 登录流超出本工作树范围；本记录只到 manager / 工具层 |
-| DB `blocks` / 卡片渲染 | **未验证** | 任务书 Step 2 的 `blocks.type=="subagent"`、`agent_id` 含 `#1`、前端「GA 外援」卡片属于 turn runtime + 持久化 + UI 三段，本记录只在 manager 层等价验证了 `EventBuffer` 的 `subagent_start/_event/_end` 流。**DB blocks / card rendering not exercised at manager level (requires full turn runtime + UI).** |
-| 「主对话可以立即继续发送」 | **部分验证** | manager 层已证：`ga_stop` 之后同一 manager 立刻再派任务，2.7 s 完成并复述随机 marker（§5.4）。**chat / SSE 层的这一段未验证**（需要完整 turn runtime + 前端）。 |
+| Web UI E2E | ✅ **已跑** | 2026-11-09 在主工作树用真浏览器登录 `127.0.0.1:8000` 跑通；见 §9 |
+| DB `blocks` / 卡片渲染 | ✅ **已验证** | §9.2 实测 `type=subagent`、`agent_id=ga_67769141#1`、`role=ga`、`status=completed`、31 条 events；§9.4 实测「GA 外援」卡片、实时事件与停止态 |
+| 「主对话可以立即继续发送」 | ✅ **已验证** | manager 层 §5.4 + chat/SSE 层 §9.2/§9.3：停止或完成后同会话立即再发，均返回 `done complete` |
 | GA 内部 subagent 事件 | **未透出** | GA 自己的子代理（workflow / child_agent）事件不会变成 `subagent_*`；ACP 只把 `session/update` 的 `agent_message_chunk` / `tool_call*` 映射出来，外层只能看到 GA 一层 |
 | 跨轮续跑 | **不支持** | 会话按 generation 生命周期管理，本轮结束 `close_all()`；bridge `agentCapabilities.loadSession=false`，无法跨轮恢复 GA 侧上下文 |
 | `session/set_mode` | 未触发 | bridge 默认就是 `full_access`，与本次配置相同，该分支未被真实执行 |
@@ -332,5 +333,183 @@ stdout」，§11.3 的探针却仍用 `print`，属实现与已知事实冲突�
    真正回收靠收尾 `close_all()` 或产品 `/stop` 顺序里的 `process_registry` 硬杀（`returncode=1`）。
 4. **主要缺陷已闭环**：预检探针在真机失效的问题由 `78c0b4f` 用
    `importlib.util.find_spec(...).origin` 修掉，并补了带 stdout 重定向副作用的回归测试。
-5. **剩余边界清楚**（见 §7）：Web UI E2E、DB blocks / 卡片渲染、chat 层「停止后立即发送」、
-   GA 内部 subagent 事件、跨轮续跑均未覆盖。
+5. **Web 层已补齐**（§9）：真浏览器登录、DB blocks / 卡片渲染、chat/SSE 停止与「停止后立即发送」均通过；
+   剩余边界是 GA 内部 subagent 事件、跨轮续跑、硬杀兜底（见 §7）。
+
+---
+
+## 9. Web 真实 E2E（2026-11-09 补充，已执行）
+
+> 本节补齐 §7 原来的三项未覆盖：**Web 登录流、DB `blocks` / 卡片渲染、chat/SSE 层停止后立即发送**。
+> 环境是仓库主工作树 `D:/git_codes/inner_chatgpt`（非 worktree），后端单端口托管重建后的 `frontend/dist`。
+
+### 9.1 环境与账号
+
+- 后端：`C:/anaconda3/python.exe run.py`，`127.0.0.1:8000`；启动环境
+  `INNER_ACP_GA_PYTHON=C:/anaconda3/python.exe`；健康检查返回 `{"ok":true,...}`。
+- 前端：`npm run build` 重建（包含 `SubagentCard` 的 `ga → GA 外援` 标签）。
+- 账号：`wfd3970794@fix.local`（仓库测试脚本约定的一次性测试账号；密码不落文档）。
+- 模型：该用户自己的 `user_llm_configs` 配置 `moma/deepseek-latest-flash`
+  （仓库根没有 `llm.yaml`，因此这也验证了「用户级模型配置」路径）。
+- 浏览器：`playwright-cli` 实际打开页面、填表登录，不是只发 HTTP。
+
+### 9.2 场景 A：浏览器内派 GA 写哨兵文件 —— ✅ 通过
+
+| 观测点 | 证据 |
+|---|---|
+| 会话 / 随机 token | `co_6ec2a648100f` / `WEBE2EA1AE2DB773` |
+| 工具调用 | 3.2 s `ga_spawn`；17.4 s `ga_result`；两者 `is_error=false` |
+| 子代理卡片 id | `ga_67769141#1`（会话级 id + `#1`） |
+| 事件量 | `subagent_start` 1、`subagent_event` 31、`subagent_end` 1、`text_delta` 54 |
+| 完成时间 | `ga_wait` 15.9 s 返回 `completed`；整轮 `done status=complete`，23.17 s |
+| 文件落盘 | `backend/data/workspaces/u_2c13cd6b707e/acp_web_e2e_WEBE2EA1AE2DB773.txt`，字节精确为 `WEBE2EA1AE2DB773`（无换行） |
+| DB `blocks` | assistant 消息含 `type=subagent`、`agent_id=ga_67769141#1`、`role=ga`、`status=completed`、31 条 events |
+| GA 进程回收 | 轮末 `genericagent_acp_bridge` 进程数 **0** |
+| 立即续发 | 同会话再发「只回复 OK」→ `done status=complete`，正文 `OK` |
+| 浏览器卡片 | `GenericAgent · 创建 e2e 文本文件  GA 外援 · 已完成 · 2 个工具`，展开可见 `code_run` 时间线；截图 `work/acp_web_e2e/ga_card_visible.png`、`work/acp_web_e2e/ga_card_completed.png` |
+
+> `subagent_end` 的 `result` 为空是**设计行为**：有文本事件时卡片时间线已经展示过，
+> `session.py::_finish_prompt` 不再重复塞 `result`；GA 的最终答复由 `ga_result` 返回。
+
+### 9.3 场景 B：chat/SSE 层停止 + 停止后立即发送 —— ✅ 通过（终帧有边界）
+
+| 观测点 | 证据 |
+|---|---|
+| 会话 / token | `co_5e1b6df2ac3f` / `STOPBBA4C957EC` |
+| GA 任务 | 先 `time.sleep(90)`，再写文件；调用后进入 `ga_wait` |
+| `/stop` 响应 | HTTP 200，`{"ok":true,"stopped":1,"subagents_stopped":0,...}`，0.53 s |
+| 进程回收 | 停止后 `genericagent_acp_bridge` 进程数 **0** |
+| DB 状态 | assistant 消息 `status=stopped`；subagent 块 `status=stopped` |
+| 立即续发 | 同会话立刻再发「只回复 OK」→ 200，`done complete`，正文 `OK`；无需刷新或重试 |
+
+**边界**：停止时服务端直接关闭 SSE，客户端看到
+`RemoteProtocolError: peer closed connection without sending complete message body`，
+没有 `done` / `subagent_end` 终帧。UI 停止按钮、DB 状态与后续发送都正确；
+若第三方客户端依赖终帧，需要把「连接被关闭」也当作停止处理。该行为来自现有 chat 停止路径，
+不是 ACP 新增。
+
+### 9.4 场景 C：浏览器内实时卡片 + UI 停止 —— ✅ 通过，三个观察项（均已修复）
+
+- 通过 UI 新建会话并发送长任务；约 10 s 时快照显示
+  `GenericAgent · 等待120秒后回复DONE  GA 外援 · 1 个工具`、`ga_wait ... 运行中`，
+  底部有 `Working 23s` 与「停止」按钮；截图 `work/acp_web_e2e/ga_card_live_running.png`。
+- 点击「停止」后约 4 s，卡片变为 `GA 外援 · 已停止 · 1 个工具`；
+  `genericagent_acp_bridge` 进程数 **0**；截图 `work/acp_web_e2e/ga_card_stopped.png`。
+- 刷新页面后卡片仍显示 `已停止`（会话 `co_febd66956e21`）。
+- **观察项 1（Minor，既有 UI 渲染；✅ 已修复，见 §10.1）**：被中断的工具步骤 `ga_wait` 在刷新后仍显示「运行中」。
+  根因是 `MessageList.tsx::toolState()` 用 `result === undefined` 判运行中，未按消息
+  `stopped` 兜底；子代理卡片本身有兜底（`MessageList.tsx:248-253` 会把非流式消息里的
+  `running` 子代理渲染为 `stopped`），所以卡片状态正确，只有工具步骤文案不一致。
+- **观察项 2（Minor，数据层竞态；✅ 已修复，见 §10.2）**：硬取消时最后一次 `_persist` 可能被一起取消，
+  DB 子代理块可停留在 `running`（本次 UI 停止后的 DB 即为 `running`；§9.3 的 API 停止那次为
+  `stopped`）。前端已用上述兜底渲染成「已停止」，用户可见状态正确；直接读 DB 的下游需要
+  应用同一规则。属停止路径与持久化竞态，不是 ACP 断连。
+- **观察项 3（噪声，不阻塞；✅ 已修复，见 §10.3）**：后端 stderr 在停止/客户端断开时出现若干 `CancelledError`
+  回溯（`team_store.release_generation` 被取消）。下一次发送的陈旧租约自愈逻辑正常生效，
+  未出现 409 或卡死；建议后续用取消安全的持久化收口。
+
+### 9.5 Web 层结论
+
+1. **全链路通过**：真浏览器 + 真登录 + 真后端 + 真 GA：`ga_spawn` → 实时卡片 → 文件落盘
+   → DB `blocks` → 停止 → 立即续发。
+2. 「GA 外援」角色标签、实时事件、完成/停止状态在 UI 正确显示；刷新后状态仍可读。
+3. 三个观察项都不影响主流程，且已仅在内层修复（§10）：中断步骤显示「已中断」、停止后 DB 块持久化为 `stopped`、取消不再打印回溯；未改 GenericAgent。
+4. §7 原来列出的「Web UI E2E」「DB blocks / 卡片渲染」「停止后立即发送」三项**已补齐**。
+
+
+---
+
+## 10. 停止路径小问题修复（2026-11-09，仅改 inner_chatgpt）
+
+> 用户要求：**不动 GenericAgent 一行代码**。本节所有改动都在 inner_chatgpt；
+> 本轮没有对 GenericAgent 仓库执行任何写操作（GA 工作树里若有既有改动，与本轮无关）。
+
+### 10.1 中断的工具步骤显示「运行中」→「已中断」
+
+- 新增 `frontend/src/toolState.ts`：未拿到 result 的步骤，只有消息仍在流式时才是 `running`；
+  消息已结束则返回 `stopped`。
+- `MessageList.tsx` 的 `StepRow` / `StepGroup` / `renderBlocks` 传入 `interrupted = !isActiveStream`；
+  步骤与分组文案显示「已中断」，CSS 新增 `.status-dot.stopped` / `.step-group-sum.stopped`。
+- 测试：`frontend/tests/toolState.test.ts`（4 条，`npm test`）。
+  反向确认：移除 `toolState.ts` 后测试全红。
+
+### 10.2 DB 子代理块停止后仍为 `running`
+
+- 根因：流被取消后，`except asyncio.CancelledError` 里的 `await _persist(...)` 会立刻再次抛
+  `CancelledError`，终态写库被丢掉；`finally` 里的租约释放同样会被取消。
+- 修复（`backend/app/routers/chat.py`）：新增 `_spawn_background` / `_drain_background_tasks`；
+  取消路径用 `_finalize_and_persist_after_cancel(...)` 把终态写库放到新任务，
+  `was_unknown` 收尾也走同一后台写。
+- 测试：`backend/tests/test_stop_persistence.py::test_cancel_terminal_finalizes_and_persists_in_background`。
+  反向确认：stash `chat.py` 后测试变红。
+
+### 10.3 停止时 `CancelledError` 回溯噪声
+
+- 租约释放改为 `_release_or_background(...)`：正常时 await；被取消时把释放动作交给新任务，
+  不再把 `team_store.release_generation` 的取消回溯打到 stderr。
+- `_cleanup_turn` 对 `host.close_all` / `acp.close_all` 的 `CancelledError` 单独处理：
+  记录 info 级「cancelled; settling in background」，仍然调度 `_settle_turn`，不再 `exc_info=True`。
+- 测试：`test_release_generation_after_cancel_is_retried_in_background`、
+  `test_cleanup_acp_cancellation_logs_without_traceback`（均含反向确认）。
+
+### 10.4 验证结果
+
+- 后端全量：**246 passed**（原 243 + 3 条停止持久化/噪声测试）。
+- 前端：`npm test` 4 passed；`npm run build` 成功。
+- 真机 Web 复验（固定后端 + 重建前端）：
+  - UI 停止后立即显示 `ga_wait ... 已中断`，刷新后仍为「已中断」；
+  - DB assistant 消息 `status=stopped`，子代理块 `status=stopped`（会话 `co_0dced37cf96f`）；
+  - 停止后同会话立即再发返回 `done complete`；
+  - `backend3.err.log` 8 行，无 `Traceback` / `CancelledError` / `release generation lease failed`；
+  - `genericagent_acp_bridge` 进程数 0。
+- **未改 GenericAgent**：桥、GA 配置、GA 代码均未动。
+- 仍未改的边界：停止时 SSE 直接关闭、没有 `done` 终帧（§9.3），这次不在修复范围。
+
+---
+
+## 11. 边界分析：停止时 SSE 直接关闭，会不会影响 GA？
+
+结论：**不影响 GA 的进程生命周期与会话正确性，可以保留。** 影响只在客户端协议层：
+第三方 SSE 客户端拿不到 `done` 终帧，需要把「连接被关闭」当作停止处理。
+
+### 11.1 两条通道是解耦的
+
+- SSE 是 **server → 浏览器** 的单向流；GA 是 **server → 子进程** 的 ACP stdio 通道。
+- `/stop` 的调用顺序是先停 GA、后杀 SSE（`request_stop` → `stop_acp_generation`
+  ≤2 s 优雅窗口 → `cancel_generation` → 子代理 → `code_run`），所以 SSE 关闭时
+  GA 的停止动作已经发出。
+- 即使 SSE 任务被取消，`_event_stream` 的 `finally` 仍会走 `_cleanup_turn`：
+  同步执行 `acp.stop_all_now()`（`mark_stopped` + `kill_tree_now`），再异步 `close_all()`。
+  取消安全的后台任务保证租约释放与终态写库（§10）。
+
+### 11.2 实测一：用户点停止
+
+- 会话 `co_0dced37cf96f`：`/stop` 返回 `stopped=1`，0.59 s；GA bridge 进程数 **0**；
+  DB 消息与子代理块均为 `stopped`；同会话立刻再发成功；`backend3.err.log` 无回溯。
+
+### 11.3 实测二：客户端直接断开、不调用 `/stop`
+
+这是比「停止时关 SSE」更严格的场景：
+
+- 会话 `co_1b9e10aa04a5`，GA 任务进入 `sleep 60` 后，客户端在 `subagent_start` 后
+  2.95 s **直接关闭 SSE 连接**，没有调用 `/stop`。
+- 关闭后 **1 s** 复查：GA bridge 进程数 **0**；assistant 消息 `status=stopped`；
+  子代理块 `status=stopped`。
+- 同会话立刻再发「只回复 OK」→ HTTP 200、`done complete`、正文 `OK`；
+  最终 bridge 进程数仍为 **0**。
+
+即：即使只关 SSE、不发停止请求，服务端的请求取消也会触发 `_cleanup_turn`，
+把 GA 子进程收掉；不存在「SSE 断了、GA 还在后台跑」的泄漏。
+
+### 11.4 对 GA 的实际影响边界
+
+- **没有进程泄漏**：两种路径实测 bridge 进程数都归零。
+- **没有跨轮状态损坏**：GA 会话按 generation 生命周期管理，本轮结束即回收；
+  bridge `loadSession=false`，本来就不保留跨轮上下文。
+- **在途工作会被丢弃**：这是「停止」的语义，不是 SSE 关闭造成的额外影响；
+  若 GA 正在写文件，可能留下写到一半的文件，和任何中断一样。
+- **唯一损失在客户端**：没有 `done` / `subagent_end` 终帧。当前 UI 用本地停止状态
+  和刷新兜底处理；第三方客户端需要把连接关闭当作终态。
+
+因此本次保留「停止时 SSE 直接关闭」的行为，不改协议；如果未来要服务第三方
+SSE 客户端，可以单独加「先发 `done` 再关流」或心跳，与 GA 侧无关。

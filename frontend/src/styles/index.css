@@ -235,6 +235,8 @@ textarea, input { caret-color: var(--clay); }
 .status-dot.done { background: var(--ok); }
 .status-dot.failed { background: var(--danger); }
 .status-dot.running { background: var(--clay); animation: breathe 1.6s ease-in-out infinite; }
+.status-dot.stopped { background: var(--line-strong); }
+.step-group-sum.stopped { color: var(--muted); }
 @keyframes breathe {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: .45; transform: scale(.72); }

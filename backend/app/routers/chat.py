@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -155,6 +156,41 @@ class _TurnUR:
 
 logger = logging.getLogger(__name__)
 
+# Cancellation-critical bookkeeping is moved to fresh tasks: once a streaming
+# task is cancelled, every *new* await in it raises immediately, so awaiting
+# the terminal DB write or the generation-lease release there would drop it.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> None:
+    """Run ``coro`` outside the caller's cancel scope and keep it referenced."""
+    try:
+        task = asyncio.create_task(coro)
+    except BaseException:
+        logger.warning("schedule background task failed", exc_info=True)
+        return
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+def _finalize_and_persist_after_cancel(
+    finalize: Callable[[str], None],
+    persist: Callable[[str], Awaitable[None]],
+    status: str,
+) -> None:
+    """Finalize in-memory blocks now, persist them from a fresh task."""
+    finalize(status)
+    _spawn_background(persist(status))
+
+
+async def _release_or_background(release: Callable[[], Awaitable[None]]) -> None:
+    """Await a lease release, retrying it in a fresh task if cancelled."""
+    try:
+        await release()
+    except asyncio.CancelledError:
+        _spawn_background(release())
+        raise
+
 
 async def _settle_turn(turn, user_id: str, session_id: str, generation_id: str,
                        status: str, hub=None) -> None:
@@ -260,8 +296,12 @@ async def _cleanup_turn(turn, hub, user_id: str, session_id: str, generation_id:
             logger.warning("release team lifecycle lease was interrupted", exc_info=True)
     try:
         await turn.host.close_all()
+    except asyncio.CancelledError:
+        logger.info("close subagent host cancelled; settling in background")
+        _schedule_settle()
+        return
     except BaseException:
-        logger.warning("close subagent host was interrupted", exc_info=True)
+        logger.warning("close subagent host failed", exc_info=True)
         _schedule_settle()
         return
     acp_interrupted = False
@@ -269,8 +309,11 @@ async def _cleanup_turn(turn, hub, user_id: str, session_id: str, generation_id:
     if callable(acp_close):
         try:
             await acp_close()
+        except asyncio.CancelledError:
+            logger.info("close ACP sessions cancelled; settling in background")
+            acp_interrupted = True
         except BaseException:
-            logger.warning("close ACP sessions was interrupted", exc_info=True)
+            logger.warning("close ACP sessions failed", exc_info=True)
             acp_interrupted = True
     if acp_interrupted:
         _schedule_settle()
@@ -564,8 +607,11 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
         yield frame("done", {"message_id": message_id, "status": status, "model": ur.model.model_name})
     except asyncio.CancelledError:
         terminal_status = "stopped"
-        _finalize_sub_blocks(terminal_status)
-        await _persist(terminal_status, force=True)
+        _finalize_and_persist_after_cancel(
+            _finalize_sub_blocks,
+            lambda status: _persist(status, force=True),
+            terminal_status,
+        )
         raise
     except Exception as e:  # noqa: BLE001
         terminal_status = "error"
@@ -587,13 +633,20 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                 logger.warning("turn cleanup failed", exc_info=True)
         if was_unknown:
             try:
-                _finalize_sub_blocks(terminal_status)
-                await _persist(terminal_status, force=True)
+                _finalize_and_persist_after_cancel(
+                    _finalize_sub_blocks,
+                    lambda status: _persist(status, force=True),
+                    terminal_status,
+                )
             except BaseException:
                 logger.warning("persist terminal status failed", exc_info=True)
         unregister_generation(user_id, session_id, generation_id)
         try:
-            await team_store.release_generation(user_id, session_id, generation_id)
+            await _release_or_background(
+                lambda: team_store.release_generation(user_id, session_id, generation_id)
+            )
+        except asyncio.CancelledError:
+            raise
         except BaseException:
             logger.warning("release generation lease failed", exc_info=True)
 
