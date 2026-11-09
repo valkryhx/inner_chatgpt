@@ -99,13 +99,13 @@
 路线图见 `docs/20261105-去LangChain依赖-决策记录.md`。
 开工前先按 0.3 的文档约定新建设计文档，再动代码；不得把未实现项写进 README / 本文件的能力描述。
 
-**P5：外部 GenericAgent（ACP）—— 已实现，manager 级 E2E 通过；1 个阻塞缺陷待修（2026-11-09）。**
+**P5：外部 GenericAgent（ACP）—— 已实现，manager 级真 GA E2E 通过（预检缺陷已修，2026-11-09）。**
 
 - 新增 `backend/app/acp/`：自写 JSON-RPC 行传输（`transport`）、握手与请求分发（`client`）、会话状态机与事件映射（`session`）、并发配额/会话名额/进程租约/停止级联（`manager`）、5 个 root-only 工具（`tools`）与只解析环境变量的配置层（`config`）。
 - 与既有 P2/P3 同构：GA 事件并入主对话 SSE（`subagent_start/_event/_end`），GA 进程注册 `ProcessLease`，`/stop` 走「优雅 cancel → 硬杀兜底」。
-- 真 GA manager 级 E2E 通过：哨兵任务（`file_write` 落盘 18 B 内容逐字节匹配，10 s）、停止后 `process_registry` 硬杀回收（`returncode=1`）。
-- ⚠️ **阻塞缺陷（未修）**：`AcpSessionManager.preflight()` 用 `print(b.__file__)` 取路径，而真 bridge 在 import 期把 fd 1 / text stdout 重定向到 stderr → 真机预检恒失败、`ga_*` 工具集不注册。单测用假模块（无重定向）所以全绿。修法与回归测试要求见记录 §5.1。
-- 未覆盖：Web UI E2E、GA 内部 subagent 事件透出、跨轮续跑（bridge `loadSession: false`）。
+- 真 GA manager 级 E2E 通过（HEAD `78c0b4f`，全新进程无缓存预热）：哨兵任务 7.9 s，GA 用 `file_write` 落盘 19 B（哨兵 + GA 自带的行尾换行，文件含哨兵即判通过）；停止后 `process_registry` 硬杀回收（`returncode=1`）。
+- **预检缺陷（E2E 中发现，已修复）**：原探针 `print(b.__file__)` 被真 bridge 在 import 期对 fd 1 / text stdout 的重定向击穿（真机预检恒失败 → `ga_*` 不注册；单测用假模块所以全绿）。`78c0b4f` 改为 `importlib.util.find_spec(<module>).origin`（只解析路径、不执行目标模块），并补了带 stdout 重定向副作用的回归测试；复验：全新进程预检 0.047 s 返回 site-packages 路径 + SHA256 `4e95c64b…`，5 个 `ga_*` 正常注入。详见记录 §5。
+- 未覆盖：Web UI E2E、GA 内部 subagent 事件透出、跨轮续跑（bridge `loadSession: false`）；`tasklist | findstr genericagent_acp_bridge` 对 GA 是假阴性，复核请按命令行过滤（见记录 §4.4）。
 - 详见 `docs/20261109-ACP-client驱动GenericAgent实施记录.md`；设计与工具契约见 `docs/20261109-ACP-client驱动GenericAgent设计与实施.md`。
 
 ### 0.2 必读文档（按顺序）
