@@ -41,6 +41,19 @@ class BrokenManager(FakeManager):
         raise RuntimeError("boom")
 
 
+class Evil:
+    """str() 会炸的返回值：用来验证「结果序列化失败也不能抛」。"""
+
+    def __str__(self):
+        raise RuntimeError("no str for you")
+
+
+class UnserializableManager(FakeManager):
+    async def stop(self, agent_id):
+        self.calls.append(("stop", agent_id))
+        return {"stopped": [Evil()]}
+
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -80,6 +93,27 @@ def test_tool_errors_become_readable_text():
     out = run(tools_of(BrokenManager())["ga_spawn"].call({"task": "x"}))
     assert out.startswith("[工具执行错误]")
     assert "boom" in out
+
+
+def test_spawn_rejects_null_task():
+    mgr = FakeManager()
+    out = run(tools_of(mgr)["ga_spawn"].call({"task": None}))
+    assert out.startswith("[工具执行错误]")
+    assert mgr.calls == []
+
+
+def test_result_close_string_false_is_false():
+    mgr = FakeManager()
+    run(tools_of(mgr)["ga_result"].call(
+        {"agent_id": "ga_x", "close": "false", "full": "0"}))
+    assert mgr.calls[0] == ("result", "ga_x",
+                            {"max_chars": 20000, "full": False, "close": False})
+
+
+def test_serialization_failure_becomes_readable_text():
+    out = run(tools_of(UnserializableManager())["ga_stop"].call({}))
+    assert out.startswith("[工具执行错误]")
+    assert "no str for you" in out
 
 
 def test_preflight_fails_fast_for_missing_module(tmp_path):

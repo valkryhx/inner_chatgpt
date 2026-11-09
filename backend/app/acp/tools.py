@@ -38,6 +38,18 @@ def _dumps(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+# 模型经常把布尔值写成字符串：``"false"`` / ``"0"`` / ``"no"`` / ``""`` 都必须当 False。
+# 否则 ``close="false"`` 会被 ``bool()`` 判成 True，真的把会话名额释放掉（不可逆）。
+_FALSE_STRINGS = frozenset({"false", "0", "no", ""})
+
+
+def _as_bool(value: Any) -> bool:
+    """宽进严出地解析布尔参数；真布尔、数字、None 走 Python 语义。"""
+    if isinstance(value, str):
+        return value.strip().lower() not in _FALSE_STRINGS
+    return bool(value)
+
+
 def _agent_id(args: dict) -> str | None:
     """``agent_id``：缺省 / 空串都表示 None（ga_wait、ga_stop 里 = 全部）。"""
     value = args.get("agent_id")
@@ -52,16 +64,20 @@ def build_acp_tools(manager: AcpSessionManager) -> list[Tool]:
 
     async def ga_spawn(args: dict) -> str:
         try:
+            task = str(args.get("task", "") or "").strip()
+            if not task:
+                # null / 空任务绝不能进 manager：那会白开一个会话并占住名额。
+                raise ValueError("task 不能为空")
             out = await manager.spawn(
-                task=str(args.get("task", "")),
+                task=task,
                 title=str(args.get("title", "") or ""),
                 mode=str(args.get("mode", "") or ""),
                 # 0 = 用服务端 prompt_timeout_s（默认 1800s），不在工具层写死。
                 timeout_s=float(args.get("timeout_s", 0) or 0),
             )
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001 - 工具永不抛
             return _error(e)
-        return _dumps(out)
 
     async def ga_wait(args: dict) -> str:
         try:
@@ -70,11 +86,11 @@ def build_acp_tools(manager: AcpSessionManager) -> list[Tool]:
                 timeout_s=float(args.get("timeout_s", 60) or 60),
                 since_seq=int(args.get("since_event_seq", 0) or 0),
             )
+            if isinstance(out, dict) and out.get("timed_out"):
+                out = {**out, "note": _WAIT_TIMEOUT_NOTE}
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _error(e)
-        if isinstance(out, dict) and out.get("timed_out"):
-            out = {**out, "note": _WAIT_TIMEOUT_NOTE}
-        return _dumps(out)
 
     async def ga_result(args: dict) -> str:
         try:
@@ -84,29 +100,29 @@ def build_acp_tools(manager: AcpSessionManager) -> list[Tool]:
             out = await manager.result(
                 agent_id,
                 max_chars=int(args.get("max_chars", 20000) or 20000),
-                full=bool(args.get("full", False)),
-                close=bool(args.get("close", False)),
+                full=_as_bool(args.get("full", False)),
+                close=_as_bool(args.get("close", False)),
             )
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _error(e)
-        return _dumps(out)
 
     async def ga_send(args: dict) -> str:
         try:
             agent_id = _agent_id(args)
             if not agent_id:
                 raise ValueError("agent_id 不能为空")
-            out = await manager.send(agent_id, str(args.get("message", "")))
+            out = await manager.send(agent_id, str(args.get("message", "") or ""))
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _error(e)
-        return _dumps(out)
 
     async def ga_stop(args: dict) -> str:
         try:
             out = await manager.stop(_agent_id(args))
+            return _dumps(out)
         except Exception as e:  # noqa: BLE001
             return _error(e)
-        return _dumps(out)
 
     return [
         Tool(
