@@ -104,6 +104,8 @@ class AcpProcess:
         self._env = dict(env)
         self._stderr_maxlen = max(int(stderr_lines), 1)
         self._stderr_tail: deque[str] = deque(maxlen=self._stderr_maxlen)
+        # deque 本身的 append 是原子的，但迭代不是：快照必须与写入互斥。
+        self._stderr_lock = threading.Lock()
 
         self._proc: subprocess.Popen[bytes] | None = None
         self._handle: AsyncProcHandle | None = None
@@ -162,7 +164,8 @@ class AcpProcess:
         """返回 stderr 的最后 ``n`` 行。"""
         if n <= 0:
             return []
-        return list(self._stderr_tail)[-n:]
+        with self._stderr_lock:
+            return list(self._stderr_tail)[-n:]
 
     # ------------------------------------------------------------------ 读写
 
@@ -260,7 +263,8 @@ class AcpProcess:
                 raw = reader.readline()
                 if not raw:
                     break
-                self._stderr_tail.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
+                with self._stderr_lock:
+                    self._stderr_tail.append(raw.decode("utf-8", "replace").rstrip("\r\n"))
         except (OSError, ValueError):
             pass
         finally:

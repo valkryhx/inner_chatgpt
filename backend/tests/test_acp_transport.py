@@ -100,3 +100,47 @@ def test_unknown_line_does_not_kill_reader():
             await p.close()
 
     run(scenario())
+
+
+
+def test_stderr_tail_snapshot_is_race_free():
+    """写线程持续压行、主线程反复取快照：不许抛 RuntimeError(deque mutated)。"""
+    import io
+    import threading
+
+    p = AcpProcess([sys.executable, "-c", "pass"], cwd=str(Path.cwd()),
+                   env={}, stderr_lines=5000)
+    read_fd, write_fd = os.pipe()
+    stop = threading.Event()
+
+    def write_lines():
+        i = 0
+        while not stop.is_set():
+            try:
+                os.write(write_fd, b"line %d\n" % i)
+            except OSError:      # 主线程已关写端
+                return
+            i += 1
+
+    reader = threading.Thread(target=p._read_stderr,
+                              args=(io.FileIO(read_fd, "rb", closefd=True),),
+                              name="test-stderr", daemon=True)
+    writer = threading.Thread(target=write_lines, name="test-stderr-writer", daemon=True)
+
+    # 默认 GIL 切换间隔 5ms，撞上 deque 迭代的窗口太小；压到 1us 把窗口放大
+    # （free-threaded 构建上这条测试才有机会真的复现 RuntimeError）。
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    reader.start()
+    writer.start()
+    try:
+        for _ in range(2000):
+            tail = p.stderr_tail(10)
+            assert len(tail) <= 10
+    finally:
+        stop.set()
+        writer.join(5)
+        os.close(write_fd)
+        reader.join(5)
+        sys.setswitchinterval(old_interval)
+    assert 0 < len(p.stderr_tail(10)) <= 10
