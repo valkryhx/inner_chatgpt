@@ -285,3 +285,15 @@ async def ack_notifications_db(ids: list[str]) -> int:
         )
         await conn.commit()
         return cur.rowcount
+
+async def get_latest_run_by_name(user_id: str, session_id: str, name: str) -> dict | None:
+    """按名字取本会话最近一次 run（跨 generation 回退用）。"""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM subagent_runs WHERE user_id=? AND session_id=? AND name=?"
+            " ORDER BY started_at DESC LIMIT 1",
+            (user_id, session_id, name),
+        )
+        row = await cur.fetchone()
+    return dict(row) if row else None

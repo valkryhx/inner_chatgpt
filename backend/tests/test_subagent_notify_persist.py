@@ -117,3 +117,50 @@ def test_drain_does_not_duplicate_within_one_host(isolated):
         assert len(host.drain_notifications()) == 0
 
     run(flow())
+
+
+def test_read_result_falls_back_to_db_in_new_generation(isolated):
+    """新 generation 的 host 里没有旧节点，read_agent_result 必须回退到 DB。"""
+    async def flow():
+        host = _host(generation="g1")
+        await host.spawn(task_name="calc", message="算 6*7")
+        await host.wait(targets=["calc"], timeout_s=10)
+        await asyncio.sleep(0.2)
+
+        nxt = _host(generation="g2")
+        res = await nxt.read_result("calc")
+        assert res["ok"] is True, res
+        assert "结果正文" in (res.get("result") or "")
+        assert res.get("source") == "db"
+
+    run(flow())
+
+
+def test_read_result_unknown_name_still_errors(isolated):
+    async def flow():
+        host = _host(generation="g2")
+        res = await host.read_result("nobody")
+        assert res["ok"] is False
+        assert "未知子代理" in res["error"]
+
+    run(flow())
+
+
+def test_read_agent_result_tool_works_across_generation(isolated):
+    """工具层不能假设返回体一定有 node 字段（DB 回退也要能拼 header）。"""
+    async def flow():
+        host = _host(generation="g1")
+        await host.spawn(task_name="calc", message="算 6*7")
+        await host.wait(targets=["calc"], timeout_s=10)
+        await asyncio.sleep(0.2)
+
+        from app.subagent.tools import build_subagent_tools
+
+        nxt = _host(generation="g2")
+        tools = {t.name: t for t in build_subagent_tools(nxt)}
+        out = await tools["read_agent_result"].call({"target": "calc"})
+        assert "[工具执行错误]" not in out
+        assert "子代理结果" in out
+        assert "结果正文" in out
+
+    run(flow())

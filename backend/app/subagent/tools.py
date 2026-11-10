@@ -24,6 +24,7 @@ def build_subagent_tools(host: SubagentHost) -> list[Tool]:
                 message=str(args.get("message", "")),
                 fork_turns=str(args.get("fork_turns", "none") or "none"),
                 background=bool(args.get("background", True)),
+            timeout_s=float(args.get("timeout_seconds", 0) or 0),
                 max_turns=int(args.get("max_turns", 0) or 0),
             )
         except SubagentError as e:
@@ -97,6 +98,8 @@ def build_subagent_tools(host: SubagentHost) -> list[Tool]:
                     "fork_turns": {"type": "string", "description": "none(默认,不继承对话) | all | recent:N"},
                     "background": {"type": "boolean", "description": "默认 true"},
                     "max_turns": {"type": "integer", "description": "可选，覆盖默认轮数上限"},
+                    "timeout_seconds": {"type": "number",
+                                        "description": "可选，墙钟超时秒数；默认 1800（30 分钟）"},
                 },
                 "required": ["task_name", "message"],
             },

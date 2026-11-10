@@ -58,7 +58,7 @@ class SubagentHost:
             max_depth=_env_int("SUBAGENT_MAX_DEPTH", 2),
             max_active=_env_int("SUBAGENT_MAX_ACTIVE", 4),
         )
-        self.timeout_s = _env_float("SUBAGENT_TIMEOUT_S", 300.0)
+        self.timeout_s = _env_float("SUBAGENT_TIMEOUT_S", 1800.0)
         self._change = asyncio.Event()
         self._closed = False
         # 子代理完成通知：peek/ack 分离，供母代理在 fold 点注入
@@ -68,7 +68,7 @@ class SubagentHost:
     async def spawn(self, *, task_name: str, message: str,
                     fork_turns: str = "none", background: bool = True,
                     max_turns: int = 0, team_id: str = "",
-                    role: str = "general") -> dict:
+                    role: str = "general", timeout_s: float = 0.0) -> dict:
         if self._closed:
             raise SubagentError("该会话的子代理宿主已关闭")
         if not (message or "").strip():
@@ -110,7 +110,8 @@ class SubagentHost:
             name=node.name, message=message,
             fork_turns=fork_turns or "none", max_turns=max_turns,
         )
-        node.task = asyncio.create_task(self._run_child(node, spec))
+        node.task = asyncio.create_task(
+            self._run_child(node, spec, timeout_s=float(timeout_s or 0) or None))
         self._publish({
             "type": "subagent_start",
             "agent_id": node.agent_id,
@@ -127,7 +128,8 @@ class SubagentHost:
             "note": "已派活。之后用 wait_agent 等待、read_agent_result 读取结果。",
         }
 
-    async def _run_child(self, node: AgentNode, spec: SubagentSpec) -> None:
+    async def _run_child(self, node: AgentNode, spec: SubagentSpec,
+                        *, timeout_s: float | None = None) -> None:
         last_seq = 0
         runtime = None
         started = time.monotonic()
@@ -168,13 +170,14 @@ class SubagentHost:
                     except Exception:
                         pass
 
-            await asyncio.wait_for(_drive(), timeout=self.timeout_s)
+            effective = float(timeout_s or self.timeout_s)
+            await asyncio.wait_for(_drive(), timeout=effective)
             node.status = "stopped" if node.stop.is_set() else "completed"
             node.turns = _count_turns(runtime.history)
             node.result = _final_text(runtime.history)
         except asyncio.TimeoutError:
             node.status = "stopped"
-            node.error = f"timeout: 超过 {int(self.timeout_s)}s"
+            node.error = f"timeout: 超过 {int(timeout_s or self.timeout_s)}s"
             node.result = _final_text(runtime.history) if runtime is not None else ""
         except asyncio.CancelledError:
             node.status = "stopped"
@@ -401,6 +404,21 @@ class SubagentHost:
     async def read_result(self, target: str, max_chars: int = MAX_READ_CHARS) -> dict:
         node = self.registry.get(target)
         if node is None:
+            # 跨 generation：旧节点已不在内存，回退到 DB 最近一次 run
+            row = await sub_store.get_latest_run_by_name(
+                self.ctx.user_id, self.ctx.session_id, target
+            )
+            if row and row.get("result_text"):
+                return {
+                    "ok": True,
+                    "name": target,
+                    "error": row.get("error") or "",
+                    "result": row["result_text"][:max_chars],
+                    "status": row.get("status", ""),
+                    "turns": row.get("turns", 0),
+                    "source": "db",
+                    "note": "该子代理属于上一轮，结果来自持久化记录",
+                }
             return {"ok": False, "error": f"未知子代理: {target}"}
         if not node.is_terminal:
             return {"ok": False,
