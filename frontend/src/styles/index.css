@@ -1250,3 +1250,60 @@ textarea, input { caret-color: var(--clay); }
 }
 .attach-btn:hover:not(:disabled) { background: var(--surface-2); color: var(--ink); }
 .attach-btn:disabled { opacity: .45; cursor: default; }
+
+/* ---------- 模型下拉（底部说明行） ---------- */
+.model-menu { position: relative; flex: 0 0 auto; }
+.model-menu-btn {
+  display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 6px;
+  border: none; border-radius: 6px; background: transparent; color: var(--muted);
+  font-size: 13px; cursor: pointer; max-width: 320px;
+}
+.model-menu-btn:hover:not(:disabled) { background: var(--surface-2); color: var(--ink); }
+.model-menu-btn:disabled { opacity: .5; cursor: default; }
+.mm-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mm-caret { font-size: 10px; opacity: .8; }
+
+.model-menu-pop {
+  position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 40;
+  min-width: 260px; max-width: 420px; padding: 4px;
+  background: var(--canvas); border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0,0,0,.12), inset 0 0 0 1px var(--line);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.mm-item {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 6px 8px; border: none; border-radius: 6px; background: transparent;
+  color: var(--ink); font-size: 13px; text-align: left; cursor: pointer;
+}
+.mm-item:hover { background: var(--surface-2); }
+.mm-item.active { color: var(--btn); }
+.mm-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mm-default { margin-left: auto; font-size: 11px; color: var(--clay); flex: 0 0 auto; }
+.mm-check { color: var(--ok); font-size: 12px; flex: 0 0 auto; }
+
+/* ---------- 侧栏「查看全部会话」 ---------- */
+.all-sessions { justify-content: flex-start; color: var(--muted); font-size: 13px; margin-top: 2px; }
+
+/* ---------- 全部会话弹窗 ---------- */
+.session-browser { width: min(720px, 92vw); max-height: 72vh; display: flex; flex-direction: column; }
+.sb-search { padding: 8px 20px 4px; }
+.sb-search input {
+  width: 100%; height: 34px; padding: 0 12px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--canvas); color: var(--ink); font-size: 14px;
+}
+.sb-search input:focus { outline: none; border-color: var(--clay); box-shadow: 0 0 0 3px var(--clay-soft); }
+.sb-list { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 12px 16px; }
+.sb-row {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px;
+  border-radius: 8px; cursor: pointer;
+}
+.sb-row:hover { background: var(--surface-2); }
+.sb-row.active { background: var(--clay-soft); }
+.sb-main { flex: 1; min-width: 0; }
+.sb-title { font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.sb-row .icon-btn { color: var(--muted); }
+.sb-more { align-self: center; margin: 8px auto 0; display: block; }
+
+/* 「查看全部会话」固定在会话滚动区下方，始终可见 */
+.all-sessions { flex: 0 0 auto; margin: 4px 0 2px; height: 32px; padding: 0 8px; }

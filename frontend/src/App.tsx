@@ -3,6 +3,8 @@ import { api, getToken, setToken, streamMessage } from './api'
 import type { Attachment, ContextUsage, LlmModelOption, Message, Session, StreamEvent, TeamEvent, TeamSnapshot, User } from './types'
 import Sidebar from './components/Sidebar'
 import MessageList from './components/MessageList'
+import ModelMenu from './components/ModelMenu'
+import SessionBrowser from './components/SessionBrowser'
 import Composer from './components/Composer'
 import LoginPage from './components/LoginPage'
 import SettingsModal from './components/SettingsModal'
@@ -119,6 +121,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [sessions, setSessions] = useState<Session[]>([])
+  const [allSessionsOpen, setAllSessionsOpen] = useState(false)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [streaming, setStreaming] = useState(false)
@@ -690,33 +693,14 @@ export default function App() {
   })()
   const activeModelLabel = activeModel ? activeModel.model : null
 
-  // 模型选择器：位置对齐 claude.ai 的底部说明行（不再放在顶栏）
+  // 模型选择器：底部说明行右侧；用自定义下拉，避免把「（默认）」塞进值里被截断。
   const modelSelector = (
-    <label className="model-picker" title={activeSession ? '切换本会话使用的模型（会话级）' : '新会话将使用该模型'}>
-      <span className="model-picker-label">模型</span>
-      <select
-        value={currentModelId}
-        disabled={streaming || models.length === 0}
-        onChange={(e) => changeModel(e.target.value)}
-      >
-        {models.length === 0 && (
-          <option value="">
-            {activeSession?.model_id ? '（该配置不可用）' : '（尚未配置模型）'}
-          </option>
-        )}
-        {/* 会话记录的模型已不可用（被删除/停用）时，避免下拉框显示为空白 */}
-        {models.length > 0 && currentModelId !== '' &&
-          !models.some((m) => m.id === currentModelId) && (
-            <option value={currentModelId}>（该配置不可用）</option>
-          )}
-        {models.map((m) => (
-          <option key={m.id} value={m.id}>
-            {m.label} · {m.model}
-            {m.is_default ? '（默认）' : ''}
-          </option>
-        ))}
-      </select>
-    </label>
+    <ModelMenu
+      models={models}
+      currentId={currentModelId}
+      disabled={streaming}
+      onChange={changeModel}
+    />
   )
 
   return (
@@ -733,6 +717,7 @@ export default function App() {
         onRename={renameSession}
         onOpenSettings={() => setSettingsOpen(true)}
         onLogout={doLogout}
+        onOpenAllSessions={() => setAllSessionsOpen(true)}
       />
       <div className="main">
         <div className="main-header">
@@ -798,6 +783,14 @@ export default function App() {
           modelSelector={modelSelector}
         />
       </div>
+      <SessionBrowser
+        open={allSessionsOpen}
+        activeId={activeId}
+        initial={sessions}
+        onClose={() => setAllSessionsOpen(false)}
+        onSelect={(id) => { selectSession(id); setAllSessionsOpen(false) }}
+        onDelete={deleteSession}
+      />
       <TeamPanel
         snapshot={teamSnapshot}
         open={teamOpen}

@@ -114,7 +114,8 @@ export const api = {
   me: () => request<User>('/auth/me'),
 
   // sessions
-  listSessions: () => request<{ sessions: Session[]; has_more: boolean }>('/sessions?limit=100'),
+  listSessions: (limit = 100, offset = 0) =>
+    request<{ sessions: Session[]; has_more: boolean }>(`/sessions?limit=${limit}&offset=${offset}`),
   createSession: (title?: string, modelId?: string) =>
     request<Session>('/sessions', {
       method: 'POST',

@@ -13,6 +13,7 @@ interface Props {
   onRename: (id: string, title: string) => void
   onOpenSettings: () => void
   onLogout: () => void
+  onOpenAllSessions: () => void
 }
 
 function timeAgo(ts: number): string {
@@ -37,6 +38,7 @@ export default function Sidebar({
   onRename,
   onOpenSettings,
   onLogout,
+  onOpenAllSessions,
 }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
@@ -156,16 +158,11 @@ export default function Sidebar({
         )}
         {rest.map(row)}
       </div>
+      <button className="side-nav-item all-sessions" onClick={onOpenAllSessions}>
+        查看全部会话
+      </button>
 
       <div className="sidebar-footer">
-        <div className="foot-status">
-          <span className="dot" />
-          {activeModel
-            ? `${activeModel} · ${health?.mcp_tools ?? 0} 个工具`
-            : health
-              ? `${health.model || '未配置模型'} · ${health.mcp_tools} 个工具`
-              : '连接中…'}
-        </div>
         <div className="user-bar">
           <button
             type="button"
