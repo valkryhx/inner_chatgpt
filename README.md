@@ -89,9 +89,9 @@ cd ../frontend
 npm install
 npm run build
 
-# 3) 启动后端
+# 3) 启动后端（带 A2A，PowerShell 版见下方「后端启动（日常）」）
 cd ../backend
-python run.py                        # http://127.0.0.1:8000
+INNER_A2A_ENABLED=true INNER_A2A_PUBLIC_BASE_URL=http://127.0.0.1:8000 python run.py
 ```
 
 首次启动会自动创建空的 `backend/data/app.db`（无任何用户/会话）。
@@ -103,14 +103,39 @@ python run.py                        # http://127.0.0.1:8000
 
 - 健康检查：`GET http://127.0.0.1:8000/api/health`（`model` 为空表示 Hlaudz 没有可选的 `llm.yaml` 兜底，属正常）
 - 若 `frontend/dist` 存在，后端会自动在 `/` 托管前端（单端口访问）。
-- 需要 A2A 时，启动前设置 `INNER_A2A_ENABLED=true` 和 `INNER_A2A_PUBLIC_BASE_URL`（例如 `http://127.0.0.1:8000`），再在「设置 → A2A 接入」创建 token。
+- A2A 需要实例级开关：按下方「后端启动（日常）」带环境变量启动，再登录到「设置 → A2A 接入」打开你自己的开关并创建 token。
 
 ### 后端启动（日常）
 
-```bash
-cd backend
+**推荐带 A2A 启动**（Windows PowerShell）：
+
+```powershell
+cd D:\git_codes\inner_chatgpt\backend
+$env:INNER_A2A_ENABLED="true"
+$env:INNER_A2A_PUBLIC_BASE_URL="http://127.0.0.1:8000"
 python run.py                        # http://127.0.0.1:8000
 ```
+
+存成一行（新开终端时环境变量不会保留，所以每次都要带上）：
+
+```powershell
+cd D:\git_codes\inner_chatgpt\backend; $env:INNER_A2A_ENABLED="true"; $env:INNER_A2A_PUBLIC_BASE_URL="http://127.0.0.1:8000"; python run.py
+```
+
+Linux / macOS / Git Bash 同理：
+
+```bash
+cd backend
+INNER_A2A_ENABLED=true INNER_A2A_PUBLIC_BASE_URL=http://127.0.0.1:8000 python run.py
+```
+
+三个要点：
+
+1. `INNER_A2A_ENABLED=true` 是**实例级硬闸**——不设就完全没有 A2A 端点（AgentCard、JSON-RPC、token 管理一律 404）。
+2. 它只是「允许开」，**用户级开关默认关**：登录后到「设置 → A2A 接入」点一下才会真正响应外部调用；随时可关，**不用重启**。
+3. `INNER_A2A_PUBLIC_BASE_URL` 必须是外部客户端实际能访问到的地址（反代后的域名 / 内网地址），它会写进 AgentCard 和 token 返回的 URL。
+
+不需要 A2A 时，直接 `python run.py` 即可。
 
 ### 前端启动（开发模式）
 
