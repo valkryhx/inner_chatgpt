@@ -1,0 +1,3 @@
+# 技能包里的 zip 是二进制，必须原样入库（不能被 eol=lf 改写）。
+# 文本部分（SKILL.md / references / assets/*.csv）仍走仓库根 .gitattributes 的 LF 规范化。
+*.zip binary
