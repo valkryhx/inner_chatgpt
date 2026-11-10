@@ -113,6 +113,7 @@ backend/tests/e2e/runs/<runId>/messages.json  # 持久化后的消息列表
 | S8 | 工具选择 | 「在 backend 目录找所有 TODO 并统计」 | 出现 `file_grep`，**不出现** `code_run` |
 | S9 | 并发槽位 | 「同一轮一次性派 6 个（每个先 sleep 8 秒）」 | 前 4 个成功；第 5/6 个返回「已达上限 4」；模型 close 后补派；最终 6 个 completed |
 | S10 | 长任务 | 「派一个 sleep 660 秒的子代理」 | 跨多轮 wait 后拿到结果；无重复 spawn；事件缓冲不丢 |
+| S12 | 跨回合通知 | 两轮对话：第一轮派活后结束，第二轮问结果 | 第二轮不重新 spawn；`read_agent_result` 能取到上一代结果（source=db）；history 含「[任务通知]」 |
 | S11（计划） | 大输出 | 「跑 pytest 并列出失败详情」 | 出现落盘路径且模型能读回 |
 | S0 | 负对照 | 「今天几号」 | 无 spawn / 无搜索工具 |
 
