@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import type { ReactNode, WheelEvent } from 'react'
 import type { ChartBlock, Message, MessageBlock, SubagentBlock, SummaryBlock, ToolBlock } from '../types'
 import ChartView from './ChartView'
+import MarkdownImage from './MarkdownImage'
 import Markdown from './Markdown'
 import SubagentCard from './SubagentCard'
 import { basename, downloadWorkspaceFile } from '../files'
@@ -242,7 +243,23 @@ function renderBlocks(
       i = j
       continue
     }
-    if (block.type === 'summary') {
+    if (block.type === 'attachments') {
+      const items = (block as { type: 'attachments'; items: { path: string; name?: string }[] }).items || []
+      if (items.length) {
+        out.push(
+          <div className="msg-attachments" key={'att_' + i}>
+            {items.map((it, k) => (
+              <MarkdownImage
+                key={'att_' + i + '_' + k}
+                src={it.path}
+                alt={it.name || '图片'}
+                onSettled={() => onImageSettled?.()}
+              />
+            ))}
+          </div>,
+        )
+      }
+    } else if (block.type === 'summary') {
       out.push(<SummaryCard key={'sum_' + i} block={block} />)
     } else if (block.type === 'reasoning') {
       out.push(<ReasoningSection key={'reason_' + i} text={block.text} live={i === liveIdx} />)
@@ -347,6 +364,7 @@ function MessageRow({ msg, onImageSettled, onOpenWorkspace }: {
     if (b.type === 'text' || b.type === 'reasoning') return !!b.text
     if (b.type === 'tool') return true
     if (b.type === 'chart' || b.type === 'summary') return true
+    if (b.type === 'attachments') return !!((b as { items?: unknown[] }).items || []).length
     if (b.type === 'subagent') {
       const s = b as SubagentBlock
       return !!(s.task || s.status || s.result || (s.events && s.events.length))

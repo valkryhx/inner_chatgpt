@@ -136,7 +136,18 @@ def _to_chat_messages(messages: list[dict], system_prompt: str) -> list[dict]:
             continue
         item: dict[str, Any] = {"role": role}
         content = m.get("content", "")
-        item["content"] = content if isinstance(content, str) else str(content or "")
+        text = content if isinstance(content, str) else str(content or "")
+        images = m.get("image_urls") if role == "user" else None
+        if images:
+            # 只有带图时 content 才变成数组；没图时逐字节保持原来的字符串形态。
+            parts: list[dict[str, Any]] = []
+            if text:
+                parts.append({"type": "text", "text": text})
+            for url in images:
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+            item["content"] = parts
+        else:
+            item["content"] = text
         if role == "assistant":
             if m.get("reasoning"):
                 item["reasoning_content"] = m["reasoning"]
@@ -168,6 +179,9 @@ def _to_responses_input(messages: list[dict]) -> list[dict]:
         text = content if isinstance(content, str) else str(content or "")
         if text:
             parts.append({"type": "output_text" if role == "assistant" else "input_text", "text": text})
+        if role == "user":
+            for url in (m.get("image_urls") or []):
+                parts.append({"type": "input_image", "image_url": url})
         if not parts:
             parts = [{"type": "output_text" if role == "assistant" else "input_text", "text": "."}]
         result.append({"role": role, "content": parts})

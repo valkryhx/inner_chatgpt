@@ -69,9 +69,17 @@ class UpdateSessionIn(BaseModel):
     model_id: Optional[str] = None
 
 
+class AttachmentIn(BaseModel):
+    path: str
+    name: Optional[str] = None
+    mime: Optional[str] = None
+
+
 class SendMessageIn(BaseModel):
-    text: str
+    text: str = ""
     generation_id: Optional[str] = None
+    # 可选：随消息发送的图片引用（必须先通过 POST /api/me/uploads 落盘）。
+    attachments: list[AttachmentIn] = []
 
 
 class StopIn(BaseModel):

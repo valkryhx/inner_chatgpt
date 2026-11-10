@@ -36,7 +36,7 @@ def test_reasoning_kept_in_event_order(monkeypatch):
         captured["blocks"] = fields.get("blocks")
         captured["status"] = fields.get("status")
 
-    async def fake_run_agent_stream(ur, session_id, text, stop_event=None):
+    async def fake_run_agent_stream(ur, session_id, text, stop_event=None, attachments=None):
         yield {"type": "thinking_delta", "text": "先想一下"}
         yield {"type": "tool_start", "id": "c1", "name": "code_run", "input": {"code": "1+1"}}
         yield {"type": "tool_result", "id": "c1", "name": "code_run", "content": "2", "is_error": False}
@@ -92,7 +92,7 @@ def test_reasoning_consecutive_chunks_merge(monkeypatch):
     async def fake_update_message(message_id, **fields):
         captured["blocks"] = fields.get("blocks")
 
-    async def fake_run_agent_stream(ur, session_id, text, stop_event=None):
+    async def fake_run_agent_stream(ur, session_id, text, stop_event=None, attachments=None):
         yield {"type": "thinking_delta", "text": "A"}
         yield {"type": "thinking_delta", "text": "B"}
         yield {"type": "text_delta", "text": "ans"}
@@ -138,7 +138,7 @@ def test_stop_persists_partial_text_before_done(monkeypatch):
     async def fake_update_message(message_id, **fields):
         snapshots.append(dict(fields))
 
-    async def fake_run_agent_stream(ur, session_id, text, stop_event=None):
+    async def fake_run_agent_stream(ur, session_id, text, stop_event=None, attachments=None):
         yield {"type": "text_delta", "text": "已经生成的前半段"}
         raise asyncio.CancelledError()
 
@@ -269,7 +269,7 @@ def _wire_event_stream(monkeypatch, fake_run_agent_stream, captured):
 def test_complete_terminal_status_is_not_overwritten(monkeypatch):
     snapshots = []
 
-    async def fake_run_agent_stream(ur, session_id, text, stop_event=None):
+    async def fake_run_agent_stream(ur, session_id, text, stop_event=None, attachments=None):
         yield {"type": "text_delta", "text": "完整回复"}
         yield {"type": "done", "status": "complete"}
 
@@ -283,7 +283,7 @@ def test_complete_terminal_status_is_not_overwritten(monkeypatch):
 def test_upstream_error_terminal_status_is_not_overwritten(monkeypatch):
     snapshots = []
 
-    async def fake_run_agent_stream(ur, session_id, text, stop_event=None):
+    async def fake_run_agent_stream(ur, session_id, text, stop_event=None, attachments=None):
         yield {"type": "text_delta", "text": "失败前内容"}
         yield {"type": "error", "error": "模型服务失败"}
 
@@ -297,7 +297,7 @@ def test_upstream_error_terminal_status_is_not_overwritten(monkeypatch):
 def test_cancel_terminal_status_is_stopped(monkeypatch):
     snapshots = []
 
-    async def fake_run_agent_stream(ur, session_id, text, stop_event=None):
+    async def fake_run_agent_stream(ur, session_id, text, stop_event=None, attachments=None):
         yield {"type": "text_delta", "text": "中断前内容"}
         raise asyncio.CancelledError()
 

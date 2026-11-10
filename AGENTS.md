@@ -118,6 +118,16 @@
 - 验证：`backend/tests/test_a2a_mvp.py`（13）+ `backend/tests/test_a2a_policy.py`（12），后端全量 271 passed；真实 A2A CLI v0.4.0 E2E（同步/流式/订阅/取消/幂等/配额/档位）。
 - 详见 `docs/20261110-A2A使用文档.md`、`docs/20261110-A2A-MVP实施记录.md`；协议调研见 `docs/20261109-A2A协议接入调研与设计.md`。
 
+**P7：图片上传与视觉输入 —— 已完成（2026-11-10）。**
+
+- 存储：`backend/data/workspaces/<user_id>/uploads/<uuid>.<ext>`；DB 只存引用（`messages.blocks` 的
+  `attachments` 块），历史里不存 base64。
+- 链路：`POST /api/me/uploads` → `SendMessageIn.attachments` → `sse.run_agent_stream` →
+  `agent_loop` 送模型前用**副本**展开成 data URL → `llm_client` 转 `image_url` / `input_image`。
+- 真实 E2E：带图问「图里是什么数字」答 `42`；新会话无图时明确回答"没有图片附件"（负对照）。
+- 限制：单条 4 张 / 单张 25MB；只带最近 3 轮图片；删消息不删文件（无 GC）；A2A 暂不传图。
+- 详见 `docs/20261110-图片上传与视觉输入设计方案.md`、`docs/20261110-changelog-图片上传与视觉输入.md`。
+
 ### 0.2 必读文档（按顺序）
 
 | 文档 | 用途 |

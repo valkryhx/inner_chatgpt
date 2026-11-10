@@ -196,7 +196,16 @@ class AgentLoop:
 
             async def _drive():
                 try:
-                    res = await self.client.run(history, self.registry.schemas(),
+                    # 图片只在「送模型的那一份」里展开成 data URL：
+                    # history 本身要保持纯文本，否则 base64 会被持久化进 session_history。
+                    wire = history
+                    if self.user_id:
+                        try:
+                            from .uploads import expand_images_for_wire
+                            wire = expand_images_for_wire(history, self.user_id)
+                        except Exception:
+                            wire = history
+                    res = await self.client.run(wire, self.registry.schemas(),
                                                 on_delta=on_delta_q, stop_check=stopped)
                     return res
                 finally:

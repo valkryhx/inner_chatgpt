@@ -14,10 +14,11 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
 from ..auth import get_current_user
+from .. import uploads
 from ..workspace import PathSecurityError, normalize_workspace_path, safe_read_path
 
 router = APIRouter(prefix="/api/me", tags=["media"])
@@ -96,3 +97,18 @@ async def workspace_image(
         # 即使用于 <img>，也避免直接打开 SVG 时执行脚本/外链。
         headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
     return FileResponse(target, media_type=media_type, headers=headers)
+
+
+@router.post("/uploads")
+async def upload_image(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    """接收一张图片，落到 <user workspace>/uploads/，返回引用。
+
+    前端上传后拿到 ``path``，随消息发送时只需带上这个引用；
+    读取仍走既有的 ``GET /api/me/workspace-image``，不需要新接口。
+    """
+    data = await file.read(uploads.MAX_IMAGE_BYTES + 1)
+    try:
+        meta = uploads.save_image(user["id"], file.filename or "", data)
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from None
+    return {**meta, "url": f"/api/me/workspace-image?path={meta['path']}"}

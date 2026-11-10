@@ -2,6 +2,7 @@ import type {
   A2AAgentInfo,
   A2AToken,
   A2ATokenCreated,
+  Attachment,
   AuthResponse,
   ContextUsage,
   LLMConfig,
@@ -10,6 +11,7 @@ import type {
   Session,
   SessionDetail,
   Message,
+  UploadedImage,
   StopResult,
   StreamEvent,
   User,
@@ -292,17 +294,43 @@ function parseFrame(raw: string): { event: string; data: StreamEvent } | null {
   }
 }
 
+export async function uploadImage(file: File): Promise<UploadedImage> {
+  const form = new FormData()
+  form.append('file', file)
+  const res = await fetch(`${BASE}/me/uploads`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: form,
+  })
+  if (!res.ok) {
+    let detail = `上传失败 (${res.status})`
+    try {
+      const body = await res.json()
+      detail = body.detail || body.error || detail
+    } catch {
+      /* ignore */
+    }
+    throw new Error(detail)
+  }
+  return (await res.json()) as UploadedImage
+}
+
 export async function streamMessage(
   sessionId: string,
   text: string,
   generationId: string,
   onEvent: (ev: StreamEvent) => void,
   signal?: AbortSignal,
+  attachments?: Attachment[],
 ): Promise<void> {
   const res = await fetch(`${BASE}/sessions/${sessionId}/messages`, {
     method: 'POST',
     headers: authHeaders({ 'content-type': 'application/json', accept: 'text/event-stream' }),
-    body: JSON.stringify({ text, generation_id: generationId }),
+    body: JSON.stringify({
+      text,
+      generation_id: generationId,
+      ...(attachments && attachments.length ? { attachments } : {}),
+    }),
     signal,
   })
   if (!res.ok || !res.body) {

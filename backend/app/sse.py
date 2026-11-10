@@ -84,6 +84,7 @@ async def run_agent_stream(
     session_id: str,
     user_text: str,
     stop_event: asyncio.Event | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Load history, append the user message, run the AgentLoop, yield normalized events.
 
@@ -101,7 +102,11 @@ async def run_agent_stream(
             history = await store.get(user_id, session_id)
         else:
             history = await store.get(session_id)
-    history.append({"role": "user", "content": user_text})
+    user_msg: dict[str, Any] = {"role": "user", "content": user_text}
+    if attachments:
+        # 只存引用（path/mime/name），base64 在送模型时才展开。
+        user_msg["attachments"] = attachments
+    history.append(user_msg)
     if store is not None:
         if user_id:
             await store.set(user_id, session_id, history)

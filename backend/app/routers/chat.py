@@ -21,6 +21,7 @@ from ..process_registry import stop_generation as stop_code_runs
 from .. import team_store
 from ..schemas import CompactResult, MessageOut, SendMessageIn, StopIn, StopResult
 from ..sse import run_agent_stream, sse_frame
+from .. import uploads
 from ..subagent.context import AgentContext
 from ..subagent.session import build_turn_runtime, prepare_turn_team
 
@@ -331,7 +332,8 @@ router = APIRouter(prefix="/api", tags=["chat"])
 
 async def _event_stream(user_id: str, session_id: str, text: str, generation_id: str, message_id: str,
                         model_id: str = "", stop_event: asyncio.Event | None = None,
-                        tool_policy: str = "full") -> AsyncIterator[str]:
+                        tool_policy: str = "full",
+                        attachments: list[dict] | None = None) -> AsyncIterator[str]:
     # Register/capture the current streaming task at the very top.  The
     # prelude below can await runtime construction and compaction; registering
     # only after it would leave stop unable to cancel a request that is stuck
@@ -343,7 +345,8 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     # rows so history is consistent, but do not build a runtime or call an LLM.
     if stop_event.is_set():
         try:
-            await db.add_message(session_id, "user", content=text)
+            await db.add_message(session_id, "user", content=text,
+                                 blocks=_attachment_blocks(attachments))
             await db.add_message(session_id, "assistant", content="", status="stopped",
                                  message_id=message_id)
         except Exception:
@@ -363,7 +366,8 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     # the stop endpoint must at least find the user row and assistant
     # placeholder to converge, instead of erasing what they just typed.
     try:
-        await db.add_message(session_id, "user", content=text)
+        await db.add_message(session_id, "user", content=text,
+                             blocks=_attachment_blocks(attachments))
         await db.add_message(session_id, "assistant", content="", status="streaming", message_id=message_id)
     except Exception:
         pass
@@ -516,11 +520,12 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
             turn_ur = _TurnUR(turn)
             if not getattr(turn_ur, "user_id", ""):
                 turn_ur.user_id = user_id
-            events = _merged_events(run_agent_stream(turn_ur, session_id, text, stop_event),
+            events = _merged_events(run_agent_stream(turn_ur, session_id, text, stop_event,
+                                                     attachments=attachments),
                                     turn.buffer, turn.host, stop_event,
                                     extra=getattr(turn, "acp", None))
         else:
-            events = run_agent_stream(ur, session_id, text, stop_event)
+            events = run_agent_stream(ur, session_id, text, stop_event, attachments=attachments)
 
         async for ev in events:
             et = ev["type"]
@@ -657,7 +662,8 @@ async def send_message(session_id: str, body: SendMessageIn, user: dict = Depend
     sess = await db.get_session(session_id, user["id"])
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
-    if not body.text.strip():
+    attachments = await _validate_attachments(user["id"], body.attachments)
+    if not body.text.strip() and not attachments:
         raise HTTPException(status_code=400, detail="empty text")
     generation_id = body.generation_id or db.new_id("g")
     # One active generation per (user, session). Without this lease two tabs
@@ -696,6 +702,7 @@ async def send_message(session_id: str, body: SendMessageIn, user: dict = Depend
             async for chunk in _event_stream(
                 user["id"], session_id, body.text, generation_id, message_id,
                 sess.get("model_id", "") or "", stop_event=stop_event,
+                attachments=attachments or None,
             ):
                 yield chunk
         finally:
@@ -879,3 +886,32 @@ async def mcp_tools(user: dict = Depends(get_current_user)):
                                "input_schema": t.input_schema} for t in tools]}
         except Exception:
             return {"tools": []}
+
+
+def _attachment_blocks(attachments: list[dict] | None) -> list[dict]:
+    """把图片引用写进消息块，供前端回看；正文仍然是纯文本。"""
+    if not attachments:
+        return []
+    return [{"type": "attachments", "items": list(attachments)}]
+
+
+async def _validate_attachments(user_id: str, items) -> list[dict]:
+    """校验引用确实属于当前用户的 uploads/，并补全 mime/size。"""
+    out: list[dict] = []
+    for item in items or []:
+        try:
+            path = uploads.resolve_attachment(user_id, item.path)
+        except uploads.UploadError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from None
+        out.append({
+            "path": str(item.path).strip().lstrip("/"),
+            "name": item.name or path.name,
+            "mime": item.mime or uploads.MIME_BY_SUFFIX.get(path.suffix.lower(), ""),
+            "size": path.stat().st_size,
+        })
+    if len(out) > uploads.MAX_IMAGES_PER_MESSAGE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"单条消息最多 {uploads.MAX_IMAGES_PER_MESSAGE} 张图片",
+        )
+    return out

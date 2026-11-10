@@ -159,7 +159,25 @@ export interface TeamSnapshot {
   messages: TeamMessage[]
 }
 
+export interface Attachment {
+  path: string
+  name?: string
+  mime?: string
+  size?: number
+}
+
+/** 上传成功后的返回值：多一个可直接渲染的鉴权读取地址。 */
+export interface UploadedImage extends Attachment {
+  url: string
+}
+
+export interface AttachmentsBlock {
+  type: 'attachments'
+  items: Attachment[]
+}
+
 export type MessageBlock =
+  | AttachmentsBlock
   | TextBlock
   | ToolBlock
   | SummaryBlock

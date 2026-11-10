@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, getToken, setToken, streamMessage } from './api'
-import type { ContextUsage, LlmModelOption, Message, Session, StreamEvent, TeamEvent, TeamSnapshot, User } from './types'
+import type { Attachment, ContextUsage, LlmModelOption, Message, Session, StreamEvent, TeamEvent, TeamSnapshot, User } from './types'
 import Sidebar from './components/Sidebar'
 import MessageList from './components/MessageList'
 import Composer from './components/Composer'
@@ -417,8 +417,8 @@ export default function App() {
     })
   }
 
-  const send = async (text: string) => {
-    if (!text.trim() || streaming) return
+  const send = async (text: string, attachments: Attachment[] = []) => {
+    if ((!text.trim() && attachments.length === 0) || streaming) return
     setError(null)
     setTeamSnapshot(null)
     setTeamError(null)
@@ -436,7 +436,12 @@ export default function App() {
       role: 'user',
       content: text,
       reasoning: '',
-      blocks: [{ type: 'text', text }],
+      blocks: [
+        ...(text ? [{ type: 'text' as const, text }] : []),
+        ...(attachments.length
+          ? [{ type: 'attachments' as const, items: attachments }]
+          : []),
+      ],
       status: 'complete',
       created_at: Date.now(),
     }
@@ -582,7 +587,7 @@ export default function App() {
     }
 
     try {
-      await streamMessage(sid, text, genId, onEvent, ctrl.signal)
+      await streamMessage(sid, text, genId, onEvent, ctrl.signal, attachments)
     } catch (e) {
       if (!ctrl.signal.aborted) {
         const msg = String(e)
