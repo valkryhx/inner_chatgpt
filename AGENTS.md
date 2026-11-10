@@ -67,7 +67,7 @@
 - 子代理用**独立侧链 history**，不写 `session_history`，避免主对话被中间产物污染。
 - 子代理事件并入主对话同一条 SSE（`subagent_start` / `subagent_event` / `subagent_end`），
   前端新增可折叠 `SubagentCard`。
-- 停止级联（主 stop → 所有子代理 stop + cancel）、`wait` 超时不杀子、墙钟 `SUBAGENT_TIMEOUT_S`、
+- 停止级联（主 stop → 所有子代理 stop + cancel）、`wait` 超时不杀子、墙钟 `SUBAGENT_TIMEOUT_S`（2026-11-11 起默认 1800s，可按次用 `spawn_agent(timeout_seconds=…)` 覆盖）、
   `wait_agent.since_event_seq` 增量事件。
 - 单测 62 项通过（原 42 + 新增 20），前端 `npm run build` 通过，3 次真实 LLM E2E + Playwright UI 验证。
 
