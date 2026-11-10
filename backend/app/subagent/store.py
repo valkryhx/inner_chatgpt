@@ -38,6 +38,17 @@ CREATE TABLE IF NOT EXISTS subagent_messages (
     created_at    INTEGER NOT NULL,
     PRIMARY KEY (run_id, seq)
 );
+CREATE TABLE IF NOT EXISTS subagent_notifications (
+    id            TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL,
+    session_id    TEXT NOT NULL,
+    generation_id TEXT NOT NULL DEFAULT '',
+    agent_name    TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    preview       TEXT NOT NULL DEFAULT '',
+    created_at    INTEGER NOT NULL,
+    acked_at      INTEGER
+);
 """
 _SCOPE_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_subruns_scope
@@ -235,3 +246,42 @@ async def mark_stale_running_as_errored(reason: str = "restarted") -> int:
         n = cur.rowcount or 0
         await conn.commit()
     return n
+
+async def add_notification(*, nid: str, user_id: str, session_id: str,
+                           generation_id: str, agent_name: str, status: str,
+                           preview: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "INSERT OR IGNORE INTO subagent_notifications"
+            "(id,user_id,session_id,generation_id,agent_name,status,preview,created_at)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (nid, user_id, session_id, generation_id, agent_name, status, preview, now_ms()),
+        )
+        await conn.commit()
+
+
+async def list_pending_notifications(user_id: str, session_id: str,
+                                     limit: int = 20) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM subagent_notifications"
+            " WHERE user_id=? AND session_id=? AND acked_at IS NULL"
+            " ORDER BY created_at ASC LIMIT ?",
+            (user_id, session_id, max(1, min(int(limit), 100))),
+        )
+        rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def ack_notifications_db(ids: list[str]) -> int:
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            f"UPDATE subagent_notifications SET acked_at=? WHERE id IN ({placeholders})",
+            (now_ms(), *ids),
+        )
+        await conn.commit()
+        return cur.rowcount

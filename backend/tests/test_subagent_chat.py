@@ -442,3 +442,47 @@ def test_merged_events_waits_for_live_child_after_main_done():
 
     types = run(scenario())
     assert "subagent_end" in types
+
+
+def test_turn_runtime_loads_pending_notifications(tmp_path, monkeypatch):
+    """每轮 build_turn_runtime 都要补载上一代未读的子代理完成通知。"""
+    from app import workspace
+    monkeypatch.setattr(workspace, "WORKSPACES_DIR", tmp_path / "ws")
+    (tmp_path / "ws").mkdir()
+    from app.subagent import store as sub_store
+    monkeypatch.setattr(sub_store, "DB_PATH", tmp_path / "s.db")
+    run(sub_store.init_tables())
+
+    from app.subagent import host as sub_host
+    from app.subagent.session import build_turn_runtime
+    from app.tools import Tool, ToolRegistry
+
+    called: list[int] = []
+
+    async def spy(self, limit: int = 20) -> int:
+        called.append(1)
+        return 0
+
+    monkeypatch.setattr(sub_host.SubagentHost, "load_pending_notifications", spy)
+
+    def mk(n):
+        async def call(args):
+            return "ok"
+        return Tool(n, "", {"type": "object", "properties": {}}, call)
+
+    class FakeModel:
+        model_name = "fake"
+        client = object()
+
+    class FakeBaseLoop:
+        system_prompt = "SYS"
+
+    class FakeBase:
+        model = FakeModel()
+        loop = FakeBaseLoop()
+        store = object()
+        registry = ToolRegistry([mk("file_read")])
+
+    ctx = AgentContext(user_id="u1", session_id="s1", message_id="m1", generation_id="g2")
+    run(build_turn_runtime(FakeBase(), ctx))
+    assert called == [1]

@@ -207,7 +207,7 @@ class SubagentHost:
                 )
             except Exception:
                 pass
-            self._notify(node)
+            await self._notify(node)
             self._publish({
                 "type": "subagent_end",
                 "agent_id": node.agent_id,
@@ -220,14 +220,50 @@ class SubagentHost:
             self._touch()
 
     # ---------------- notifications ----------------
-    def _notify(self, node: "AgentNode") -> None:
-        self._notifications.append({
-            "id": uuid.uuid4().hex[:8],
+    async def _notify(self, node: "AgentNode") -> None:
+        item = {
+            "id": uuid.uuid4().hex[:16],
             "agent": node.name,
             "status": node.status,
             "result_chars": len(node.result or ""),
             "preview": (node.result or "")[:400],
-        })
+        }
+        self._notifications.append(item)
+        try:
+            await sub_store.add_notification(
+                nid=item["id"],
+                user_id=self.ctx.user_id,
+                session_id=self.ctx.session_id,
+                generation_id=self.ctx.generation_id,
+                agent_name=item["agent"],
+                status=item["status"],
+                preview=item["preview"],
+            )
+        except Exception:  # noqa: BLE001 - 通知落库失败不能影响子代理收尾
+            pass
+
+    async def load_pending_notifications(self, limit: int = 20) -> int:
+        """从 DB 补载本会话未读通知（跨 generation 的新 host 也能拿到）。"""
+        try:
+            rows = await sub_store.list_pending_notifications(
+                self.ctx.user_id, self.ctx.session_id, limit
+            )
+        except Exception:  # noqa: BLE001
+            return 0
+        known = {n["id"] for n in self._notifications}
+        added = 0
+        for r in rows:
+            if r["id"] in known:
+                continue
+            self._notifications.append({
+                "id": r["id"],
+                "agent": r["agent_name"],
+                "status": r["status"],
+                "result_chars": len(r.get("preview") or ""),
+                "preview": r.get("preview") or "",
+            })
+            added += 1
+        return added
 
     def peek_notifications(self, limit: int = 5) -> list[dict]:
         return self._notifications[: max(1, int(limit))]
@@ -243,7 +279,12 @@ class SubagentHost:
         items = self.peek_notifications(limit)
         if not items:
             return []
-        self.ack_notifications([n["id"] for n in items])
+        ids = [n["id"] for n in items]
+        self.ack_notifications(ids)
+        try:
+            asyncio.get_running_loop().create_task(sub_store.ack_notifications_db(ids))
+        except Exception:  # noqa: BLE001
+            pass
         lines = [f"- {n['agent']} 已{n['status']}：{n['preview']}" for n in items]
         extra = len(self._notifications)
         body = "\n".join(lines)

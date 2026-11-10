@@ -85,6 +85,29 @@ def cases() -> dict[str, dict]:
             "min_tasks": 13,
             "timeout_s": 900,
         },
+        "S9": {
+            "name": "subagent-slot-limit",
+            "prompt": ("在**同一轮**里一次性发出 6 个 spawn_agent（分别计算 1*1 到 6*6），"
+                       "每个子代理都必须先用 code_run 睡眠 8 秒再计算，否则会太早结束、测不到上限。"
+                       "不要等前面的完成再派后面的。每个子代理结果里都要原样包含："
+                       f"{SENTINEL}。如果某个 spawn 被拒绝（例如「已达上限」），"
+                       "把错误原文复述给我，然后 close 已完成的再补派，最后汇总 6 个结果。"),
+            "expect_tools": ["spawn_agent", "close_agent"],
+            "tool_min_counts": {"spawn_agent": 4},
+            "sentinel": SENTINEL,
+            "timeout_s": 600,
+        },
+        "S10": {
+            "name": "subagent-long-task",
+            "prompt": ("派一个子代理，让它用 code_run 跑 Python：先 time.sleep(660)，"
+                       f"然后打印 LONG DONE {SENTINEL}。派完先用 wait_agent 等 180 秒"
+                       "（会超时，这完全正常，绝对不要重新 spawn）；之后继续 wait_agent "
+                       "直到它完成，再读取结果并告诉我。整个任务大约需要 11 分钟。"),
+            "expect_tools": ["spawn_agent", "wait_agent", "read_agent_result"],
+            "tool_counts": {"spawn_agent": 1},
+            "sentinel": SENTINEL,
+            "timeout_s": 1500,
+        },
         "S5": {
             "name": "team-basic",
             "prompt": ("建一个 2 个任务的团队任务板：任务 A 写一句话介绍杭州，任务 B 写一句话介绍成都。"

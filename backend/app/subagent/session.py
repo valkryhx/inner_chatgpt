@@ -194,6 +194,12 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
                 merged.add(t)
             acp = manager
 
+    # 2d) 跨回合通知：上一个 generation 里完成但没被注入的子代理通知，本轮补上
+    try:
+        await host.load_pending_notifications()
+    except Exception:  # noqa: BLE001 - 补载失败不能让本轮启动失败
+        pass
+
     # 3) 独立的 AgentLoop：**必须挂主对话的 history_store**，
     #    否则主对话的 assistant/tool 消息不会落 session_history，下一轮上下文就丢了。
     #    （子代理用独立的侧链表，与这里无关。）
