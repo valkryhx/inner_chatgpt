@@ -1441,3 +1441,11 @@ textarea, input { caret-color: var(--clay); }
   background: rgba(191, 77, 67, .1);
   cursor: help; white-space: nowrap;
 }
+
+/* 底部右侧：模型在前、思考等级紧随其后（两者是一组，不要被 space-between 拆开） */
+.composer-foot .foot-selectors {
+  display: inline-flex; align-items: center; gap: 4px;
+  flex: 0 0 auto; margin-left: auto;
+}
+.composer-foot .foot-selectors .model-menu { flex: 0 0 auto; }
+.composer-foot .foot-selectors .model-menu-btn { padding: 0 4px; }

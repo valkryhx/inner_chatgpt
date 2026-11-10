@@ -223,8 +223,10 @@ export default function Composer({
             </>
           )}
         </span>
-        {effortSelector}
-        {modelSelector}
+        <span className="foot-selectors">
+          {modelSelector}
+          {effortSelector}
+        </span>
       </div>
     </div>
   )
