@@ -8,6 +8,7 @@ import type {
   LLMConfig,
   LlmModelOption,
   MCPServer,
+  McpServerStatus,
   Session,
   SessionDetail,
   Message,
@@ -199,7 +200,8 @@ export const api = {
       body: JSON.stringify(body),
     }),
   deleteMcpServer: (id: string) => request<{ ok: boolean }>(`/me/mcp-servers/${id}`, { method: 'DELETE' }),
-  mcpEffective: () => request<{ tools: string[] }>('/me/mcp-effective'),
+  mcpEffective: () =>
+    request<{ tools: string[]; servers?: McpServerStatus[]; error?: string }>('/me/mcp-effective'),
   mcpImport: (raw: string) =>
     request<{
       ok: boolean
@@ -215,6 +217,11 @@ export const api = {
       body: JSON.stringify({ raw }),
     }),
   mcpExport: () => request<{ json: string }>('/me/mcp-servers/export'),
+  mcpProbe: () =>
+    request<{ ok: boolean; servers: McpServerStatus[]; tools: string[]; error?: string }>(
+      '/me/mcp-servers/probe',
+      { method: 'POST' },
+    ),
 
   // ---------------- A2A per-user access ----------------
   getA2AAgent: () => request<A2AAgentInfo>('/a2a/agent'),

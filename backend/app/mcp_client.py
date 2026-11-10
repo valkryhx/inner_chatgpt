@@ -99,14 +99,19 @@ def _build_target(target: Any) -> Any:
 class MCPToolset:
     """持有一个 fastmcp.Client，暴露为自研 Tool 列表（必须在 lifespan 内 enter/exit）。"""
 
-    def __init__(self, target: Any = None, *, user_id: str = "") -> None:
+    def __init__(self, target: Any = None, *, user_id: str = "",
+                 server_name: str = "") -> None:
         # target None -> 内置 demo
         self._target = target
         self._user_id = user_id
+        self._server_name = (server_name or "").strip()
         self._client: Optional[Client] = None
         self._tools: list[Tool] = []
         self._raw: list[Any] = []
         self._error: Optional[str] = None
+        # 每个已配置 server 的连接结果（成功/失败/工具数），由 build_user_toolset 填充。
+        # 失败不能静默消失：否则模型只会看到「工具列表里没有」，然后编造原因。
+        self._manifest: list[dict[str, Any]] = []
         # 合并后：持有一组子 toolset，关闭时统一释放
         self._children: list["MCPToolset"] = []
 
@@ -174,7 +179,15 @@ class MCPToolset:
             except QuotaExceeded as exc:
                 return f"[工具执行错误] {exc}"
 
-        return Tool(name=name, description=description, input_schema=schema, call=_call)
+        return Tool(name=name, description=description, input_schema=schema, call=_call,
+                    source=self._source_label())
+
+    def _source_label(self) -> str:
+        if self._server_name:
+            return f"MCP: {self._server_name}"
+        if self._target is not None and not isinstance(self._target, dict):
+            return "内置 demo MCP"
+        return ""
 
     @property
     def tools(self) -> list[Tool]:
@@ -184,10 +197,36 @@ class MCPToolset:
     def error(self) -> Optional[str]:
         return self._error
 
+    @property
+    def server_name(self) -> str:
+        return self._server_name
+
+    @property
+    def manifest(self) -> list[dict[str, Any]]:
+        """各 MCP server 的连接状态；合并后的 toolset 汇总全部子 server。"""
+        if self._manifest:
+            return self._manifest
+        if self._children:
+            return [c.status() for c in self._children]
+        if self._target is None and not self._children:
+            return []
+        return [self.status()]
+
+    def status(self) -> dict[str, Any]:
+        """单个 MCP server 的连接状态，供系统提示词与设置页展示。"""
+        return {
+            "name": self._server_name or self._source_label() or "unknown",
+            "ok": self._error is None,
+            "tool_count": len(self._tools),
+            "error": self._error or "",
+            "tools": [t.name for t in self._tools],
+        }
+
     def describe(self) -> list[dict[str, Any]]:
         out = []
         for t in self._raw:
             out.append({
+                "server": self._server_name,
                 "name": getattr(t, "name", ""),
                 "description": getattr(t, "description", "") or "",
                 "input_schema": getattr(t, "inputSchema", None) or {},

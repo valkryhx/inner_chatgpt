@@ -175,16 +175,57 @@ async def mcp_effective(user: dict = Depends(get_current_user)):
     if not hub:
         return {"tools": []}
     # 工具与模型无关，但 runtime 构建会顺带解析模型；模型不可用时不应让本接口 500。
+    # 必须用与会话轮次相同的 model_id 取 runtime，否则这里是另一个缓存实例：
+    # 它会独立再连一遍 MCP，状态和用户实际聊天时看到的可能不一致
+    # （2026-11-10 实测：设置页显示 exa 已连接，对话轮里却是 TimeoutError）。
+    model_id = ""
     try:
-        ur = await hub.get_user_runtime(user["id"])
-        return {"tools": [t.name for t in ur.registry.tools]}
+        rows, _ = await db.list_sessions(user["id"], limit=1)
+        if rows:
+            model_id = rows[0].get("model_id", "") or ""
+    except Exception:
+        model_id = ""
+    try:
+        ur = await hub.get_user_runtime(user["id"], model_id)
+        # 软 TTL：超过 MCP_STATUS_TTL_S 就现场探测一次；只有状态真的变了才重建
+        # runtime（重建会关掉 toolset 和 LLM client，代价不小）。有对话在跑时
+        # 直接跳过，避免打断正在执行的那一轮。
+        refreshed = await hub.refresh_mcp_status(user["id"], model_id)
+        if refreshed:
+            ur = await hub.get_user_runtime(user["id"], model_id)
+        return {
+            "tools": [t.name for t in ur.registry.tools],
+            # 每个 MCP server 的连接结果：设置页据此显示「已连接 / 失败原因」。
+            # 只给工具名的话，用户无法区分「没配」和「配了但连不上」。
+            "servers": getattr(ur.toolset, "manifest", []) or [],
+        }
     except Exception as e:  # noqa: BLE001
         from ..builtin_tools import build_builtin_tools
         try:
             names = [t.name for t in build_builtin_tools(user["id"])]
         except Exception:
             names = []
-        return {"tools": names, "error": f"{type(e).__name__}: {e}"}
+        return {"tools": names, "servers": [], "error": f"{type(e).__name__}: {e}"}
+
+
+@router.post("/mcp-servers/probe")
+async def mcp_probe(user: dict = Depends(get_current_user)):
+    """强制重连所有已启用的 MCP server，返回实时状态。
+
+    runtime 按 (user, model) 缓存，MCP 断开后缓存里的「已连接」不会自己变。
+    用户点「重新检测」时需要真实探测结果，所以这里绕开任何缓存。
+    """
+    from ..agent import build_user_toolset
+
+    try:
+        ts = await build_user_toolset(user["id"])
+        servers = getattr(ts, "manifest", []) or []
+        tools = [t.name for t in ts.tools]
+        await ts.__aexit__(None, None, None)
+        return {"ok": True, "servers": servers, "tools": tools}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "servers": [], "tools": [],
+                "error": f"{type(e).__name__}: {e}"}
 
 
 @router.get("/llm-models")

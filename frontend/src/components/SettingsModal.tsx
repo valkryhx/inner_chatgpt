@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { MouseEvent as ReactMouseEvent } from 'react'
 import { api } from '../api'
-import type { LLMConfig, MCPServer, Skill } from '../types'
+import type { LLMConfig, MCPServer, McpServerStatus, Skill } from '../types'
 import A2aSection from './A2aSection'
 
 interface Props {
@@ -313,6 +313,8 @@ function McpSection() {
   const [list, setList] = useState<MCPServer[]>([])
   const [error, setError] = useState<string | null>(null)
   const [effective, setEffective] = useState<string[]>([])
+  const [servers, setServers] = useState<McpServerStatus[]>([])
+  const [probing, setProbing] = useState(false)
   const [jsonText, setJsonText] = useState('')
   const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -321,7 +323,13 @@ function McpSection() {
 
   const load = (syncText = false) => {
     api.listMcpServers().then(setList).catch((e) => setError(String(e)))
-    api.mcpEffective().then((r) => setEffective(r.tools)).catch(() => {})
+    api
+      .mcpEffective()
+      .then((r) => {
+        setEffective(r.tools)
+        setServers(r.servers || [])
+      })
+      .catch(() => {})
     api
       .mcpExport()
       .then((r) => {
@@ -372,6 +380,28 @@ function McpSection() {
     }
   }
 
+  // runtime 没有 TTL：MCP 断开后缓存里的「已连接」会一直留着。
+  // 必须提供一个绕开缓存、真实重连的入口，用户才能确认当前到底通不通。
+  const probe = async () => {
+    setProbing(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const r = await api.mcpProbe()
+      setServers(r.servers || [])
+      setEffective(r.tools || [])
+      if (!r.ok && r.error) setError('检测失败：' + r.error)
+      else {
+        const bad = (r.servers || []).filter((s) => !s.ok)
+        setNotice(bad.length ? `检测完成：${bad.length} 个 server 连接失败` : '检测完成：全部已连接')
+      }
+    } catch (e: any) {
+      setError('检测失败：' + (e?.message || String(e)))
+    } finally {
+      setProbing(false)
+    }
+  }
+
   const del = async (id: string) => {
     if (!confirm('删除该 MCP 服务器？')) return
     await api.deleteMcpServer(id)
@@ -390,9 +420,34 @@ function McpSection() {
       <p className="hint">
         按业界标准 <code>mcp.json</code>（<code>mcpServers</code>）直接粘贴配置即可。
         保存时按 <b>name</b> 增量合并：同名覆盖、新名新增，<b>不会清空</b>你已有的其它 MCP。
-        当前生效工具：<b>{effective.length ? effective.join(', ') : '无'}</b>
         （无配置时默认使用内置 demo 工具集）
       </p>
+
+      <div className="mcp-summary">
+        <div className="mcp-summary-row">
+          <span className={`mcp-dot ${servers.length && servers.every((s) => s.ok) ? 'ok' : 'warn'}`} />
+          <b>
+            {servers.length === 0
+              ? '未检测'
+              : servers.every((s) => s.ok)
+              ? `全部 ${servers.length} 个 server 已连接`
+              : `${servers.filter((s) => s.ok).length}/${servers.length} 个 server 已连接`}
+          </b>
+          <span className="mcp-summary-tools">共 {effective.length} 个可用工具</span>
+          <button className="ghost-btn small" onClick={probe} disabled={probing}>
+            {probing ? '检测中…' : '重新检测连接'}
+          </button>
+        </div>
+        {servers.filter((s) => !s.ok).length > 0 && (
+          <div className="mcp-summary-bad">
+            连接失败：
+            {servers
+              .filter((s) => !s.ok)
+              .map((s) => `${s.name}（${s.error || '未知原因'}）`)
+              .join('、')}
+          </div>
+        )}
+      </div>
 
       <div className="cfg-list">
         {list.length === 0 && <div className="hint">尚未配置（使用内置 demo 工具）</div>}
@@ -409,6 +464,16 @@ function McpSection() {
                 {' · '}
                 {m.enabled ? '启用' : '停用'}
               </div>
+              {(() => {
+                const st = servers.find((s) => s.name === m.name)
+                if (!st) return null
+                return (
+                  <div className={`mcp-state ${st.ok ? 'ok' : 'bad'}`}>
+                    <span className="mcp-dot" />
+                    {st.ok ? `已连接 · ${st.tool_count} 个工具` : `连接失败 · ${st.error || '未知原因'}`}
+                  </div>
+                )
+              })()}
             </div>
             <div className="cfg-actions">
               <button className="ghost-btn" onClick={() => api.updateMcpServer(m.id, { enabled: !m.enabled }).then(() => load())}>

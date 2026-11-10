@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, getToken, setToken, streamMessage } from './api'
-import type { Attachment, ContextUsage, LlmModelOption, Message, Session, StreamEvent, TeamEvent, TeamSnapshot, User } from './types'
+import type { Attachment, ContextUsage, LlmModelOption, McpServerStatus, Message, Session, StreamEvent, TeamEvent, TeamSnapshot, User } from './types'
 import Sidebar from './components/Sidebar'
 import MessageList from './components/MessageList'
 import ModelMenu from './components/ModelMenu'
@@ -130,7 +130,9 @@ export default function App() {
   const [sendPulse, setSendPulse] = useState(0)
   const [activeStreamMsgId, setActiveStreamMsgId] = useState<string | null>(null)
   const [autoCompacted, setAutoCompacted] = useState<number>(0)
-  const [health, setHealth] = useState<{ model: string; mcp_tools: number } | null>(null)
+  const [health, setHealth] = useState<
+    { model: string; mcp_tools: number; servers: McpServerStatus[] } | null
+  >(null)
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
   const [models, setModels] = useState<LlmModelOption[]>([])
   // 没有会话时选择的模型：作为下一个新会话的初始 model_id
@@ -272,7 +274,11 @@ export default function App() {
   const refreshHealth = useCallback(async () => {
     const h = await api.health().catch(() => null)
     const eff = await api.mcpEffective().catch(() => null)
-    setHealth({ model: h?.model || '', mcp_tools: eff ? eff.tools.length : h?.mcp_tools ?? 0 })
+    setHealth({
+      model: h?.model || '',
+      mcp_tools: eff ? eff.tools.length : h?.mcp_tools ?? 0,
+      servers: eff?.servers || [],
+    })
   }, [])
 
   useEffect(() => {

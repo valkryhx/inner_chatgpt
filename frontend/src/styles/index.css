@@ -460,6 +460,7 @@ textarea, input { caret-color: var(--clay); }
 }
 .cfg-item b { font-size: 13px; }
 .cfg-meta { font-size: 11px; color: var(--muted); margin-top: 3px; word-break: break-all; }
+.cfg-meta.mcp-status-fail { color: var(--danger); }
 .cfg-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .tag {
   font-size: 10px; color: var(--btn); background: var(--clay-soft);
@@ -1449,3 +1450,42 @@ textarea, input { caret-color: var(--clay); }
 }
 .composer-foot .foot-selectors .model-menu { flex: 0 0 auto; }
 .composer-foot .foot-selectors .model-menu-btn { padding: 0 4px; }
+
+/* ---------- MCP 连接状态 ---------- */
+.mcp-dot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--muted); flex-shrink: 0;
+}
+.mcp-dot.ok { background: #4f8a5b; }
+.mcp-dot.warn { background: var(--danger); }
+
+.mcp-health {
+  display: flex; align-items: center; gap: 6px;
+  width: 100%; padding: 6px 10px; margin-bottom: 6px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: transparent; cursor: pointer; text-align: left;
+  font-size: 11px; color: var(--muted);
+}
+.mcp-health:hover { background: var(--surface); color: var(--ink); }
+.mcp-health-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.mcp-summary {
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  padding: 10px 12px; margin-bottom: 10px; background: var(--surface);
+}
+.mcp-summary-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mcp-summary-row b { font-size: 12px; }
+.mcp-summary-tools { font-size: 11px; color: var(--muted); }
+.mcp-summary-row .ghost-btn { margin-left: auto; }
+.mcp-summary-bad {
+  margin-top: 6px; font-size: 11px; color: var(--danger); line-height: 1.6;
+}
+
+.mcp-state {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; margin-top: 4px;
+}
+.mcp-state.ok { color: var(--muted); }
+.mcp-state.bad { color: var(--danger); }
+.mcp-state.ok .mcp-dot { background: #4f8a5b; }
+.mcp-state.bad .mcp-dot { background: var(--danger); }

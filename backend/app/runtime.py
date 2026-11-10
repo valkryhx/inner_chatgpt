@@ -5,7 +5,7 @@ import asyncio
 import time
 from typing import Optional
 
-from .agent import UserRuntime
+from .agent import UserRuntime, probe_mcp_status
 from .history_store import get_history_store, HistoryStore
 
 _hub: Optional["RuntimeHub"] = None
@@ -29,6 +29,8 @@ class RuntimeHub:
         # 活跃的子代理宿主：key = (user_id, session_id, generation_id, team_id)
         # 用户 id 必须参与键，防止只猜 session/generation 就能影响别人。
         self._subagent_hosts: dict[tuple[str, str, str, str], "object"] = {}
+        # runtime 建立时间（monotonic），用于 MCP 状态的软 TTL 刷新。
+        self._built_at: dict[tuple[str, str], float] = {}
         # 本代 ACP manager：key = (user_id, session_id, generation_id)
         # 与 subagent hosts 同构，用户 id 参与键，/stop 不能作用于别人的会话。
         self._acp_managers: dict[tuple[str, str, str], "object"] = {}
@@ -127,12 +129,46 @@ class RuntimeHub:
             ur = UserRuntime()
             await ur.build(user_id, model_id or None)
             self._runtimes[key] = ur
+            self._built_at[key] = time.monotonic()
             return ur
+
+    async def refresh_mcp_status(self, user_id: str, model_id: str = "",
+                                 *, force: bool = False) -> list[dict]:
+        """按软 TTL 刷新 MCP 连接状态；只有状态真的变了才重建 runtime。
+
+        为什么不是定时重建：重建会 close 掉旧的 toolset / LLM client，代价是
+        重新连接全部 MCP server（可能好几秒）。状态没变时重建纯属浪费。
+
+        为什么必须跳过活跃轮次：重建会把正在执行的那一轮的 toolset 关掉，
+        导致工具调用失败。有生成在跑时直接返回旧状态，等下一轮再说。
+        """
+        key = (user_id, model_id or "")
+        ur = self._runtimes.get(key)
+        if ur is None:
+            return []
+        if not force:
+            built = self._built_at.get(key, 0.0)
+            if time.monotonic() - built < _MCP_STATUS_TTL_S:
+                return getattr(ur.toolset, "manifest", []) or []
+        if has_active_generation_for_user(user_id):
+            return getattr(ur.toolset, "manifest", []) or []
+
+        fresh = await probe_mcp_status(user_id)
+        current = getattr(ur.toolset, "manifest", []) or []
+        if _same_manifest(current, fresh):
+            # 状态没变：只续期，不重建。
+            self._built_at[key] = time.monotonic()
+            return current
+
+        await self.invalidate(user_id)
+        ur = await self.get_user_runtime(user_id, model_id)
+        return getattr(ur.toolset, "manifest", []) or []
 
     async def invalidate(self, user_id: str) -> None:
         for key in list(self._runtimes.keys()):
             if key[0] == user_id:
                 ur = self._runtimes.pop(key, None)
+                self._built_at.pop(key, None)
                 if ur is not None:
                     await ur.close()
 
@@ -147,6 +183,7 @@ class RuntimeHub:
         dropped = 0
         for key in keys:
             ur = self._runtimes.pop(key, None)
+            self._built_at.pop(key, None)
             if ur is not None:
                 dropped += 1
                 try:
@@ -221,6 +258,33 @@ def has_active_generation(session_id: str, user_id: str = "") -> bool:
         if sid != session_id:
             continue
         if user_id and owner != user_id:
+            continue
+        if _is_live_key(key):
+            return True
+    return False
+
+
+# MCP 状态软 TTL：超过这个时间后，下一次读取状态会重新探测一次。
+# 只用于「用户在看状态」，不参与对话轮次的 runtime 取用。
+_MCP_STATUS_TTL_S = float(__import__("os").environ.get("MCP_STATUS_TTL_S", "60"))
+
+
+def _same_manifest(a: list[dict], b: list[dict]) -> bool:
+    """比较两次探测的连接状态；掉顺序或错误文案细节不算变化。"""
+    def norm(items):
+        return sorted(
+            (str(i.get("name") or ""), bool(i.get("ok")), int(i.get("tool_count") or 0))
+            for i in items
+        )
+    return norm(a) == norm(b)
+
+
+def has_active_generation_for_user(user_id: str) -> bool:
+    """该用户是否有任何会话正在生成。重建 runtime 前必须跳开这种情况，
+    否则会让正在跑的轮次用到一个被 close 掉的 toolset / client。"""
+    _cleanup_expired_reservations()
+    for key in set(_stop_events) | set(_generation_tasks) | set(_generation_reservations):
+        if key[0] != user_id:
             continue
         if _is_live_key(key):
             return True

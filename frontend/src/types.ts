@@ -292,6 +292,15 @@ export interface LLMConfig {
   is_default: boolean
 }
 
+export interface McpServerStatus {
+  name: string
+  ok: boolean
+  tool_count: number
+  error: string
+  tools: string[]
+}
+
+
 export interface MCPServer {
   id: string
   name: string

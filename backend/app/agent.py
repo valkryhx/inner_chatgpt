@@ -88,9 +88,43 @@ def select_system_prompt() -> str:
     return _PROMPT_VARIANTS.get(variant, SYSTEM_PROMPT)
 
 
-def compose_system_prompt(skill_block: str = "") -> str:
+def format_mcp_manifest(manifest: list[dict[str, Any]] | None) -> str:
+    """Render per-server MCP status into the system prompt.
+
+    The model only ever saw a flattened tool-name list, so it could not answer
+    "does server X have tools here" and fell back to guessing (2026-11-10: it
+    called metric_search yet claimed sqlbot was not connected).  Give it the
+    authoritative manifest instead.
+    """
+    if not manifest:
+        return ""
+    lines = ["", "", "## MCP servers connected this turn (authoritative)"]
+    lines.append(
+        "The following MCP servers are enabled for your account. "
+        "Every MCP tool description is prefixed with its owner, e.g. [MCP: <server>]."
+    )
+    for m in manifest:
+        name = m.get("name") or "unknown"
+        count = int(m.get("tool_count") or 0)
+        if m.get("ok"):
+            names = ", ".join(m.get("tools") or [])
+            lines.append("- %s: connected, %d tools (%s)" % (name, count, names))
+        else:
+            err = (m.get("error") or "unknown reason").strip()
+            lines.append("- %s: **connection FAILED this turn**, 0 tools. Reason: %s" % (name, err))
+    lines.append("")
+    lines.append(
+        "When asked whether you have a server's tools, answer from this list: a listed "
+        "server IS connected; missing tools can only mean that server failed to connect "
+        "this turn. Do not hand-roll the protocol via code_run, and do not treat comments "
+        "in old workspace scripts as current facts."
+    )
+    return chr(10).join(lines)
+
+
+def compose_system_prompt(skill_block: str = "", mcp_block: str = "") -> str:
     """base prompt + 每用户 skill 索引（L1）+ 子代理编排提示。"""
-    return select_system_prompt() + skill_block + "\n\n" + ROOT_AGENT_HINT
+    return select_system_prompt() + skill_block + mcp_block + "\n\n" + ROOT_AGENT_HINT
 
 
 class BuiltModel:
@@ -131,7 +165,13 @@ async def build_user_model(user_id: str, llm_config_id: str | None = None,
 
 
 async def build_user_toolset(user_id: str) -> MCPToolset:
-    """Assemble per-user MCP toolset (multi-server aggregated); fall back to demo."""
+    """Assemble per-user MCP toolset (multi-server aggregated); fall back to demo.
+
+    Every tool carries ``source="MCP: <server name>"`` so the model can tell which
+    server a tool belongs to.  Connection failures are recorded in ``.manifest``
+    instead of being silently dropped: the old silent fallback made the agent
+    claim "that MCP has no tools" while the server was merely down.
+    """
     servers = [m for m in await db.list_mcp_servers(user_id) if m.get("enabled")]
     if not servers:
         from mcp_server.server import mcp as demo_mcp
@@ -139,12 +179,14 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
 
     connect_timeout = float(os.environ.get("MCP_CONNECT_TIMEOUT", "12"))
     toolsets: list[MCPToolset] = []
+    manifest: list[dict[str, Any]] = []
     for srv in servers:
+        name = srv.get("name") or srv.get("id") or "mcp"
         ts = None
         try:
             if srv.get("transport") == "builtin_demo":
                 from mcp_server.server import mcp as demo_mcp
-                ts = MCPToolset(demo_mcp, user_id=user_id)
+                ts = MCPToolset(demo_mcp, user_id=user_id, server_name=name)
                 await asyncio.wait_for(ts.__aenter__(), timeout=connect_timeout)
             else:
                 target = {
@@ -155,13 +197,23 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
                     "headers": srv.get("headers", {}) or {},
                     "env": srv.get("env", {}) or {},
                 }
-                ts = MCPToolset(target, user_id=user_id)
+                ts = MCPToolset(target, user_id=user_id, server_name=name)
                 await asyncio.wait_for(ts.__aenter__(), timeout=connect_timeout)
             if ts.tools:
                 toolsets.append(ts)
+                manifest.append(ts.status())
             else:
+                # 连上了但零工具 / 连接失败都在 ts.error 里
+                manifest.append({
+                    "name": name, "ok": False, "tool_count": 0,
+                    "error": ts.error or "该 server 没有暴露任何工具", "tools": [],
+                })
                 await ts.__aexit__(None, None, None)
-        except Exception:
+        except Exception as e:
+            manifest.append({
+                "name": name, "ok": False, "tool_count": 0,
+                "error": f"{type(e).__name__}: {e}", "tools": [],
+            })
             if ts is not None:
                 try:
                     await ts.__aexit__(None, None, None)
@@ -170,8 +222,33 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
             continue
     if not toolsets:
         from mcp_server.server import mcp as demo_mcp
-        return await MCPToolset(demo_mcp, user_id=user_id).__aenter__()
-    return MCPToolset.merge(toolsets)
+        fallback = await MCPToolset(demo_mcp, user_id=user_id).__aenter__()
+        fallback._manifest = manifest
+        return fallback
+    merged = MCPToolset.merge(toolsets)
+    merged._manifest = manifest
+    return merged
+
+
+async def probe_mcp_status(user_id: str) -> list[dict]:
+    """现场重连全部已启用 MCP server，只返回状态清单。
+
+    与 ``build_user_toolset`` 的区别：用完立刻关闭，不留常驻连接。
+    供「重新检测连接」按钮和 runtime 软 TTL 刷新共用。
+    """
+    ts = None
+    try:
+        ts = await build_user_toolset(user_id)
+        return getattr(ts, "manifest", []) or []
+    except Exception as e:  # noqa: BLE001
+        return [{"name": "mcp", "ok": False, "tool_count": 0,
+                 "error": f"{type(e).__name__}: {e}", "tools": []}]
+    finally:
+        if ts is not None:
+            try:
+                await ts.__aexit__(None, None, None)
+            except Exception:
+                pass
 
 
 def with_effort(runtime, effort: str):
@@ -216,9 +293,11 @@ class UserRuntime:
             skill_block = ""
         # 子代理编排规则只进 root agent 的 system prompt；子代理自己走
         # subagent.prompts.build_child_system_prompt()，不会看到这段。
-        system_prompt = compose_system_prompt(skill_block)
-        self.model = await build_user_model(user_id, llm_config_id, system_prompt=system_prompt)
+        # Build the toolset first so the prompt can state which MCP servers are live.
         self.toolset = await build_user_toolset(user_id)
+        mcp_block = format_mcp_manifest(getattr(self.toolset, "manifest", None))
+        system_prompt = compose_system_prompt(skill_block, mcp_block)
+        self.model = await build_user_model(user_id, llm_config_id, system_prompt=system_prompt)
         # Built-in tools first so MCP tools can never shadow file_read / load_skill etc.
         mcp_tools = self.toolset.tools if self.toolset else []
         builtin = build_builtin_tools(user_id)

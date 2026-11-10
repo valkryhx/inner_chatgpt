@@ -19,6 +19,23 @@ class Tool:
     description: str
     input_schema: dict
     call: Callable[[dict], Awaitable[str]]
+    # 工具来源，例如 "MCP: sqlbotmcp"。空字符串表示平台内置工具。
+    #
+    # 为什么必须带到模型面前：所有 MCP server 的工具会被拍平进同一个 list，
+    # name 里没有命名空间。少了来源，模型无法回答「某个 server 的工具在不在」，
+    # 只能按名字猜（2026-11-10 hx 会话：实际调用了 metric_search 仍声称
+    # 「没有 sqlbot 工具」）。来源写进 description 是不改工具名契约的最小解。
+    source: str = ""
+
+    def describe_for_model(self) -> str:
+        """模型看到的 description：带来源标签，便于判断工具归属。"""
+        desc = self.description or self.name
+        if not self.source:
+            return desc
+        tag = f"[{self.source}]"
+        if desc.startswith(tag):
+            return desc
+        return f"{tag} {desc}"
 
     def to_openai_schema(self) -> dict:
         schema = self.input_schema or {"type": "object", "properties": {}}
@@ -28,7 +45,7 @@ class Tool:
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description or self.name,
+                "description": self.describe_for_model(),
                 "parameters": schema,
             },
         }

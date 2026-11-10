@@ -45,6 +45,9 @@ export default function Sidebar({
   const [hidden, setHidden] = useState(false)
   const displayName = user.name || user.username || user.email || '未命名用户'
   const showEmail = !!user.email && user.email !== displayName
+  // health.servers 来自 /mcp-effective，与对话轮次共用同一份 runtime。
+  const servers = health?.servers || []
+  const badServers = servers.filter((s) => !s.ok)
 
   const pinned = sessions.filter((s) => s.pinned)
   const rest = sessions.filter((s) => !s.pinned)
@@ -160,6 +163,26 @@ export default function Sidebar({
       </div>
       <button className="side-nav-item all-sessions" onClick={onOpenAllSessions}>
         查看全部会话
+      </button>
+
+      <button
+        type="button"
+        className="mcp-health"
+        onClick={onOpenSettings}
+        title={
+          badServers.length
+            ? `连接失败：${badServers.map((s) => s.name).join('、')}（点击查看详情）`
+            : 'MCP 与工具状态（点击打开设置）'
+        }
+      >
+        <span className={`mcp-dot ${badServers.length ? 'warn' : 'ok'}`} />
+        <span className="mcp-health-text">
+          {servers.length === 0
+            ? 'MCP 未检测'
+            : badServers.length
+            ? `${badServers.length} 个 MCP 断开`
+            : `MCP 正常 · ${health?.mcp_tools ?? 0} 工具`}
+        </span>
       </button>
 
       <div className="sidebar-footer">
