@@ -73,6 +73,26 @@ def cases() -> dict[str, dict]:
             "sentinel": SENTINEL,
             "timeout_s": 420,
         },
+        "S11": {
+            "name": "big-output-persist",
+            "prompt": ("用 code_run 跑一段 Python：循环打印 30000 行，每行形如 LINE 00001。"
+                       "跑完后如果工具输出被截断并保存到了文件，把那个文件路径告诉我，"
+                       "并说明首尾能看到什么。"),
+            "expect_tools": ["code_run"],
+            # 超限必须落盘 + 头尾预览，而不是整段塞进上下文
+            "tool_result_contains": "chars omitted",
+            "timeout_s": 300,
+        },
+        "S13": {
+            "name": "subagent-stopping-state",
+            "prompt": ("派一个子代理，让它用 code_run 跑 Python：先 time.sleep(120)，"
+                       "然后打印 SLOW DONE。不要等它，紧接着立刻用 close_agent 关掉它。"
+                       "关完告诉我子代理当前状态。"),
+            "expect_tools": ["spawn_agent", "close_agent"],
+            # 关闭期间必须广播 stopping，否则面板一直显示运行中
+            "expect_events": ["subagent_status"],
+            "timeout_s": 300,
+        },
         "S6": {
             "name": "team-scale",
             "prompt": ("建一个团队任务板，创建 13 个任务：10 个简单任务（每个用一句话介绍一个"

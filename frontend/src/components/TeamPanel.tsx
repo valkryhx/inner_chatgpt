@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import type { TeamEvent, TeamSnapshot, TeamTask, TeamTaskStatus } from '../types'
+import { capList } from '../subagentView'
 
 interface Props {
   snapshot: TeamSnapshot | null
@@ -15,6 +16,9 @@ const TASK_LABEL: Record<TeamTaskStatus, string> = {
   completed: '已完成',
   cancelled: '已取消',
 }
+
+/** 面板一次最多渲染多少行；超出必须显式告知，不能静默截断 */
+const ROW_LIMIT = 200
 
 const TASK_ORDER: TeamTaskStatus[] = ['in_progress', 'pending', 'completed', 'cancelled']
 
@@ -85,6 +89,9 @@ export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop 
   const tasks = snapshot?.tasks || []
   const messages = snapshot?.messages || []
   const events = snapshot?.events || []
+  const shownTasks = capList(tasks, ROW_LIMIT)
+  const shownMessages = capList(messages, ROW_LIMIT)
+  const shownEvents = capList(events.slice().reverse(), ROW_LIMIT)
   const team = snapshot?.team || null
   const counts = useMemo(() => {
     const by = { pending: 0, in_progress: 0, completed: 0, cancelled: 0 }
@@ -180,7 +187,7 @@ export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop 
               ) : (
                 <div className="team-task-list">
                   {TASK_ORDER.map((statusKey) => {
-                    const group = tasks.filter((task) => task.status === statusKey)
+                    const group = shownTasks.items.filter((task) => task.status === statusKey)
                     if (group.length === 0) return null
                     return (
                       <section key={statusKey} className="team-task-group">
@@ -192,6 +199,9 @@ export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop 
                       </section>
                     )
                   })}
+                  {shownTasks.hidden > 0 && (
+                    <div className="team-hidden-count">另有 {shownTasks.hidden} 个任务未显示</div>
+                  )}
                 </div>
               )
             )}
@@ -200,7 +210,7 @@ export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop 
                 <div className="team-empty">暂无团队消息。</div>
               ) : (
                 <div className="team-message-list">
-                  {messages.map((message) => (
+                  {shownMessages.items.map((message) => (
                     <article className="team-message" key={message.message_id}>
                       <div className="team-message-route">
                         <span>{ownerLabel(message.sender_agent_id)}</span>
@@ -211,6 +221,9 @@ export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop 
                       <p>{message.content}</p>
                     </article>
                   ))}
+                  {shownMessages.hidden > 0 && (
+                    <div className="team-hidden-count">另有 {shownMessages.hidden} 条消息未显示</div>
+                  )}
                 </div>
               )
             )}
@@ -219,13 +232,16 @@ export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop 
                 <div className="team-empty">暂无团队动态。</div>
               ) : (
                 <ol className="team-event-list">
-                  {events.slice().reverse().map((event) => (
+                  {shownEvents.items.map((event) => (
                     <li key={event.team_id + ':' + event.event_seq}>
                       <span className="team-event-seq">#{event.event_seq}</span>
                       <span className="team-event-name">{EVENT_LABEL[event.type] || event.type}</span>
                       {eventDetail(event) && <span className="team-event-detail">{eventDetail(event)}</span>}
                     </li>
                   ))}
+                  {shownEvents.hidden > 0 && (
+                    <li className="team-hidden-count">另有 {shownEvents.hidden} 条动态未显示</li>
+                  )}
                 </ol>
               )
             )}

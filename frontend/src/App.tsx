@@ -8,6 +8,7 @@ import SessionBrowser from './components/SessionBrowser'
 import Composer from './components/Composer'
 import LoginPage from './components/LoginPage'
 import SettingsModal from './components/SettingsModal'
+import { mergeStart, mergeStatus } from './subagentView'
 import TeamPanel from './components/TeamPanel'
 import WorkspacePanel from './components/WorkspacePanel'
 
@@ -539,10 +540,10 @@ export default function App() {
         blocks = appendBlock(blocks, { type: 'chart', spec: ev.spec })
         patch({ ...assistantMsg, blocks: [...blocks] })
       } else if (ev.type === 'subagent_start') {
-        blocks = appendBlock(blocks, {
-          type: 'subagent', agent_id: ev.agent_id, name: ev.name, role: ev.role,
-          status: 'running', task: ev.task, events: [], result: '', turns: 0,
-        })
+        blocks = mergeStart(blocks as any, {
+          agent_id: ev.agent_id, name: ev.name, role: ev.role,
+          task: ev.task, startedAt: Date.now(),
+        }) as any
         patch({ ...assistantMsg, blocks: [...blocks] })
       } else if (ev.type === 'subagent_event') {
         const inner: any = ev.event
@@ -558,10 +559,24 @@ export default function App() {
           return { ...b, events }
         })
         patch({ ...assistantMsg, blocks: [...blocks] })
+      } else if (ev.type === 'subagent_status') {
+        blocks = blocks.map((b: any) =>
+          b.type === 'subagent' && b.agent_id === ev.agent_id
+            ? { ...b, status: mergeStatus(b.status, ev.status) }
+            : b,
+        )
+        patch({ ...assistantMsg, blocks: [...blocks] })
       } else if (ev.type === 'subagent_end') {
         blocks = blocks.map((b: any) =>
           b.type === 'subagent' && b.agent_id === ev.agent_id
-            ? { ...b, status: ev.status, result: ev.result || b.result, turns: ev.turns ?? b.turns, error: ev.error || b.error }
+            ? {
+                ...b,
+                status: mergeStatus(b.status, ev.status),
+                endedAt: Date.now(),
+                result: ev.result || b.result,
+                turns: ev.turns ?? b.turns,
+                error: ev.error || b.error,
+              }
             : b,
         )
         patch({ ...assistantMsg, blocks: [...blocks] })

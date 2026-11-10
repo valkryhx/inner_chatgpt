@@ -21,6 +21,7 @@ from .history_store import get_history_store
 from .builtin_tools import build_builtin_tools
 from .skill_store import build_skill_prompt
 from .subagent.prompts import ROOT_AGENT_HINT
+from .prompts_legacy import SYSTEM_PROMPT_LEGACY
 
 SYSTEM_PROMPT = """你是 Hlaudz，一个中文智能 Agent，运行在多用户 Web 平台中，可以调用工具完成任务。
 
@@ -71,6 +72,25 @@ SYSTEM_PROMPT = """你是 Hlaudz，一个中文智能 Agent，运行在多用户
 - 跟随用户的语言（默认中文）；先给结论，再给必要的过程与证据。
 - 引用代码位置写 `文件路径:行号`；产物给可点击的绝对路径或相对链接，不要粘贴大段原文。
 - 有自然的下一步就简短提一句，不要长篇总结。"""
+
+
+_PROMPT_VARIANTS = {"new": SYSTEM_PROMPT, "legacy": SYSTEM_PROMPT_LEGACY}
+
+
+def select_system_prompt() -> str:
+    """基础提示词。
+
+    HLAUDZ_PROMPT_VARIANT=legacy 可切回改造前的版本，**只用于提示词消融实验**
+    （backend/tests/e2e/ablation.py 会分别起两个进程跑同一批任务）。生产默认 new。
+    环境变量在调用时读取，不要在 import 时缓存。
+    """
+    variant = (os.environ.get("HLAUDZ_PROMPT_VARIANT") or "new").strip().lower()
+    return _PROMPT_VARIANTS.get(variant, SYSTEM_PROMPT)
+
+
+def compose_system_prompt(skill_block: str = "") -> str:
+    """base prompt + 每用户 skill 索引（L1）+ 子代理编排提示。"""
+    return select_system_prompt() + skill_block + "\n\n" + ROOT_AGENT_HINT
 
 
 class BuiltModel:
@@ -174,7 +194,7 @@ class UserRuntime:
             skill_block = ""
         # 子代理编排规则只进 root agent 的 system prompt；子代理自己走
         # subagent.prompts.build_child_system_prompt()，不会看到这段。
-        system_prompt = SYSTEM_PROMPT + skill_block + "\n\n" + ROOT_AGENT_HINT
+        system_prompt = compose_system_prompt(skill_block)
         self.model = await build_user_model(user_id, llm_config_id, system_prompt=system_prompt)
         self.toolset = await build_user_toolset(user_id)
         # Built-in tools first so MCP tools can never shadow file_read / load_skill etc.

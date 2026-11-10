@@ -1408,3 +1408,27 @@ textarea, input { caret-color: var(--clay); }
 .switch.on { background: #d97757; }
 .switch.on .knob { transform: translateX(18px); }
 .switch:disabled { opacity: .6; cursor: default; }
+
+/* ===== 子代理卡片 UX 补齐（stopping / 耗时 / 失败原因展开）===== */
+.subagent-card.stopping { border-color: var(--clay-soft); }
+.subagent-error { font-size: 12.5px; color: var(--danger); }
+.subagent-error > summary {
+  cursor: pointer; list-style: none; padding: 2px 0;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+.subagent-error > summary::-webkit-details-marker { display: none; }
+.subagent-error > summary::before { content: '▸ '; }
+.subagent-error[open] > summary::before { content: '▾ '; }
+.subagent-error-body {
+  margin: 6px 0 0; padding: 8px 10px; max-height: 220px; overflow: auto;
+  background: var(--canvas); border: 1px solid var(--line); border-radius: var(--r-sm);
+  font-size: 11.5px; line-height: 1.6; color: var(--ink-2);
+  white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+}
+
+/* 列表超过上限时显式提示，不做静默截断 */
+.team-hidden-count {
+  list-style: none; margin-top: 6px; padding: 6px 8px;
+  font-size: 11.5px; color: var(--muted);
+  background: var(--surface-2); border-radius: var(--r-sm);
+}

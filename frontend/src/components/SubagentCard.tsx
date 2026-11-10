@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { SubagentBlock, SubagentEventItem } from '../types'
 import Markdown from './Markdown'
+import { elapsedMs, formatDuration, lastToolError } from '../subagentView'
 
 const ROLE_LABEL: Record<string, string> = {
   general: '通用',
@@ -9,6 +10,7 @@ const ROLE_LABEL: Record<string, string> = {
 
 const STATUS_LABEL: Record<string, string> = {
   running: '运行中',
+  stopping: '停止中',
   completed: '已完成',
   errored: '失败',
   stopped: '已停止',
@@ -52,8 +54,17 @@ function groupEvents(events: SubagentEventItem[]): SubagentEventItem[] {
 export default function SubagentCard({ block }: { block: SubagentBlock }) {
   const [open, setOpen] = useState(false)
   const status = block.status || 'running'
-  const running = status === 'running'
+  const running = status === 'running' || status === 'stopping'
   const failed = status === 'errored'
+  // 耗时每秒刷新一次；进入终态后停止刷新，避免无谓重渲染。
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!running) return
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [running])
+  const duration = elapsedMs(block, now)
+  const failure = lastToolError(block)
   let events = groupEvents(block.events || [])
 
   // 去重：子代理的最终答复既会以 text 事件流出，也会作为 result 落到「结果」区，
@@ -69,9 +80,10 @@ export default function SubagentCard({ block }: { block: SubagentBlock }) {
 
   const meta = [
     ROLE_LABEL[block.role] || block.role || '通用',
-    running ? '' : STATUS_LABEL[status] || status,
+    status === 'running' ? '' : STATUS_LABEL[status] || status,
     toolCount ? `${toolCount} 个工具` : '',
     block.turns ? `${block.turns} 轮` : '',
+    duration !== null ? (running ? `已运行 ${formatDuration(duration)}` : `耗时 ${formatDuration(duration)}`) : '',
   ]
     .filter(Boolean)
     .join(' · ')
@@ -129,7 +141,16 @@ export default function SubagentCard({ block }: { block: SubagentBlock }) {
               <Markdown text={block.result} />
             </div>
           )}
-          {block.error && <div className="subagent-error">错误：{block.error}</div>}
+          {failure && (
+            <details className="subagent-error">
+              <summary>
+                {failure.source === 'tool'
+                  ? `失败原因：${failure.name || '工具'} 报错`
+                  : `失败原因：${flat(failure.text, 60)}`}
+              </summary>
+              <pre className="subagent-error-body">{failure.text}</pre>
+            </details>
+          )}
         </div>
       )}
     </div>

@@ -128,6 +128,8 @@ def test_event_stream_builds_subagent_block(monkeypatch):
             self.buffer.put({"type": "subagent_event", "agent_id": "sub:scan",
                              "event": {"type": "tool_start", "id": "t1", "name": "file_read",
                                        "input": {"path": "a.py"}}})
+            self.buffer.put({"type": "subagent_status", "agent_id": "sub:scan",
+                             "name": "scan", "status": "stopping"})
             self.buffer.put({"type": "subagent_end", "agent_id": "sub:scan", "name": "scan",
                              "status": "completed", "result": "结论", "turns": 2})
             self.buffer.close()
@@ -185,6 +187,8 @@ def test_event_stream_builds_subagent_block(monkeypatch):
     frames = _collect(chat._event_stream("u1", "s1", "hi", "g1", "m1"))
     joined = "\n".join(frames)
     assert "event: subagent_start" in joined
+    # 关闭中的状态必须透传，否则前端在关闭期间一直显示「运行中」
+    assert "event: subagent_status" in joined
     assert "event: subagent_end" in joined
 
     subs = [b for b in captured["blocks"] if b.get("type") == "subagent"]

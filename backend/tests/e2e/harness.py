@@ -125,7 +125,11 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
         tid = task.get("task_id")
         if tid and task.get("status"):
             tasks[tid] = task["status"]
-    return {"tools": tools, "text": texts, "errors": errors, "done": done, "tasks": tasks}
+    event_types = sorted({e.get("type") for e in events if e.get("type")})
+    tool_results = "".join(str(e.get("content") or "") for e in events
+                           if e.get("type") == "tool_result")
+    return {"tools": tools, "text": texts, "errors": errors, "done": done,
+            "tasks": tasks, "event_types": event_types, "tool_results": tool_results}
 
 
 def evaluate(case: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, Any]]:
@@ -134,6 +138,9 @@ def evaluate(case: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, An
     checks: list[dict[str, Any]] = []
     for name in case.get("expect_tools", []):
         checks.append({"kind": "expect_tool", "name": name, "ok": name in tools})
+    for name in case.get("expect_events", []):
+        checks.append({"kind": "expect_event", "name": name,
+                       "ok": name in (summary.get("event_types") or [])})
     for name in case.get("forbid_tools", []):
         checks.append({"kind": "forbid_tool", "name": name, "ok": name not in tools})
     for name, count in (case.get("tool_min_counts") or {}).items():
@@ -148,6 +155,10 @@ def evaluate(case: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, An
         ok = len(states) >= want and all(v == "completed" for v in states.values())
         checks.append({"kind": "tasks_completed", "name": f"{len(states)}/{want}",
                        "ok": ok})
+    marker = case.get("tool_result_contains")
+    if marker:
+        checks.append({"kind": "tool_result_contains", "name": marker,
+                       "ok": marker in (summary.get("tool_results") or "")})
     sentinel = case.get("sentinel")
     if sentinel:
         checks.append({"kind": "sentinel", "name": sentinel, "ok": sentinel in text})
@@ -186,6 +197,7 @@ async def run_case(case: dict[str, Any]) -> dict[str, Any]:
         "session_id": sid,
         "elapsed_s": round(time.time() - started, 1),
         "tools": summary["tools"],
+        "text": summary["text"],
         "errors": summary["errors"],
         "checks": checks,
         "ok": all(c["ok"] for c in checks),

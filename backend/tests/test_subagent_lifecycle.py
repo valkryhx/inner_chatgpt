@@ -146,3 +146,41 @@ def test_reuse_while_running_is_still_rejected(isolated):
         await host.close("busy")
 
     run(flow())
+
+
+def test_close_running_publishes_stopping_status(isolated):
+    """关闭中的成员必须让前端看到 stopping，否则面板一直显示「运行中」。"""
+
+    async def flow():
+        buf = EventBuffer()
+        host = _host(Client(delay=1.0, content="late"), buf=buf)
+        await host.spawn(task_name="slow", message="m")
+        await asyncio.sleep(0.05)
+        await host.close("slow")
+        seen = []
+        while not buf._q.empty():
+            seen.append(buf._q.get_nowait())
+        statuses = [(e.get("type"), e.get("status")) for e in seen
+                    if e.get("type") == "subagent_status"]
+        assert ("subagent_status", "stopping") in statuses, statuses
+
+    run(flow())
+
+
+def test_close_completed_agent_does_not_publish_stopping(isolated):
+    """已经结束的成员不该再报 stopping。"""
+
+    async def flow():
+        buf = EventBuffer()
+        host = _host(Client(content="ok"), buf=buf)
+        await host.spawn(task_name="fast", message="m")
+        await host.wait(targets=["fast"], timeout_s=10)
+        while not buf._q.empty():
+            buf._q.get_nowait()
+        await host.close("fast")
+        seen = []
+        while not buf._q.empty():
+            seen.append(buf._q.get_nowait())
+        assert not [e for e in seen if e.get("type") == "subagent_status"], seen
+
+    run(flow())

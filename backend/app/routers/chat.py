@@ -582,6 +582,14 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                                         "is_error": inner.get("is_error", False)})
                 await _persist("streaming")
                 yield frame("subagent_event", {"agent_id": aid, "event": inner})
+            elif et == "subagent_status":
+                # 关闭中的成员：让面板显示 stopping，而不是继续显示运行中
+                aid = ev.get("agent_id", "")
+                b = _sub_block(aid)
+                b["status"] = ev.get("status", b.get("status", "running"))
+                await _persist("streaming")
+                yield frame("subagent_status", {"agent_id": aid, "name": ev.get("name"),
+                                               "status": ev.get("status")})
             elif et == "subagent_end":
                 aid = ev.get("agent_id", "")
                 b = _sub_block(aid)

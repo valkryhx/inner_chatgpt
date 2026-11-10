@@ -475,6 +475,16 @@ class SubagentHost:
         return {"ok": True, "closed": closed, "status": "closed"}
 
     async def _stop_node(self, node: AgentNode) -> None:
+        # 关闭是有成本的（最多等 2s 优雅退出）。先把状态广播出去，
+        # 否则面板在这段时间里仍显示「运行中」，用户会以为关不掉。
+        if not node.is_terminal and node.status != "stopping":
+            node.status = "stopping"
+            self._publish({
+                "type": "subagent_status",
+                "agent_id": node.agent_id,
+                "name": node.name,
+                "status": "stopping",
+            })
         node.stop.set()
         task = node.task
         if task is not None and not task.done():

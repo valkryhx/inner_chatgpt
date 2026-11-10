@@ -46,3 +46,50 @@ def test_has_planning_and_delivery():
     p = _prompt()
     assert "计划" in p
     assert "结论" in p
+
+
+# ---- 消融实验用的提示词变体开关（env 在调用时读取，不是 import 时冻结）----
+
+
+def test_select_system_prompt_defaults_to_new(monkeypatch):
+    from app.agent import SYSTEM_PROMPT, select_system_prompt
+
+    monkeypatch.delenv("HLAUDZ_PROMPT_VARIANT", raising=False)
+    assert select_system_prompt() == SYSTEM_PROMPT
+
+
+def test_select_system_prompt_legacy(monkeypatch):
+    from app.agent import SYSTEM_PROMPT_LEGACY, select_system_prompt
+
+    monkeypatch.setenv("HLAUDZ_PROMPT_VARIANT", "legacy")
+    assert select_system_prompt() == SYSTEM_PROMPT_LEGACY
+
+
+def test_select_system_prompt_unknown_value_falls_back(monkeypatch):
+    from app.agent import SYSTEM_PROMPT, select_system_prompt
+
+    monkeypatch.setenv("HLAUDZ_PROMPT_VARIANT", "nonsense")
+    assert select_system_prompt() == SYSTEM_PROMPT
+
+
+def test_legacy_prompt_is_the_pre_change_text():
+    from app.agent import SYSTEM_PROMPT_LEGACY
+
+    # 旧版只有「工具使用与自纠」「本地工作区与 Skill」两节
+    assert "工具使用与自纠" in SYSTEM_PROMPT_LEGACY
+    assert "身份与边界" not in SYSTEM_PROMPT_LEGACY
+    assert len(SYSTEM_PROMPT_LEGACY) < 1500
+
+
+def test_compose_system_prompt_honours_env_at_call_time(monkeypatch):
+    from app import agent as agent_mod
+
+    monkeypatch.setenv("HLAUDZ_PROMPT_VARIANT", "legacy")
+    legacy = agent_mod.compose_system_prompt("[SKILLS]")
+    monkeypatch.delenv("HLAUDZ_PROMPT_VARIANT", raising=False)
+    newer = agent_mod.compose_system_prompt("[SKILLS]")
+    assert "工具使用与自纠" in legacy
+    assert "身份与边界" not in legacy
+    assert "身份与边界" in newer
+    # skill 索引与 root 编排提示两块都要拼进去
+    assert "[SKILLS]" in legacy and "[SKILLS]" in newer

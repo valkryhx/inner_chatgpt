@@ -82,7 +82,11 @@ export interface SubagentBlock {
   agent_id: string
   name: string
   role: string
-  status: 'running' | 'completed' | 'errored' | 'stopped' | 'closed'
+  status: 'running' | 'stopping' | 'completed' | 'errored' | 'stopped' | 'closed'
+  /** 卡片出现时的本地时间戳，用于显示已运行时长 */
+  startedAt?: number
+  /** 进入终态的时间戳；结束后时长固定在 (endedAt - startedAt) */
+  endedAt?: number
   task: string
   events: SubagentEventItem[]
   result?: string
@@ -237,6 +241,7 @@ export type StreamEvent =
   | { type: 'subagent_start'; agent_id: string; name: string; role: string; task: string }
   | { type: 'subagent_event'; agent_id: string; event: StreamEvent }
   | { type: 'subagent_end'; agent_id: string; name?: string; status: string; result?: string; turns?: number; error?: string }
+  | { type: 'subagent_status'; agent_id: string; name?: string; status: string }
   | { type: 'compaction'; summary_tokens: number; kept_messages: number; trigger?: string }
   | { type: 'team_event'; event: TeamEvent }
   | { type: 'done'; message_id: string; status: 'complete' | 'stopped' | 'error' }
