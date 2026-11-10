@@ -53,7 +53,7 @@ export default function LoginPage({ onAuthed }: Props) {
       <div className="auth-glow" aria-hidden="true" />
       <div className="auth-card">
         <div className="auth-brand">
-          <img className="auth-mark" src="/logo.png" alt="" width={60} height={60} />
+          <img className="auth-mark" src="/assets/logo.png" alt="" width={60} height={60} />
           <h1>Hlaudz</h1>
           <p>{mode === 'login' ? '登录你的智能 Agent 工作台' : '创建一个账号，开始你自己的 Agent 工作台'}</p>
         </div>
