@@ -1239,3 +1239,14 @@ textarea, input { caret-color: var(--clay); }
 .composer-foot .model-picker-label { display: none; }
 .composer-foot .model-picker select { background: transparent; border: none; color: var(--muted); }
 .composer-foot .model-picker select:hover { background: var(--surface-2); border-radius: 6px; }
+
+/* 输入框对齐修正：＋ 与右侧图标同尺寸（28×28）、同一中线 */
+.composer { align-items: center; }
+.composer textarea { padding: 3px 4px; min-height: 22px; }
+.attach-btn {
+  width: 28px; height: 28px; flex: 0 0 28px;
+  border: none; border-radius: 8px; background: transparent;
+  color: var(--ink-2); font-size: 16px; font-weight: 400; line-height: 1;
+}
+.attach-btn:hover:not(:disabled) { background: var(--surface-2); color: var(--ink); }
+.attach-btn:disabled { opacity: .45; cursor: default; }
