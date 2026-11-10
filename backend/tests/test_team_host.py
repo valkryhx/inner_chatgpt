@@ -190,3 +190,23 @@ def test_spawn_failure_reclaims_bound_task(isolated_db):
         assert row["version"] == 2
 
     run(flow())
+
+
+def test_events_since_publishes_teammate_events(isolated_db):
+    """teammate 写入的事件必须在 lead 拉取时进入 SSE sink，否则面板永远看不到。"""
+    async def flow():
+        lead_scope = scope(agent="root")
+        mate_scope = scope(agent="sub:w", role="teammate")
+        await team_store.emit_event(
+            mate_scope, "task_updated",
+            {"task": {"task_id": "t1", "status": "completed"}},
+            task_id="t1",
+        )
+        seen: list[dict] = []
+        lead = TeamHost(lead_scope, event_sink=seen.append)
+        rows = await lead.events_since(0)
+        assert len(rows) == 1
+        assert len(seen) == 1
+        assert seen[0].get("type") == "task_updated"
+
+    run(flow())

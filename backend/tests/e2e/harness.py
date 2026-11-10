@@ -116,7 +116,16 @@ def summarize(events: list[dict[str, Any]]) -> dict[str, Any]:
     texts = "".join(e.get("text", "") for e in events if e.get("type") in ("text_delta", "message_delta"))
     errors = [e.get("error") for e in events if e.get("type") == "error"]
     done = next((e for e in reversed(events) if e.get("type") == "done"), {})
-    return {"tools": tools, "text": texts, "errors": errors, "done": done}
+    tasks: dict[str, str] = {}
+    for e in events:
+        if e.get("type") not in ("task_created", "task_updated"):
+            continue
+        payload = e.get("payload") or {}
+        task = payload.get("task") or payload
+        tid = task.get("task_id")
+        if tid and task.get("status"):
+            tasks[tid] = task["status"]
+    return {"tools": tools, "text": texts, "errors": errors, "done": done, "tasks": tasks}
 
 
 def evaluate(case: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, Any]]:
@@ -127,9 +136,18 @@ def evaluate(case: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, An
         checks.append({"kind": "expect_tool", "name": name, "ok": name in tools})
     for name in case.get("forbid_tools", []):
         checks.append({"kind": "forbid_tool", "name": name, "ok": name not in tools})
+    for name, count in (case.get("tool_min_counts") or {}).items():
+        checks.append({"kind": "tool_min_count", "name": f"{name}>={count}",
+                       "ok": tools.count(name) >= count})
     for name, count in (case.get("tool_counts") or {}).items():
         checks.append({"kind": "tool_count", "name": f"{name}={count}",
                        "ok": tools.count(name) == count})
+    if case.get("expect_all_tasks_completed"):
+        states = summary.get("tasks") or {}
+        want = int(case.get("min_tasks", 1))
+        ok = len(states) >= want and all(v == "completed" for v in states.values())
+        checks.append({"kind": "tasks_completed", "name": f"{len(states)}/{want}",
+                       "ok": ok})
     sentinel = case.get("sentinel")
     if sentinel:
         checks.append({"kind": "sentinel", "name": sentinel, "ok": sentinel in text})

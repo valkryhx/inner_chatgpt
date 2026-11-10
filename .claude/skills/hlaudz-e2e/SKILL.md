@@ -136,6 +136,33 @@ backend/tests/e2e/runs/<runId>/messages.json  # 持久化后的消息列表
 | 「timeout」 | 模型侧慢（上游排队），先看 `summary.json` 的单次 LLM 耗时 |
 | 「消息重复」 | 前端重连导致的事件重放，查 `generation_id` 是否一致 |
 
+## 6.5 审计：SSE 与数据库必须一致
+
+跑完场景后必须审计一次，不能只看 `[PASS]`：
+
+```bash
+cd backend
+python -m tests.e2e.audit <runId>
+```
+
+它会给出：
+
+| 字段 | 含义 |
+| --- | --- |
+| `tools` / `tool_counts` | 工具调用序列（与预期对比） |
+| `subagent_started` / `subagent_ended` / `subagent_status` | 子代理终态分布 |
+| `zombie_running` | 有 start 没有 end 的名字 → **必须为空** |
+| `task_states` | 从 **SSE 事件** 解析出的任务状态 |
+| `db_task_states` | 从 **数据库** 读到的任务状态 |
+| `sse_missing_events` | DB 有、SSE 没收到的事件数与 seq 列表 |
+
+**判据**：
+
+1. `zombie_running` 必须为空；
+2. `task_states` 与 `db_task_states` 必须一致——不一致说明事件链路断了，
+   面板会显示错误的进度（2026-11-11 就因为这个抓到 `events_since` 不 publish 的缺陷）；
+3. `sse_missing_events.missing_count` 应为 0；非 0 时把 seq 列表写进报告。
+
 ## 7. 报告模板（贴进回复或 docs）
 
 ```markdown

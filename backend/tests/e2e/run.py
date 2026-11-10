@@ -62,6 +62,29 @@ def cases() -> dict[str, dict]:
             "expect_tools": ["spawn_agent", "followup_task", "wait_agent"],
             "timeout_s": 480,
         },
+        "S3": {
+            "name": "subagent-timeout",
+            "prompt": ("派一个子代理，让它用 code_run 跑一段 Python：先睡眠 75 秒，"
+                       f"然后打印 SLEEP DONE {SENTINEL}。派完后先用 wait_agent 等 15 秒"
+                       "（会超时，这是预期的，不要因此重新 spawn）；确认它还在运行后，"
+                       "再 wait_agent 直到它完成，然后读取结果并告诉我。"),
+            "expect_tools": ["spawn_agent", "wait_agent", "read_agent_result"],
+            "tool_counts": {"spawn_agent": 1},
+            "sentinel": SENTINEL,
+            "timeout_s": 420,
+        },
+        "S6": {
+            "name": "team-scale",
+            "prompt": ("建一个团队任务板，创建 13 个任务：10 个简单任务（每个用一句话介绍一个"
+                       "中国城市，城市自选且不重复），3 个中等任务（分别写一段 80 字左右的杭州、"
+                       "成都、西安介绍）。派 2 个 teammate 完成这些任务，全部结束后汇总"
+                       "任务板状态（每个任务 id 与最终状态）。"),
+            "expect_tools": ["task_create", "spawn_teammate", "task_list"],
+            "tool_min_counts": {"task_create": 13, "spawn_teammate": 2},
+            "expect_all_tasks_completed": True,
+            "min_tasks": 13,
+            "timeout_s": 900,
+        },
         "S5": {
             "name": "team-basic",
             "prompt": ("建一个 2 个任务的团队任务板：任务 A 写一句话介绍杭州，任务 B 写一句话介绍成都。"

@@ -340,6 +340,8 @@ class TeamHost:
         rows = await team_store.events_since(self.scope, since_seq, limit)
         for row in rows:
             self._observed_seq = max(self._observed_seq, int(row.get("event_seq", 0)))
+            # 必须 publish：否则 teammate 侧产生的事件只推进游标、永远进不了 SSE
+            self._publish_event(row)
         return rows
 
     @staticmethod
