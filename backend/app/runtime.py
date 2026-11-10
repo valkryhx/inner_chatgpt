@@ -134,13 +134,18 @@ class RuntimeHub:
 
     async def refresh_mcp_status(self, user_id: str, model_id: str = "",
                                  *, force: bool = False) -> list[dict]:
-        """按软 TTL 刷新 MCP 连接状态；只有状态真的变了才重建 runtime。
+        """按软 TTL 刷新 MCP 连接状态；只有状态真的变了（或会话已死）才重建。
 
         为什么不是定时重建：重建会 close 掉旧的 toolset / LLM client，代价是
         重新连接全部 MCP server（可能好几秒）。状态没变时重建纯属浪费。
 
         为什么必须跳过活跃轮次：重建会把正在执行的那一轮的 toolset 关掉，
         导致工具调用失败。有生成在跑时直接返回旧状态，等下一轮再说。
+
+        为什么不只看 manifest：**缓存里的连接可能已经死了**。MCP server 重启后，
+        新连接的 probe 依然返回「已连接、12 工具」，与缓存 manifest 一致，
+        于是判定「状态没变」不重建 —— 而旧 client 每次调用都 `Session terminated`，
+        用户永久卡死（2026-11-10 实测）。所以先探测缓存连接本身的活性。
         """
         key = (user_id, model_id or "")
         ur = self._runtimes.get(key)
@@ -153,6 +158,14 @@ class RuntimeHub:
         if has_active_generation_for_user(user_id):
             return getattr(ur.toolset, "manifest", []) or []
 
+        # 1) 先看缓存连接是否还活着（真实往返，比 list_tools 更严格）
+        live = await _toolset_is_live(getattr(ur, "toolset", None))
+        if not live:
+            await self.invalidate(user_id)
+            ur = await self.get_user_runtime(user_id, model_id)
+            return getattr(ur.toolset, "manifest", []) or []
+
+        # 2) 连接活着：再看配置侧有没有变化（server 增删/改 URL）
         fresh = await probe_mcp_status(user_id)
         current = getattr(ur.toolset, "manifest", []) or []
         if _same_manifest(current, fresh):
@@ -277,6 +290,79 @@ def _same_manifest(a: list[dict], b: list[dict]) -> bool:
             for i in items
         )
     return norm(a) == norm(b)
+
+
+# 会话活性探测的超时。MCP server 卡死时不能把状态查询也拖住。
+_LIVENESS_TIMEOUT_S = 8.0
+
+
+async def _toolset_is_live(toolset) -> bool:
+    """缓存里的 MCP 连接是否还能用（真实往返，不是 list_tools）。
+
+    为什么必须探活：`list_tools` 只能证明「server 活着」，证明不了**这条连接**
+    还活着。fastmcp 的 client 在 server 重启后不会自己恢复，而探测用的是新连接 ——
+    于是 manifest 一致、TTL 判定「没变」、不重建，坏 client 永久留在缓存里。
+    实测（2026-11-10）：用户每轮调用都是 `Session terminated`，只能重启后端。
+
+    判定规则（保守，宁可放过不可错杀）：
+    - 没有 toolset / 没有子连接 → 视为活（没有可探测的对象）；
+    - 探针调用成功 → 活；
+    - 抛传输类错误（session terminated / connection closed…）→ 死；
+    - 抛业务类错误（参数、工具自身异常）→ 仍视为活（连接是通的）；
+    - 超时 → 视为死（卡死的连接和死连接没区别，重建更安全）。
+
+    探针只挑**无必填参数**的工具，避免因缺参数被服务端拒绝而误判。
+    """
+    if toolset is None:
+        return True
+    children = getattr(toolset, "_children", None) or [toolset]
+    probe_targets = [c for c in children if getattr(c, "_client", None) is not None]
+    if not probe_targets:
+        return True
+
+    from .mcp_client import _looks_session_dead
+
+    for child in probe_targets:
+        tool = _pick_liveness_probe(child)
+        if tool is None:
+            continue
+        try:
+            await asyncio.wait_for(child._client.call_tool(tool.name, {}),
+                                   timeout=_LIVENESS_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+                return False
+            if _looks_session_dead(exc):
+                return False
+            # 业务错误：连接是通的，继续看下一个
+            continue
+    return True
+
+
+# 只探这些名字形态的工具：健康检查类、只读列举类。绝不拿任意工具当探针 ——
+# 有些 server 的首个无参工具可能是会写数据的动作，探活不能有副作用。
+_SAFE_PROBE_TOKENS = (
+    "health", "ping", "status", "version", "info", "time", "now",
+    "list", "options", "dimensions", "schema", "describe", "capabilities",
+)
+
+
+def _pick_liveness_probe(child):
+    """挑一个**只读且无必填参数**的探针工具；找不到就不探（视为活）。
+
+    宁可放过（假活）也不能错杀或产生副作用：
+    - 有必填参数 → 缺参会被服务端拒绝，误判为死；
+    - 名字不像健康/列举类 → 可能有写副作用，不能当探针。
+    """
+    tools = list(getattr(child, "tools", []) or [])
+    for t in tools:
+        schema = t.input_schema or {}
+        if schema.get("required"):
+            continue
+        low = (t.name or "").lower()
+        if any(tok in low for tok in _SAFE_PROBE_TOKENS):
+            return t
+    return None
 
 
 def has_active_generation_for_user(user_id: str) -> bool:

@@ -898,21 +898,32 @@ async def compact_session(session_id: str, body: CompactIn | None = None,
 @router.get("/mcp/tools")
 async def mcp_tools(user: dict = Depends(get_current_user)):
     """List the caller's tool list. Does NOT require a usable LLM model:
-    a user may inspect/configure tools before adding a model."""
+    a user may inspect/configure tools before adding a model.
+
+    `description` 返回的是**模型实际看到的**版本（带 `[MCP: <server>]` 来源前缀），
+    否则同一份工具在这里与对话里长得不一样，用户按此判断归属会被误导
+    （2026-11-10 实测：这里返回原始 description，SQLBot 的工具看不出属于哪个 server）。
+    原始描述另给 `source` 字段，前端可自行决定展示方式。
+    """
+    def _row(t):
+        return {"name": t.name,
+                "description": t.describe_for_model(),
+                "raw_description": t.description,
+                "source": t.source,
+                "input_schema": t.input_schema}
+
     hub = get_hub()
     if hub is None:
         return {"tools": []}
     try:
         ur = await hub.get_user_runtime(user["id"])
-        return {"tools": [{"name": t.name, "description": t.description,
-                           "input_schema": t.input_schema} for t in ur.registry.tools]}
+        return {"tools": [_row(t) for t in ur.registry.tools]}
     except Exception:
         # Model init failed (e.g. no model configured). Report built-in tools only.
         try:
             from ..builtin_tools import build_builtin_tools
             tools = build_builtin_tools(user["id"])
-            return {"tools": [{"name": t.name, "description": t.description,
-                               "input_schema": t.input_schema} for t in tools]}
+            return {"tools": [_row(t) for t in tools]}
         except Exception:
             return {"tools": []}
 

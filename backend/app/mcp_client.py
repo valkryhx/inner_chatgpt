@@ -9,6 +9,7 @@ fastmcp.Client 直接接入，封装为自研 Tool（不再依赖 langchain）�
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any, Optional
 
 from fastmcp import Client
@@ -41,28 +42,68 @@ def _schema_props(schema: Any) -> list[str]:
     return []
 
 
-async def _call_tool_safe(client: Any, name: str, kwargs: dict[str, Any], schema: Any) -> str:
-    """调用 MCP 工具，任何异常都转成可读文本返回（永不冒泡）。
+# 会话级失效的判定关键词。fastmcp 在底层传输断开后**不会自己重连**，错误一般是
+# "Session terminated" / "Connection closed" / httpx ConnectError 等。
+# 命中这些说明连接坏了（不是参数写错），必须重建 client 再重试，
+# 否则模型无论怎么改参数都调不通（2026-11-10 实测：server 重启后永久 Session terminated）。
+_SESSION_DEAD_MARKERS = (
+    "session terminated",
+    "connection closed",
+    "connection reset",
+    "server disconnected",
+    "clientconnectorerror",
+    "clientconnectionerror",
+    "serverconnectionerror",
+    "connecterror",
+    "all connection attempts failed",
+    "broken pipe",
+    "transport closed",
+    "stream closed",
+    "no active session",
+)
 
-    目的：LLM 能力有限，某个工具参数写错是常态；应把错误作为「观察」回喂模型，
-    让它按提示改参/换工具继续（ReAct），而不是中断整轮、留下悬空 tool_call。
+
+def _looks_session_dead(exc: Exception) -> bool:
+    """异常是否表示 MCP 会话/传输已断（可通过重连恢复）。
+
+    只认传输类关键词：McpError 也覆盖「工具自己抛的业务错误」，那类不该重连。
     """
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return any(m in msg for m in _SESSION_DEAD_MARKERS)
+
+
+def _format_call_error(exc: Exception, schema: Any) -> str:
+    """把工具异常渲染成模型可读的观察文本（参数纠错提示 + 原始信息）。"""
+    msg = str(exc)
+    props = _schema_props(schema)
+    hint = ""
+    low = msg.lower()
+    if ("validation" in low) or ("unexpected keyword" in low) or ("argument" in low):
+        hint = (
+            "\n[参数校验失败] 请严格按工具参数定义调用，不要臆造参数名。"
+            f"本次可用参数: {props}。"
+            "若需按时间过滤，注意各工具参数不同：metric_latest 只取最新值，"
+            "指定某月请用 metric_series 的 month=YYYY-MM。"
+        )
+    return f"[工具执行错误] {type(exc).__name__}: {msg}{hint}"
+
+
+def _apply_mcp_budget(user_id: str, server: str, tool_name: str, text: str) -> str:
+    """MCP 结果也走统一预算层。
+
+    为什么必须做：内置工具有 per-tool 上限 + 超限落盘，MCP 工具此前完全没有。
+    实测 `run_readonly_sql` 一次返回 115 KB（1000 行），直接塞进 history 会
+    吃掉整个上下文预算，紧接着触发压缩、甚至截断真正的回答。
+    """
+    from .tool_budget import apply_budget
+    if not user_id:
+        return apply_budget(f"mcp:{server}:{tool_name}", text)
     try:
-        result = await client.call_tool(name, kwargs)
-        return _result_to_text(result)
-    except Exception as e:  # noqa: BLE001
-        msg = str(e)
-        props = _schema_props(schema)
-        hint = ""
-        low = msg.lower()
-        if ("validation" in low) or ("unexpected keyword" in low) or ("argument" in low):
-            hint = (
-                "\n[参数校验失败] 请严格按工具参数定义调用，不要臆造参数名。"
-                f"本次可用参数: {props}。"
-                "若需按时间过滤，注意各工具参数不同：metric_latest 只取最新值，"
-                "指定某月请用 metric_series 的 month=YYYY-MM。"
-            )
-        return f"[工具执行错误] {type(e).__name__}: {msg}{hint}"
+        from .workspace import user_workspace
+        where = user_workspace(user_id) / ".hlaudz" / "tool_results"
+    except Exception:  # noqa: BLE001
+        where = None
+    return apply_budget(f"mcp:{server}:{tool_name}", text, persist_dir=where)
 
 
 def _build_target(target: Any) -> Any:
@@ -112,17 +153,46 @@ class MCPToolset:
         # 每个已配置 server 的连接结果（成功/失败/工具数），由 build_user_toolset 填充。
         # 失败不能静默消失：否则模型只会看到「工具列表里没有」，然后编造原因。
         self._manifest: list[dict[str, Any]] = []
+        # 合并时因跨 server 重名而被改名的工具（原名 -> 新名），供 manifest 如实披露。
+        self._renamed: list[dict[str, str]] = []
         # 合并后：持有一组子 toolset，关闭时统一释放
         self._children: list["MCPToolset"] = []
 
     @classmethod
     def merge(cls, toolsets: list["MCPToolset"]) -> "MCPToolset":
-        """聚合多个已连接的 toolset 的工具；关闭父级时统一释放全部子级。"""
+        """聚合多个已连接的 toolset 的工具；关闭父级时统一释放全部子级。
+
+        同名工具处理：不同 server 常常暴露同名工具（`health` / `search` / `list`）。
+        registry 以 name 为唯一键，重复名会带来两个真实问题：
+        1. 发给模型的 schema 里出现两个同名 function，模型分不清是哪一个；
+        2. `dispatch()` 永远命中**最后**注册的那个，等于静默调错 server。
+
+        做法：首个出现者保留原名，后续冲突者加 server 前缀（`<server>_<name>`）。
+        工具名是 SSE / 前端 / 历史契约，所以只在真正冲突时改名；模型仍可从
+        description 的 `[MCP: <server>]` 判断归属，改名记录也写进 manifest。
+        """
         user_ids = {ts._user_id for ts in toolsets if ts._user_id}
         merged = cls(None, user_id=next(iter(user_ids)) if len(user_ids) == 1 else "")
         merged._children = list(toolsets)
+        taken: set[str] = set()
         for ts in toolsets:
-            merged._tools.extend(ts.tools)
+            for tool in ts.tools:
+                final = tool
+                if tool.name in taken:
+                    prefix = (ts._server_name or "mcp").strip().replace(" ", "_")
+                    candidate = f"{prefix}_{tool.name}"
+                    n = 2
+                    while candidate in taken:
+                        candidate = f"{prefix}{n}_{tool.name}"
+                        n += 1
+                    final = replace(tool, name=candidate)
+                    merged._renamed.append({
+                        "server": ts._server_name or "mcp",
+                        "original": tool.name,
+                        "assigned": candidate,
+                    })
+                taken.add(final.name)
+                merged._tools.append(final)
             merged._raw.extend(ts._raw)
         return merged
 
@@ -136,6 +206,34 @@ class MCPToolset:
             self._tools = []
             self._raw = []
         return self
+
+    async def reconnect(self) -> bool:
+        """重建底层 client（会话断开后的自愈）。
+
+        为什么需要：fastmcp 的 Client 在 server 重启 / 连接断开后不会自己恢复，
+        缓存里的旧 client 会一直报 `Session terminated`。而 TTL 探测用的是**新**连接，
+        看到的却是「已连接、12 个工具」，与缓存 manifest 一致 → 判定「状态没变」不重建，
+        于是坏掉的 client 永远留在缓存里，用户每轮调用都失败，只能重启后端。
+        重连成功后工具列表通常不变，模型侧无感知。
+        """
+        if self._target is None and not self._children:
+            return False
+        old = self._client
+        try:
+            self._client = Client(_build_target(self._target))
+            await self._client.__aenter__()
+            await self._discover()
+            self._error = None
+        except Exception as e:  # noqa: BLE001
+            self._error = f"{type(e).__name__}: {e}"
+            self._client = old
+            return False
+        if old is not None:
+            try:
+                await old.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+        return True
 
     async def __aexit__(self, *exc: Any) -> None:
         for child in self._children:
@@ -161,23 +259,50 @@ class MCPToolset:
         name = getattr(t, "name")
         description = getattr(t, "description", "") or name
         schema = getattr(t, "inputSchema", None) or {"type": "object", "properties": {}}
-        client = self._client
         user_id = self._user_id
+        toolset = self
+
+        async def _invoke(payload: dict) -> str:
+            """调用一次；会话失效时自动重连并重试一次。"""
+            client = toolset._client
+            if client is None:
+                return f"[工具执行错误] MCP server {toolset._server_name or ''} 当前没有活动连接"
+            try:
+                result = await client.call_tool(name, payload)
+                return _result_to_text(result)
+            except Exception as exc:  # noqa: BLE001
+                if not _looks_session_dead(exc):
+                    return _format_call_error(exc, schema)
+                # 连接坏了：重建 client 再试一次。server 重启/空闲超时是最常见原因，
+                # 不重连的话模型只能一直看到 Session terminated。
+                if not await toolset.reconnect():
+                    return (
+                        "[工具执行错误] MCP 会话已断开且自动重连失败"
+                        f"（{type(exc).__name__}: {exc}）。"
+                        f"该 server 当前不可用：{toolset._error or '重连失败'}"
+                    )
+                try:
+                    result = await toolset._client.call_tool(name, payload)
+                    return _result_to_text(result)
+                except Exception as exc2:  # noqa: BLE001
+                    return _format_call_error(exc2, schema)
 
         async def _call(args: dict) -> str:
-            assert client is not None
             payload = args if isinstance(args, dict) else {}
+            text: str
             if not user_id:
-                return await _call_tool_safe(client, name, payload, schema)
-            # Keep the semaphore scope user-wide: several sessions or agents for
-            # the same user must share USER_MAX_MCP_CALLS.  Timeout is converted
-            # into a normal tool observation so the model can continue.
-            from .quota import QuotaExceeded, get_quota
-            try:
-                async with get_quota().mcp_call(user_id, timeout_s=2.0):
-                    return await _call_tool_safe(client, name, payload, schema)
-            except QuotaExceeded as exc:
-                return f"[工具执行错误] {exc}"
+                text = await _invoke(payload)
+            else:
+                # Keep the semaphore scope user-wide: several sessions or agents for
+                # the same user must share USER_MAX_MCP_CALLS.  Timeout is converted
+                # into a normal tool observation so the model can continue.
+                from .quota import QuotaExceeded, get_quota
+                try:
+                    async with get_quota().mcp_call(user_id, timeout_s=2.0):
+                        text = await _invoke(payload)
+                except QuotaExceeded as exc:
+                    return f"[工具执行错误] {exc}"
+            return _apply_mcp_budget(user_id, toolset._server_name, name, text)
 
         return Tool(name=name, description=description, input_schema=schema, call=_call,
                     source=self._source_label())

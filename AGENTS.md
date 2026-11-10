@@ -138,6 +138,24 @@
   `.claude/skills/hlaudz-e2e/`，6 个场景（S0/S1/S2/S5/S7/S8）全绿。
 - 详见 `docs/20261111-Hlaudz-P0实施与e2e实测记录.md`。
 
+**MCP 链路加固 —— 已完成（2026-11-10）。**
+
+- 被测提交 `b44ea3f`（工具来源可见 / 连接状态可见 / 软 TTL）三个目标实测通过：
+  真实湛卢对话能说出 sqlbot 的 12 个工具、3/3 次取数结果与库内值一致、断链如实报告、
+  前端侧栏与设置页红绿状态正确。
+- 同时抓出并修复 3 个单测测不到的链路缺陷：
+  ① **会话僵死不自愈（高）**：MCP server 重启后缓存 client 报 `Session terminated`，
+  而 TTL 探测用新连接看到「没变」不重建 → 用户永久卡死，只能重启后端。
+  修复：`MCPToolset.reconnect()` + 调用级自动重连重试 + `runtime._toolset_is_live()` 探活；
+  ② **跨 server 同名工具冲突**：schema 出现重名 function，dispatch 静默调错 server。
+  修复：`merge()` 冲突加 server 前缀并在提示词披露；
+  ③ **MCP 结果无预算**：`run_readonly_sql` 一次 115 KB 原样进 history。
+  修复：MCP 结果走统一预算层（实测 115,685 → 4,160 字符 + 落盘路径）。
+- 另修 `/api/mcp/tools` 丢来源前缀的契约不一致。
+- 验证：单测 451 → **488 passed**；7 套真实验证（后端 SSE + Playwright +
+  临时 MCP server 重启复现），全部 0 失败，含反向确认。
+- 详见 `docs/20261110-MCP与Hlaudz全链路测试与缺陷修复.md`。
+
 ### 0.2 必读文档（按顺序）
 
 | 文档 | 用途 |
@@ -151,6 +169,8 @@
 | `docs/20261111-Hlaudz-P2实施记录.md` | **P2 实施（最新）**：followup_task steer、名字钉住、通知 fold 注入、S4 实测与两个审计发现 |
 | `docs/20261111-Hlaudz-e2e压测报告.md` | **e2e 压测（最新，含真实缺陷）**：S3 超时 / S6 13 任务规模；抓到 teammate 事件进不了 SSE 的缺陷（面板正确率 30%），修复后 98% |
 | `docs/20261111-Hlaudz工具渐进式披露调研与决策.md` | 方向 ④：ToolSearch / deferred tools 调研（实测 8.7 KB）、MCP 膨胀阈值与切换方案、skill 索引差距 |
+| `docs/20261110-MCP与Hlaudz全链路测试与缺陷修复.md` | **MCP 全链路测试（最新）**：`b44ea3f` 三目标实测通过；抓出并修复 3 个链路缺陷（会话僵死不自愈 / 跨 server 同名工具冲突 / MCP 结果无预算）+ 1 处契约不一致；单测 451→488，7 套真实验证 runId |
+| `docs/20261110-MCP工具来源可见性与热生效验证.md` | MCP 工具来源 `[MCP: <server>]` 前缀、server manifest 进提示词、状态可见与软 TTL（本次测试的被测对象） |
 | `docs/20261110-A2A使用文档.md` | **A2A 使用文档（含本机实跑任务 id）**：每用户 endpoint/token、能力档位、配额、审计、流式与终态订阅 |
 | `docs/20261110-A2A-MVP实施记录.md` | **A2A 实施记录**：方法集、数据模型、安全模型、测试与真实 E2E |
 | `docs/20261109-项目现状与文档刷新.md` | **文档刷新记录（最新）**：按 `main@3b9c68f` 核对的能力快照、README/AGENTS/实现原理的修改清单、未纳入项与后续建议 |

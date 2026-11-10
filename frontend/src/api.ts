@@ -165,7 +165,12 @@ export const api = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ generation_id: generationId, message_id: messageId }),
     }),
-  mcpTools: () => request<{ tools: { name: string; description: string }[] }>('/mcp/tools'),
+  // description 是模型实际看到的版本（带 [MCP: <server>] 来源前缀），
+  // raw_description 是 server 原始描述，source 是来源标签。
+  mcpTools: () =>
+    request<{
+      tools: { name: string; description: string; raw_description?: string; source?: string }[]
+    }>('/mcp/tools'),
   getTeam: (sessionId: string) => request<TeamSnapshot>(`/sessions/${sessionId}/team`),
 
   // me: LLM configs

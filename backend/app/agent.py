@@ -88,13 +88,19 @@ def select_system_prompt() -> str:
     return _PROMPT_VARIANTS.get(variant, SYSTEM_PROMPT)
 
 
-def format_mcp_manifest(manifest: list[dict[str, Any]] | None) -> str:
+def format_mcp_manifest(manifest: list[dict[str, Any]] | None,
+                        renamed: list[dict[str, str]] | None = None) -> str:
     """Render per-server MCP status into the system prompt.
 
     The model only ever saw a flattened tool-name list, so it could not answer
     "does server X have tools here" and fell back to guessing (2026-11-10: it
     called metric_search yet claimed sqlbot was not connected).  Give it the
     authoritative manifest instead.
+
+    ``renamed`` explains cross-server name collisions: when two servers expose
+    ``health``, the second becomes ``<server>_health`` (otherwise dispatch always
+    hits the last one).  Without this note the model sees a tool name it never
+    asked for and may treat it as a different tool.
     """
     if not manifest:
         return ""
@@ -112,12 +118,27 @@ def format_mcp_manifest(manifest: list[dict[str, Any]] | None) -> str:
         else:
             err = (m.get("error") or "unknown reason").strip()
             lines.append("- %s: **connection FAILED this turn**, 0 tools. Reason: %s" % (name, err))
+    if renamed:
+        pairs = "; ".join(
+            "%s's `%s` is exposed as `%s`" % (r.get("server") or "a server",
+                                              r.get("original") or "?",
+                                              r.get("assigned") or "?")
+            for r in renamed
+        )
+        lines.append("")
+        lines.append(
+            "Name collision note (two servers expose the same tool name, so one was "
+            "renamed to keep them distinct): " + pairs + "."
+        )
     lines.append("")
     lines.append(
         "When asked whether you have a server's tools, answer from this list: a listed "
         "server IS connected; missing tools can only mean that server failed to connect "
         "this turn. Do not hand-roll the protocol via code_run, and do not treat comments "
-        "in old workspace scripts as current facts."
+        "in old workspace scripts as current facts. If a tool call fails with a transport "
+        "error (session terminated / connection closed), the platform reconnects and "
+        "retries automatically — read the error and retry once instead of switching to "
+        "code_run."
     )
     return chr(10).join(lines)
 
@@ -295,7 +316,8 @@ class UserRuntime:
         # subagent.prompts.build_child_system_prompt()，不会看到这段。
         # Build the toolset first so the prompt can state which MCP servers are live.
         self.toolset = await build_user_toolset(user_id)
-        mcp_block = format_mcp_manifest(getattr(self.toolset, "manifest", None))
+        mcp_block = format_mcp_manifest(getattr(self.toolset, "manifest", None),
+                                        getattr(self.toolset, "_renamed", None))
         system_prompt = compose_system_prompt(skill_block, mcp_block)
         self.model = await build_user_model(user_id, llm_config_id, system_prompt=system_prompt)
         # Built-in tools first so MCP tools can never shadow file_read / load_skill etc.
