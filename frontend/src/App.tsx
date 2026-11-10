@@ -690,6 +690,35 @@ export default function App() {
   })()
   const activeModelLabel = activeModel ? activeModel.model : null
 
+  // 模型选择器：位置对齐 claude.ai 的底部说明行（不再放在顶栏）
+  const modelSelector = (
+    <label className="model-picker" title={activeSession ? '切换本会话使用的模型（会话级）' : '新会话将使用该模型'}>
+      <span className="model-picker-label">模型</span>
+      <select
+        value={currentModelId}
+        disabled={streaming || models.length === 0}
+        onChange={(e) => changeModel(e.target.value)}
+      >
+        {models.length === 0 && (
+          <option value="">
+            {activeSession?.model_id ? '（该配置不可用）' : '（尚未配置模型）'}
+          </option>
+        )}
+        {/* 会话记录的模型已不可用（被删除/停用）时，避免下拉框显示为空白 */}
+        {models.length > 0 && currentModelId !== '' &&
+          !models.some((m) => m.id === currentModelId) && (
+            <option value={currentModelId}>（该配置不可用）</option>
+          )}
+        {models.map((m) => (
+          <option key={m.id} value={m.id}>
+            {m.label} · {m.model}
+            {m.is_default ? '（默认）' : ''}
+          </option>
+        ))}
+      </select>
+    </label>
+  )
+
   return (
     <div className="app">
       <Sidebar
@@ -707,42 +736,23 @@ export default function App() {
       />
       <div className="main">
         <div className="main-header">
-          <div className="title">{activeSession?.title || 'Hlaudz'}</div>
-          <button
-            type="button"
-            className="ghost-btn ws-open-btn"
-            onClick={() => setWorkspaceOpen(true)}
-            title="浏览、下载 workspace 中的任意文件"
-          >
-            文件
+          <button type="button" className="chat-title-btn" title="会话标题">
+            <span className="t">{activeSession?.title || 'Hlaudz'}</span>
+            <span className="caret" aria-hidden="true">▾</span>
           </button>
-          {/* 模型选择器始终可见：没有会话时也能选，选中的值作为「新会话的默认模型」。
-              之前只在 activeSession 存在时渲染，导致刚配置完模型、还没发消息时完全看不到下拉框。 */}
-          <label className="model-picker" title={activeSession ? '切换本会话使用的模型（会话级）' : '新会话将使用该模型'}>
-            <span className="model-picker-label">模型</span>
-            <select
-              value={currentModelId}
-              disabled={streaming || models.length === 0}
-              onChange={(e) => changeModel(e.target.value)}
+          <div className="header-actions">
+            <button
+              type="button"
+              className="ghost-btn"
+              onClick={() => setWorkspaceOpen(true)}
+              title="浏览、下载 workspace 中的任意文件"
             >
-              {models.length === 0 && (
-                <option value="">
-                  {activeSession?.model_id ? '（该配置不可用）' : '（尚未配置模型）'}
-                </option>
-              )}
-              {/* 会话记录的模型已不可用（被删除/停用）时，避免下拉框显示为空白 */}
-              {models.length > 0 && currentModelId !== '' &&
-                !models.some((m) => m.id === currentModelId) && (
-                  <option value={currentModelId}>（该配置不可用）</option>
-                )}
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label} · {m.model}
-                  {m.is_default ? '（默认）' : ''}
-                </option>
-              ))}
-            </select>
-          </label>
+              文件
+            </button>
+            <button type="button" className="ghost-btn" disabled title="分享（未实现）">
+              分享
+            </button>
+          </div>
         </div>
         {teamError && (
           <div className="notice-bar team-warn">
@@ -785,6 +795,7 @@ export default function App() {
           contextUsage={contextUsage}
           modelName={activeModel?.model || ''}
           reasoningEffort={activeModel?.reasoning_effort || ''}
+          modelSelector={modelSelector}
         />
       </div>
       <TeamPanel

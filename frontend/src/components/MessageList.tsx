@@ -402,8 +402,50 @@ function MessageRow({ msg, onImageSettled, onOpenWorkspace }: {
             {msg.status === 'error' ? '（生成失败）' : '（未生成回复，可能已中断）'}
           </div>
         )}
+        {!isUser && !isActiveStream && (msg.content || hasVisibleBlocks) && <MessageActions msg={msg} />}
         {!isUser && <RunFooter msg={msg} live={isActiveStream} />}
       </div>
+    </div>
+  )
+}
+
+
+/** 助手消息下方的操作行：复制可用，其余为占位（对齐 claude.ai 的位置）。 */
+function ActionIcon({ d }: { d: string }) {
+  return (
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+         strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={d} />
+    </svg>
+  )
+}
+
+const ICON_COPY = 'M9 9h9a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 18 21H9a1.5 1.5 0 0 1-1.5-1.5v-9A1.5 1.5 0 0 1 9 9ZM5.5 15H5a1.5 1.5 0 0 1-1.5-1.5v-9A1.5 1.5 0 0 1 5 3h9a1.5 1.5 0 0 1 1.5 1.5V5'
+const ICON_SPEAK = 'M11 5 6.5 9H3v6h3.5L11 19V5ZM15 9a4 4 0 0 1 0 6'
+const ICON_UP = 'M7 21a2 2 0 0 0 2-2V9.8a2 2 0 0 0-.6-1.4L9 7.8V5a2 2 0 0 1 4 0v3.9l2.6 2.6a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H7Z'
+const ICON_DOWN = 'M7 3a2 2 0 0 1 2 2v9.2a2 2 0 0 1-.6 1.4l-.4.4V19a2 2 0 0 0 4 0v-3.9l2.6-2.6a2 2 0 0 0 .6-1.4V5a2 2 0 0 0-2-2H7Z'
+const ICON_RETRY = 'M4 12a8 8 0 0 1 13.7-5.7L20 8M20 4v4h-4M20 12a8 8 0 0 1-13.7 5.7L4 16M4 20v-4h4'
+
+function MessageActions({ msg }: { msg: Message }) {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(msg.content || '')
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      /* 剪贴板不可用时静默失败 */
+    }
+  }
+  return (
+    <div className="msg-actions">
+      <button className="icon-btn" title={copied ? '已复制' : '复制'} onClick={copy}>
+        {copied ? '✓' : <ActionIcon d={ICON_COPY} />}
+      </button>
+      <button className="icon-btn" disabled title="朗读（未实现）"><ActionIcon d={ICON_SPEAK} /></button>
+      <button className="icon-btn" disabled title="赞（未实现）"><ActionIcon d={ICON_UP} /></button>
+      <button className="icon-btn" disabled title="踩（未实现）"><ActionIcon d={ICON_DOWN} /></button>
+      <button className="icon-btn" disabled title="重试（未实现）"><ActionIcon d={ICON_RETRY} /></button>
     </div>
   )
 }

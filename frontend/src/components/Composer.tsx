@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import type { ContextUsage, UploadedImage } from '../types'
 import { uploadImage } from '../api'
 import MarkdownImage from './MarkdownImage'
@@ -11,13 +12,56 @@ interface Props {
   contextUsage?: ContextUsage | null
   modelName?: string
   reasoningEffort?: string
+  /** 模型选择器由 App 注入，位置在输入框下方的说明行右侧 */
+  modelSelector?: ReactNode
 }
 
 function fmtK(n: number): string {
   return `${(Math.max(0, n) / 1000).toFixed(1)}k`
 }
 
-export default function Composer({ streaming, onSend, onStop, onCompact, contextUsage, modelName, reasoningEffort }: Props) {
+const svgProps = {
+  viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+  strokeWidth: 1.8, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const,
+  'aria-hidden': true,
+}
+
+function MicIcon() {
+  return (
+    <svg {...svgProps} width="16" height="16">
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M5 11a7 7 0 0 0 14 0M12 18v3" />
+    </svg>
+  )
+}
+
+function WaveIcon() {
+  return (
+    <svg {...svgProps} width="16" height="16">
+      <path d="M4 12h1M8 8v8M12 5v14M16 8v8M20 12h-1" />
+    </svg>
+  )
+}
+
+function ChevronIcon() {
+  return (
+    <svg {...svgProps} width="12" height="12" strokeWidth={2}>
+      <path d="M6 9l6 6 6-6" />
+    </svg>
+  )
+}
+
+function SendIcon() {
+  return (
+    <svg {...svgProps} width="16" height="16" strokeWidth={2.2}>
+      <path d="M12 19V5M6 11l6-6 6 6" />
+    </svg>
+  )
+}
+
+export default function Composer({
+  streaming, onSend, onStop, onCompact, contextUsage, modelSelector,
+}: Props) {
   const [text, setText] = useState('')
   const [pending, setPending] = useState<UploadedImage[]>([])
   const [uploading, setUploading] = useState(false)
@@ -71,6 +115,13 @@ export default function Composer({ streaming, onSend, onStop, onCompact, context
     clear()
   }
 
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      submit()
+    }
+  }
+
   const onPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const files = Array.from(e.clipboardData?.files || [])
     if (files.some((f) => f.type.startsWith('image/'))) {
@@ -79,18 +130,16 @@ export default function Composer({ streaming, onSend, onStop, onCompact, context
     }
   }
 
-  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      submit()
-    }
-  }
-
   const autoGrow = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setText(e.target.value)
     e.target.style.height = 'auto'
     e.target.style.height = Math.min(e.target.scrollHeight, 200) + 'px'
   }
+
+  const canSend = !streaming && !uploading && (!!text.trim() || pending.length > 0)
+  const ctxPct = contextUsage && contextUsage.context_window > 0
+    ? ((contextUsage.used_tokens / contextUsage.context_window) * 100).toFixed(1)
+    : ''
 
   return (
     <div className="composer-wrap">
@@ -130,7 +179,7 @@ export default function Composer({ streaming, onSend, onStop, onCompact, context
           onClick={() => fileRef.current?.click()}
           disabled={streaming || uploading}
         >
-          {uploading ? '…' : '+'}
+          {uploading ? '…' : '＋'}
         </button>
         <textarea
           ref={taRef}
@@ -138,46 +187,41 @@ export default function Composer({ streaming, onSend, onStop, onCompact, context
           onChange={autoGrow}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
-          placeholder="输入消息，Enter 发送，Shift+Enter 换行；/compact 手动压缩上下文"
+          placeholder={pending.length ? '图片已就绪，直接发送或补充一句说明…' : '输入消息…'}
           rows={1}
           disabled={streaming}
         />
-        {streaming ? (
-          <button className="send-btn stop" onClick={onStop}>
-            停止
-          </button>
-        ) : (
-          <button className="send-btn" onClick={submit} disabled={(!text.trim() && pending.length === 0) || uploading}>
-            发送
-          </button>
-        )}
+        <div className="composer-right">
+          {streaming ? (
+            <button className="send-icon stop" onClick={onStop} title="停止生成">■</button>
+          ) : canSend ? (
+            <button className="send-icon" onClick={submit} title="发送（Enter）"><SendIcon /></button>
+          ) : (
+            <>
+              <button className="icon-btn" disabled title="语音输入（未实现）" aria-label="语音输入">
+                <MicIcon />
+              </button>
+              <button className="icon-btn chev" disabled title="更多（未实现）" aria-label="更多">
+                <ChevronIcon />
+              </button>
+              <button className="icon-btn" disabled title="语音模式（未实现）" aria-label="使用语音模式">
+                <WaveIcon />
+              </button>
+            </>
+          )}
+        </div>
       </div>
-      <div
-        className="composer-hint"
-        title={contextUsage
-          ? `自动压缩阈值 ${fmtK(contextUsage.auto_compact_tokens)} · 上下文窗口 ${fmtK(contextUsage.context_window)}`
-          : undefined}
-      >
-        <span title="当前会话使用的模型">{modelName || '未配置模型'}</span>{' '}
-        <span className="composer-hint-sep">·</span>{' '}
-        <span title={`模型配置中的 reasoning_effort：${(reasoningEffort || 'default').trim() || 'default'}`}>
-          {(reasoningEffort || 'default').trim() || 'default'}
-        </span>{' '}
-        <span className="composer-hint-sep">·</span>{' '}
-        {streaming ? (
-          // The meter is a session-level snapshot refreshed after a turn; showing
-          // it as a live figure while tokens stream in reads as a stalled number.
-          <span className="hint-streaming" title="本轮回复结束后刷新上下文统计">
-            {contextUsage && contextUsage.used_tokens > 0
-              ? `${fmtK(contextUsage.used_tokens)} / ${fmtK(contextUsage.context_window)} · ${contextUsage.percent.toFixed(1)}% · `
-              : ''}
-            生成中…
-          </span>
-        ) : contextUsage ? (
-          contextUsage.remaining_to_compact <= 0
-            ? <>{fmtK(contextUsage.used_tokens)} / {fmtK(contextUsage.context_window)} · {contextUsage.percent.toFixed(1)}% · 即将自动压缩</>
-            : <>{fmtK(contextUsage.used_tokens)} / {fmtK(contextUsage.context_window)} · {contextUsage.percent.toFixed(1)}% · 距压缩 {fmtK(contextUsage.remaining_to_compact)}</>
-        ) : '上下文统计加载中…'}
+      <div className="composer-foot">
+        <span className="foot-note">
+          Hlaudz 可能会出错，请核对重要信息。
+          {ctxPct && (
+            <>
+              {' · '}
+              {fmtK(contextUsage!.used_tokens)} / {fmtK(contextUsage!.context_window)} · {ctxPct}%
+            </>
+          )}
+        </span>
+        {modelSelector}
       </div>
     </div>
   )
