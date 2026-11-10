@@ -252,3 +252,102 @@ def test_wait_since_event_seq_incremental(isolated):
         await host.close_all()
 
     run(flow())
+
+
+# ---------- wait_agent 的异步语义（any_event / 三态回执）----------
+import time as _time
+
+
+class SlowAfterTool:
+    """第一次给 tool_call（产生事件），第二次卡住 —— 测「终态前就返回」。"""
+
+    def __init__(self, delay: float = 5.0):
+        self.delay = delay
+        self.calls = 0
+
+    async def run(self, messages, tools=None, on_delta=None, stop_check=None):
+        self.calls += 1
+        if self.calls == 1:
+            return ChatResult(content="", tool_calls=[{
+                "id": "c1", "type": "function",
+                "function": {"name": "file_read", "arguments": json.dumps({"path": "x.txt"})},
+            }])
+        await asyncio.sleep(self.delay)
+        return ChatResult(content="done")
+
+
+class SleepOnly:
+    """没有工具事件，只能等超时。"""
+
+    async def run(self, messages, tools=None, on_delta=None, stop_check=None):
+        await asyncio.sleep(5)
+        return ChatResult(content="done")
+
+
+def test_wait_any_event_returns_before_child_finishes(isolated):
+    """默认语义：有进展就立刻回来，不要一直等到子代理结束。"""
+
+    async def flow():
+        host = SubagentHost(_ctx(), parent_runtime=FakeParentRuntime(SlowAfterTool(5.0)),
+                            buffer=EventBuffer())
+        await host.spawn(task_name="slow", message="看 x.txt")
+        t0 = _time.monotonic()
+        out = await host.wait(targets=["slow"], condition="any_event", timeout_s=5)
+        elapsed = _time.monotonic() - t0
+        assert out["state"] == "event", out
+        assert elapsed < 2.0, f"等了 {elapsed:.1f}s，说明还在阻塞"
+        assert out["remaining_targets"] == ["slow"]
+        await host.close_all()
+
+    run(flow())
+
+
+def test_wait_any_event_timeout_state(isolated):
+    """没有事件时不装死：超时回执也是可行动信息。"""
+
+    async def flow():
+        host = SubagentHost(_ctx(), parent_runtime=FakeParentRuntime(SleepOnly()),
+                            buffer=EventBuffer())
+        await host.spawn(task_name="quiet", message="什么都不做")
+        out = await host.wait(targets=["quiet"], condition="any_event", timeout_s=0.4)
+        assert out["state"] == "timeout", out
+        assert out["timed_out"] is True
+        assert out["remaining_targets"] == ["quiet"]
+        assert out["recommended_next_action"] == "wait_agent"
+        await host.close_all()
+
+    run(flow())
+
+
+def test_wait_any_event_returns_all_terminal_when_done(isolated):
+    async def flow():
+        host = SubagentHost(_ctx(), parent_runtime=FakeParentRuntime(FakeClient([
+            ChatResult(content="好了"),
+        ])), buffer=EventBuffer())
+        await host.spawn(task_name="fast", message="说一句话")
+        out = await host.wait(targets=["fast"], condition="any_event", timeout_s=5)
+        assert out["state"] == "all_terminal", out
+        assert out["remaining_targets"] == []
+        await host.close_all()
+
+    run(flow())
+
+
+def test_wait_tool_defaults_to_any_event(isolated):
+    """工具层默认必须是 any_event，否则模型还是会被卡住。"""
+
+    async def flow():
+        from app.subagent.tools import build_subagent_tools
+
+        host = SubagentHost(_ctx(), parent_runtime=FakeParentRuntime(SlowAfterTool(5.0)),
+                            buffer=EventBuffer())
+        tools = {t.name: t for t in build_subagent_tools(host)}
+        await tools["spawn_agent"].call({"task_name": "slow", "message": "看 x.txt"})
+        t0 = _time.monotonic()
+        out = json.loads(await tools["wait_agent"].call({"targets": ["slow"]}))
+        elapsed = _time.monotonic() - t0
+        assert out.get("state") == "event", out
+        assert elapsed < 2.0
+        await host.close_all()
+
+    run(flow())

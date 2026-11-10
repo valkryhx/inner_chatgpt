@@ -12,10 +12,12 @@ ROOT_AGENT_HINT = """
 - 阻塞下一步的关键路径工作优先自己本地做完，不要为了"显得并行"而派活。
 - 子代理**看不到**这段对话，只能看到你写的 message：背景、涉及路径、约束、期望输出、
   以及"什么算完成"都必须写全。不要写"基于你之前的发现"这类空指代。
-- 派活后不要自己再重做一遍；`spawn_agent` 只是派活，必须显式 `wait_agent` 等结果，
-  再用 `read_agent_result` 读回权威结果并整合。
-- `wait_agent` 超时**不是失败**：子代理还在跑，先看 remaining_targets 继续等，
-  不要因为 timeout 重复 spawn。
+- 派活后不要自己再重做一遍；`spawn_agent` 只是派活，结果必须用 `read_agent_result` 读回。
+- `wait_agent` **默认不会替你等完**：等到第一个实质进展就返回 `state=event`，
+  这时子代理还在跑，你可以先做别的（本地工作、再派一个、或者回答用户），稍后再 wait。
+  只有 `state=all_terminal` 才是全部结束，此时用 `read_agent_result` 取权威结果。
+- `state=timeout` **不是失败**：这段时间没有进展，子代理仍在运行；不要因为 timeout 重复 spawn。
+  确实需要一次性等完时，才显式传 `condition=all_terminal`。
 - 结论用完后用 `close_agent` 释放槽位。
 - 给子代理的 message 要明确写出「只读侦察」还是「允许修改」；子代理拥有完整工具能力，
   权限约束必须由任务说明明确，而不是靠角色自动限制。

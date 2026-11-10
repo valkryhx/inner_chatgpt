@@ -47,6 +47,10 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# 算「有实质进展」的事件：文本增量太碎，不唤醒等待者，否则 wait 会
+# 被每个 token 反复唤醒，把上下文刷成一段段无用的半句话。
+_WAKE_EVENTS = frozenset({"tool_start", "tool_result", "message_injected"})
+
 class SubagentHost:
     """按 (user, session, message, generation) 绑定；一次生成一个实例。"""
 
@@ -60,6 +64,10 @@ class SubagentHost:
         )
         self.timeout_s = _env_float("SUBAGENT_TIMEOUT_S", 1800.0)
         self._change = asyncio.Event()
+        # 全局事件游标：wait_agent 的 since_event_seq 用它做增量游标。
+        # 不能用 node.event_seq —— 那是每个节点各自从 0 开始的计数器，
+        # 多个子代理时同一个游标会串味。
+        self._gseq = 0
         self._closed = False
         # 子代理完成通知：peek/ack 分离，供母代理在 fold 点注入
         self._notifications: list[dict] = []
@@ -151,7 +159,11 @@ class SubagentHost:
                         raise SubagentError(str(ev.get("error") or "子代理执行错误"))
                     if et in ("text_delta", "thinking_delta", "tool_start", "tool_result", "message_injected"):
                         node.event_seq += 1
-                        node.event_log.append({"seq": node.event_seq, "event": ev})
+                        self._gseq += 1
+                        node.event_log.append({"seq": self._gseq, "event": ev})
+                        if et in _WAKE_EVENTS:
+                            # 有实质进展就唤醒 wait：让它马上把控制权还给母代理
+                            self._touch()
                         # 环形缓冲：每节点最多保留最近 2000 条事件
                         if len(node.event_log) > 2000:
                             del node.event_log[: len(node.event_log) - 2000]
@@ -344,6 +356,8 @@ class SubagentHost:
         while True:
             if self._condition_met(nodes, condition):
                 break
+            if condition in ("any_event", "event") and self._has_new_event(nodes, since_event_seq):
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
@@ -360,10 +374,17 @@ class SubagentHost:
         return self._wait_result(nodes, condition, timed_out, since_event_seq)
 
     def _condition_met(self, nodes: list[AgentNode], condition: str) -> bool:
-        if condition == "event":
-            return any(n.status != "starting" for n in nodes)
-        # all_terminal / result_available
+        # any_event / event 由 _has_new_event 判定，这里只管「全部终态」
         return all(n.is_terminal for n in nodes)
+
+    def _has_new_event(self, nodes: list[AgentNode], since_event_seq: int = 0) -> bool:
+        """是否已有游标之后的实质进展（工具调用 / 注入指令）。"""
+        since = int(since_event_seq or 0)
+        for n in nodes:
+            for rec in n.event_log:
+                if rec["seq"] > since and rec["event"].get("type") in _WAKE_EVENTS:
+                    return True
+        return False
 
     def _wait_result(self, nodes: list[AgentNode], condition: str, timed_out: bool,
                      since_event_seq: int = 0) -> dict:
@@ -381,6 +402,12 @@ class SubagentHost:
         else:
             for n in nodes:
                 max_seq = max(max_seq, n.event_seq)
+        if not remaining:
+            state = "all_terminal"
+        elif timed_out:
+            state = "timeout"
+        else:
+            state = "event"
         if timed_out:
             action = "wait_agent" if remaining else "read_agent_result"
         elif remaining:
@@ -388,6 +415,7 @@ class SubagentHost:
         else:
             action = "read_agent_result" if refs else "wait_agent"
         return {
+            "state": state,
             "timed_out": timed_out,
             "condition": condition,
             "changed_agents": [n.to_dict() for n in nodes],

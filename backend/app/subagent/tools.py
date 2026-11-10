@@ -39,7 +39,7 @@ def build_subagent_tools(host: SubagentHost) -> list[Tool]:
         try:
             out = await host.wait(
                 targets=targets,
-                condition=str(args.get("condition", "all_terminal") or "all_terminal"),
+                condition=str(args.get("condition", "any_event") or "any_event"),
                 timeout_s=float(args.get("timeout_seconds", 60) or 60),
                 since_event_seq=int(args.get("since_event_seq", 0) or 0),
             )
@@ -107,15 +107,19 @@ def build_subagent_tools(host: SubagentHost) -> list[Tool]:
         ),
         Tool(
             "wait_agent",
-            "等待子代理。超时不算失败（子代理仍在跑），先看 remaining_targets 再继续 wait；"
-            "已有结果用 read_agent_result。",
+            "等子代理进展，**默认最多等到第一个实质进展就返回**（不要指望它替你等完）："
+            "返回 state=event 说明有进展但没结束，你可以先做别的事再 wait；"
+            "state=timeout 说明这段时间没进展，子代理仍在跑，不是失败；"
+            "state=all_terminal 才是全部结束，此时用 read_agent_result 取结果。"
+            "确实需要一次性等完时才显式传 condition=all_terminal。",
             {
                 "type": "object",
                 "properties": {
                     "targets": {"type": "array", "items": {"type": "string"},
                                 "description": "task_name 列表；省略=所有存活子代理"},
-                    "condition": {"type": "string", "enum": ["event", "all_terminal", "result_available"],
-                                  "description": "默认 all_terminal"},
+                    "condition": {"type": "string",
+                                  "enum": ["any_event", "event", "all_terminal", "result_available"],
+                                  "description": "默认 any_event（等到第一个实质进展就返回）"},
                     "timeout_seconds": {"type": "number", "description": "默认 60"},
                     "since_event_seq": {"type": "integer",
                                         "description": "可选；传上一次 wait 返回的 event_seq 可只取增量事件"},

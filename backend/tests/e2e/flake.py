@@ -19,7 +19,9 @@ from . import harness
 from .run import cases as all_cases
 
 HERE = Path(__file__).resolve().parent
-INFRA_MARKERS = ("502 Bad Gateway", "ConnectError", "Connection", "timeout", "503", "504")
+INFRA_MARKERS = ("502 Bad Gateway", "ConnectError", "Connection", "ReadTimeout",
+                 "network error", "503", "504")
+_RETRIES = 3
 
 
 def _infra(run_dir: Path) -> str:
@@ -51,19 +53,27 @@ async def run_round(names: list[str], table: dict, round_no: int) -> list[dict]:
     for name in names:
         case = dict(table[name])
         case["name"] = f"flake-{name}-r{round_no}"
-        started = time.time()
-        try:
-            result = await harness.run_case(case)
-            infra = _infra(Path(result["dir"]))
-            rows.append({"case": name, "round": round_no, "ok": result["ok"],
-                         "infra": infra, "run_id": result["run_id"],
-                         "elapsed_s": round(time.time() - started, 1),
-                         "failed": [c["kind"] + ":" + str(c["name"])
-                                    for c in result["checks"] if not c["ok"]]})
-        except Exception as exc:  # noqa: BLE001
-            rows.append({"case": name, "round": round_no, "ok": False,
-                         "infra": f"{type(exc).__name__}", "run_id": "-",
-                         "elapsed_s": round(time.time() - started, 1), "failed": []})
+        for attempt in range(1, _RETRIES + 1):
+            started = time.time()
+            try:
+                result = await harness.run_case(case)
+                infra = _infra(Path(result["dir"]))
+                rows.append({"case": name, "round": round_no, "ok": result["ok"],
+                             "infra": infra, "run_id": result["run_id"],
+                             "elapsed_s": round(time.time() - started, 1), "attempt": attempt,
+                             "failed": [c["kind"] + ":" + str(c["name"])
+                                        for c in result["checks"] if not c["ok"]]})
+            except Exception as exc:  # noqa: BLE001
+                rows.append({"case": name, "round": round_no, "ok": False,
+                             "infra": f"{type(exc).__name__}", "run_id": "-",
+                             "elapsed_s": round(time.time() - started, 1), "attempt": attempt,
+                             "failed": []})
+            # 基础设施故障（502 / 连接失败）不是产品行为：重试，而不是记成失败
+            if not rows[-1]["infra"] or attempt >= _RETRIES:
+                break
+            print(f"    [retry] {name} 基础设施失败（{rows[-1]['infra']}），重试 {attempt}/{_RETRIES}",
+                  flush=True)
+            await asyncio.sleep(5)
         mark = "PASS" if rows[-1]["ok"] else ("INFRA" if rows[-1]["infra"] else "FAIL")
         print(f"[{mark}] {name}#{round_no} {rows[-1]['elapsed_s']}s "
               f"run={rows[-1]['run_id']} {rows[-1]['infra']}", flush=True)
@@ -110,7 +120,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", default="S1,S2,S3,S4,S5,S6,S7,S8,S11")
     ap.add_argument("--rounds", type=int, default=3)
-    return asyncio.run(main_async(ap.parse_args()))
+    ap.add_argument("--retries", type=int, default=3,
+                    help="遇到 502/连接失败时的自动重试次数（不记成产品失败）")
+    global _RETRIES
+    args = ap.parse_args()
+    _RETRIES = max(1, int(args.retries))
+    return asyncio.run(main_async(args))
 
 
 if __name__ == "__main__":

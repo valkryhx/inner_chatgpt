@@ -83,6 +83,20 @@ def cases() -> dict[str, dict]:
             "tool_result_contains": "chars omitted",
             "timeout_s": 300,
         },
+        "S14": {
+            "name": "wait-nonblocking",
+            "prompt": ("派一个子代理，让它用 code_run 跑 Python：先 time.sleep(90)，"
+                       f"然后打印 SLOW DONE {SENTINEL}。派完之后**不要干等它**："
+                       "先自己统计一下工作区里有多少个文件，再回来 wait_agent。"
+                       "如果 wait 返回还在跑，就继续做别的事或再 wait 一次，"
+                       "最后把子代理的结果告诉我。"),
+            # 判据不是「必须调 wait_agent」——恰恰相反：非阻塞的目标是派完能去干别的，
+            # 结果靠通知 + read_agent_result 拿到。这里断言「派一次 + 做了本地工作 + 拿到结果」。
+            "expect_tools": ["spawn_agent", "read_agent_result", "file_glob"],
+            "tool_counts": {"spawn_agent": 1},
+            "sentinel": SENTINEL,
+            "timeout_s": 420,
+        },
         "S13": {
             "name": "subagent-stopping-state",
             "prompt": ("派一个子代理，让它用 code_run 跑 Python：先 time.sleep(120)，"

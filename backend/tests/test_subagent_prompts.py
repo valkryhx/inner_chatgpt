@@ -28,3 +28,14 @@ def test_keeps_existing_boundaries():
     h = _hint()
     assert "不要扩大范围" in h
     assert "frontend/dist" in h
+
+
+def test_teaches_nonblocking_wait_semantics():
+    """wait_agent 默认不等完；提示词必须把三态讲清楚，否则模型会空等。"""
+    from app.subagent.prompts import ROOT_AGENT_HINT
+
+    h = ROOT_AGENT_HINT
+    assert "state=event" in h
+    assert "state=all_terminal" in h
+    assert "state=timeout" in h or "timeout" in h
+    assert "condition=all_terminal" in h
