@@ -21,6 +21,7 @@ from typing import Any
 
 from .run_guard import WORKSPACE_PYTHON_GUARD, protected_code_reason, workspace_env
 from .skill_store import load_skill_content
+from .file_search import file_glob as _file_glob, file_grep as _file_grep
 from .tools import Tool
 from .workspace import (
     PathSecurityError,
@@ -47,9 +48,30 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     return head + f"\n\n[输出被截断，共 {len(text)} 字符，仅显示前 {limit}]"
 
 
+def format_code_run_header(code_type: str, code: str, exit_code: int, cwd) -> str:
+    """code_run 的第一行：把非零退出码翻译成模型能直接用的语义。"""
+    from .exit_codes import exit_code_note
+
+    note = exit_code_note(code, exit_code) if exit_code else ""
+    suffix = f" ({note})" if note else ""
+    return f"[code_run {code_type}] exit={exit_code}{suffix} cwd={cwd}" + chr(10)
+
+
+def _with_budget(user_id: str, tool_name: str, text: str) -> str:
+    """统一结果预算：超限落盘到 workspace/.hlaudz/tool_results 并给回可读路径。"""
+    from .tool_budget import apply_budget, budget_dir_for
+
+    try:
+        where = budget_dir_for(user_workspace(user_id))
+    except Exception:  # noqa: BLE001 - 预算层不能因为目录问题让工具失败
+        where = None
+    return apply_budget(tool_name, text, persist_dir=where)
+
+
 # ---------------- file_read ----------------
 def _read_impl(user_id: str, path: str, start: int = 1, count: int = DEFAULT_READ_LINES,
-               keyword: str | None = None, show_linenos: bool = True) -> str:
+               keyword: str | None = None, show_linenos: bool = True,
+               registry: object | None = None) -> str:
     try:
         target = safe_read_path(user_id, path)
     except PathSecurityError as e:
@@ -71,6 +93,8 @@ def _read_impl(user_id: str, path: str, start: int = 1, count: int = DEFAULT_REA
             return f"未找到关键字 {keyword!r}（从第 {start} 行起）。文件共 {total} 行。"
         start = idx + 1
     end = min(total, start - 1 + count)
+    if registry is not None:
+        registry.record(target, complete=(start == 1 and not keyword and end >= total))
     chunk = all_lines[start - 1:end]
     if show_linenos:
         body = "\n".join(f"{start + i}|{line}" for i, line in enumerate(chunk))
@@ -81,7 +105,7 @@ def _read_impl(user_id: str, path: str, start: int = 1, count: int = DEFAULT_REA
 
 # ---------------- file_write ----------------
 def _write_impl(user_id: str, path: str, content: str, mode: str = "overwrite",
-                *, root: str = "") -> str:
+                *, root: str = "", registry: object | None = None) -> str:
     try:
         target = safe_workspace_path(user_id, path, root=root)
     except PathSecurityError as e:
@@ -89,6 +113,10 @@ def _write_impl(user_id: str, path: str, content: str, mode: str = "overwrite",
     mode = (mode or "overwrite").lower()
     if mode not in ("overwrite", "append", "prepend"):
         return _err(f"不支持的 mode: {mode}（overwrite/append/prepend）")
+    if mode == "overwrite" and target.exists() and registry is not None:
+        ok, reason = registry.check(target)
+        if not ok:
+            return _err(reason)
     target.parent.mkdir(parents=True, exist_ok=True)
     content = content if isinstance(content, str) else str(content)
     existing = ""
@@ -110,13 +138,17 @@ def _write_impl(user_id: str, path: str, content: str, mode: str = "overwrite",
 
 # ---------------- file_patch ----------------
 def _patch_impl(user_id: str, path: str, old_content: str, new_content: str,
-                *, root: str = "") -> str:
+                *, root: str = "", registry: object | None = None) -> str:
     try:
         target = safe_workspace_path(user_id, path, root=root)
     except PathSecurityError as e:
         return _err(str(e))
     if not target.is_file():
         return _err(f"文件不存在: {path}")
+    if registry is not None:
+        ok, reason = registry.check(target)
+        if not ok:
+            return _err(reason)
     if not old_content:
         return _err("old_content 不能为空")
     try:
@@ -234,8 +266,8 @@ async def _run_code_impl(
             out = (stdout or b"").decode("utf-8", errors="replace")
             if lease.stopped:
                 return _err("已停止：执行进程已被终止")
-            header = f"[code_run {code_type}] exit={proc.returncode} cwd={cwd}\n"
-            return _truncate(header + out)
+            header = format_code_run_header(code_type, code, proc.returncode, cwd)
+            return header + out
     except QuotaExceeded as e:
         return _err(str(e))
     except Exception as e:  # noqa: BLE001
@@ -279,16 +311,20 @@ def build_builtin_tools(
     避免多个子代理并发写同一个 workspace 互相覆盖（设计文档 §7.2）。
     """
     root = write_root or ""
+    from .read_registry import ReadRegistry
+
+    read_registry = ReadRegistry()
 
     async def file_read(args: dict) -> str:
-        return _read_impl(
+        return _with_budget(user_id, "file_read", _read_impl(
             user_id,
             str(args.get("path", "")),
             start=int(args.get("start", 1) or 1),
             count=int(args.get("count", DEFAULT_READ_LINES) or DEFAULT_READ_LINES),
             keyword=(args.get("keyword") or None),
             show_linenos=bool(args.get("show_linenos", True)),
-        )
+            registry=read_registry,
+        ))
 
     async def file_write(args: dict) -> str:
         return _write_impl(
@@ -297,6 +333,7 @@ def build_builtin_tools(
             args.get("content", ""),
             str(args.get("mode", "overwrite") or "overwrite"),
             root=root,
+            registry=read_registry,
         )
 
     async def file_patch(args: dict) -> str:
@@ -306,6 +343,7 @@ def build_builtin_tools(
             str(args.get("old_content", "")),
             str(args.get("new_content", "")),
             root=root,
+            registry=read_registry,
         )
 
     async def list_files(args: dict) -> str:
@@ -317,7 +355,7 @@ def build_builtin_tools(
         )
 
     async def code_run(args: dict) -> str:
-        return await _run_code_impl(
+        raw = await _run_code_impl(
             user_id,
             str(args.get("code", "")),
             str(args.get("type", "python") or "python"),
@@ -327,6 +365,26 @@ def build_builtin_tools(
             generation_id=generation_id,
             agent_id=agent_id,
         )
+        return _with_budget(user_id, "code_run", raw)
+
+    async def file_glob(args: dict) -> str:
+        return _with_budget(user_id, "file_glob", _file_glob(
+            user_id,
+            str(args.get("pattern", "")),
+            str(args.get("path", "") or ""),
+        ))
+
+    async def file_grep(args: dict) -> str:
+        return _with_budget(user_id, "file_grep", _file_grep(
+            user_id,
+            str(args.get("pattern", "")),
+            str(args.get("path", "") or ""),
+            str(args.get("glob", "") or ""),
+            str(args.get("output_mode", "content") or "content"),
+            bool(args.get("ignore_case", False)),
+            int(args.get("context", 0) or 0),
+            int(args.get("head_limit", 250) or 250),
+        ))
 
     async def load_skill(args: dict) -> str:
         return _load_skill_impl(
@@ -335,10 +393,12 @@ def build_builtin_tools(
             str(args.get("args", "") or ""),
         )
 
-    return _build_tool_list(file_read, file_write, file_patch, list_files, code_run, load_skill)
+    return _build_tool_list(file_read, file_write, file_patch, list_files, code_run,
+                           load_skill, file_glob, file_grep)
 
 
-def _build_tool_list(file_read, file_write, file_patch, list_files, code_run, load_skill) -> list[Tool]:
+def _build_tool_list(file_read, file_write, file_patch, list_files, code_run, load_skill,
+                    file_glob, file_grep) -> list[Tool]:
     return [
         Tool(
             "file_read",
@@ -356,6 +416,41 @@ def _build_tool_list(file_read, file_write, file_patch, list_files, code_run, lo
                 "required": ["path"],
             },
             file_read,
+        ),
+        Tool(
+            "file_glob",
+            "按文件名/路径模式查找文件。找「哪些文件叫 xxx」「这个项目有哪些 yyy 类型文件」时用它，"
+            "不要用 code_run 跑 find / ls。pattern 支持 **/*.py 这类写法；最多返回 100 个路径。",
+            {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "glob 模式，如 **/*.py"},
+                    "path": {"type": "string", "description": "搜索根目录，省略=workspace 根"},
+                },
+                "required": ["pattern"],
+            },
+            file_glob,
+        ),
+        Tool(
+            "file_grep",
+            "在文件内容里搜索。找「哪处引用了 X」「有哪些 TODO」时用它，不要用 code_run 跑 grep / rg。"
+            "先用 output_mode=files_with_matches 收敛范围，再用 content + context 看上下文。",
+            {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "正则表达式"},
+                    "path": {"type": "string", "description": "搜索根目录，省略=workspace 根"},
+                    "glob": {"type": "string", "description": "文件过滤，如 *.py"},
+                    "output_mode": {"type": "string",
+                                    "enum": ["content", "files_with_matches", "count"],
+                                    "description": "默认 content"},
+                    "ignore_case": {"type": "boolean", "description": "忽略大小写"},
+                    "context": {"type": "integer", "description": "前后各 N 行，最大 20"},
+                    "head_limit": {"type": "integer", "description": "最多返回多少行，默认 250"},
+                },
+                "required": ["pattern"],
+            },
+            file_grep,
         ),
         Tool(
             "file_write",

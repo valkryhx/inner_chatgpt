@@ -485,8 +485,25 @@ def is_builtin_skill(name: str) -> bool:
     return False
 
 
-def format_skill_listing(skills: Iterable[SkillSpec], char_budget: int = 8000) -> str:
-    """L1 index: one line per model-invocable skill, with a char budget."""
+DESC_LIMIT = 1536
+COMPACT_DESC_LIMIT = 80
+DEFAULT_INDEX_BUDGET = 16384
+
+
+def _first_sentence(desc: str, limit: int = COMPACT_DESC_LIMIT) -> str:
+    for sep in ("。", ". ", "；", ";", "!", "！"):
+        idx = desc.find(sep)
+        if 0 <= idx < limit:
+            return desc[: idx + len(sep)].strip()
+    return desc[:limit].strip()
+
+
+def format_skill_listing(skills: Iterable[SkillSpec], char_budget: int = DEFAULT_INDEX_BUDGET) -> str:
+    """L1 index: one line per model-invocable skill, with a char budget.
+
+    预算不够时不把技能压成光名字——至少保留第一句触发器，
+    否则模型只能看到名字，无法判断相关性（GA 第 3 轮的结论）。
+    """
     lines: list[str] = []
     used = 0
     for s in skills:
@@ -495,15 +512,21 @@ def format_skill_listing(skills: Iterable[SkillSpec], char_budget: int = 8000) -
         desc = re.sub(r"\s+", " ", s.description or "").strip()
         if s.when_to_use:
             desc = f"{desc} - {s.when_to_use}" if desc else s.when_to_use
-        if len(desc) > 250:
-            desc = desc[:249].rstrip() + "..."
+        if len(desc) > DESC_LIMIT:
+            desc = desc[: DESC_LIMIT - 1].rstrip() + "..."
         line = f"- {s.name}: {desc}" if desc else f"- {s.name}"
         extra = len(line) + (1 if lines else 0)
         if lines and used + extra > char_budget:
-            compact = f"- {s.name}"
+            trigger = _first_sentence(desc) if desc else ""
+            compact = f"- {s.name}: {trigger}" if trigger else f"- {s.name}"
             if used + len(compact) + 1 <= char_budget:
                 lines.append(compact)
                 used += len(compact) + 1
+                continue
+            bare = f"- {s.name}"
+            if used + len(bare) + 1 <= char_budget:
+                lines.append(bare)
+                used += len(bare) + 1
                 continue
             break
         lines.append(line)
@@ -511,7 +534,8 @@ def format_skill_listing(skills: Iterable[SkillSpec], char_budget: int = 8000) -
     return "\n".join(lines)
 
 
-def build_skill_prompt(user_id: str, char_budget: int = 8000) -> str:
+
+def build_skill_prompt(user_id: str, char_budget: int = DEFAULT_INDEX_BUDGET) -> str:
     """The L1 listing to append to the system prompt (empty string if none)."""
     listing = format_skill_listing(list_skills(user_id), char_budget=char_budget)
     if not listing:

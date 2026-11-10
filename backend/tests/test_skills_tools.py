@@ -122,6 +122,8 @@ def test_builtin_tools_file_roundtrip(tmp_path, monkeypatch):
 
     # patch must report ambiguity on duplicate matches
     run(tools["file_write"].call({"path": "dup.txt", "content": "x\nx\n"}))
+    # 写前必读：patch 已存在文件前必须先读（2026-11-11 门禁）
+    run(tools["file_read"].call({"path": "dup.txt"}))
     dup = run(tools["file_patch"].call({"path": "dup.txt", "old_content": "x", "new_content": "y"}))
     assert "工具执行错误" in dup and "2 处" in dup
 

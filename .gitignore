@@ -53,3 +53,5 @@ temp/
 
 # 本地保存的参考页面与截图，不入库
 claude_html/
+# e2e 运行现场（含会话数据，不入库）
+backend/tests/e2e/runs/

@@ -265,22 +265,31 @@ class AgentLoop:
             if reasoning:
                 amsg["reasoning"] = reasoning
             history.append(amsg)
+            prepared = []
             for tc in tool_calls:
                 if stopped():
                     break
                 fid = tc.get("id") or ""
                 name = tc.get("function", {}).get("name", "")
                 args = _safe_json(tc.get("function", {}).get("arguments"))
+                prepared.append({"id": fid, "name": name, "args": args})
                 yield {"type": "tool_start", "id": fid, "name": name, "input": args}
-                out = await self.registry.dispatch(name, args)
-                is_err = out.startswith("[工具执行错误]")
-                history.append({"role": "tool", "tool_call_id": fid, "name": name, "content": out})
-                yield {"type": "tool_result", "id": fid, "name": name, "content": out, "is_error": is_err}
-                if self.history_store is not None:
-                    if self.user_id:
-                        await self.history_store.set(self.user_id, session_id, history)
-                    else:
-                        await self.history_store.set(session_id, history)
+            if prepared and not stopped():
+                # 相邻的只读工具并发，写类与 code_run 串行（tool_batching 保证顺序）
+                from .tool_batching import run_batched
+
+                outs = await run_batched(prepared, self.registry.dispatch)
+                for item, out in zip(prepared, outs):
+                    is_err = out.startswith("[工具执行错误]")
+                    history.append({"role": "tool", "tool_call_id": item["id"],
+                                    "name": item["name"], "content": out})
+                    yield {"type": "tool_result", "id": item["id"], "name": item["name"],
+                           "content": out, "is_error": is_err}
+                    if self.history_store is not None:
+                        if self.user_id:
+                            await self.history_store.set(self.user_id, session_id, history)
+                        else:
+                            await self.history_store.set(session_id, history)
 
         yield {"type": "error", "error": f"达到最大轮数 {self.max_turns}，已停止"}
 

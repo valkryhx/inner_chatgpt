@@ -128,6 +128,16 @@
 - 限制：单条 4 张 / 单张 25MB；只带最近 3 轮图片；删消息不删文件（无 GC）；A2A 暂不传图。
 - 详见 `docs/20261110-图片上传与视觉输入设计方案.md`、`docs/20261110-changelog-图片上传与视觉输入.md`。
 
+**P8：对标 GA / CC 的工具与提示词优化（P0 阶段）—— 已完成（2026-11-11）。**
+
+- 内置工具：新增 `file_glob` / `file_grep`；统一结果预算（per-tool 上限 + 超限落盘 + 头尾预览）；
+  退出码语义化（grep/diff/test/find 非零不再当错误）；写前必读门禁；只读工具并发。
+- 提示词：`SYSTEM_PROMPT` 从 2 节扩到 7 节（补规划 / 验证纪律 / 工具优先 / skill 隐性触发）；
+  skill 索引预算 8K→16K、单条描述 250→1536。
+- 验证：新增 81 个单测（全量 373 passed）；真实 LLM e2e 骨架 `backend/tests/e2e/` +
+  `.claude/skills/hlaudz-e2e/`，6 个场景（S0/S1/S2/S5/S7/S8）全绿。
+- 详见 `docs/20261111-Hlaudz-P0实施与e2e实测记录.md`。
+
 ### 0.2 必读文档（按顺序）
 
 | 文档 | 用途 |
@@ -137,6 +147,7 @@
 | `docs/20261111-Hlaudz-subagent与team测试优化方案.md` | 方向 ②：L3 真实 e2e 骨架 S1–S8、GA 12 类缺陷目录、steer / 名字钉住 / 通知注入 / 关闭竞态 |
 | `docs/20261111-Hlaudz-提示词与通用任务能力方案.md` | 方向 ③：SYSTEM_PROMPT 2→7 节、专用工具优先、skill 隐性触发、消融测试 |
 | `.claude/skills/hlaudz-e2e/SKILL.md` | **真实 e2e 验证 skill（强制使用，见 §2）** |
+| `docs/20261111-Hlaudz-P0实施与e2e实测记录.md` | **P0 实施与 e2e 实测（最新）**：改动清单、81 条新测、反向确认与变异验证、6 个 runId 与审计结论 |
 | `docs/20261111-Hlaudz工具渐进式披露调研与决策.md` | 方向 ④：ToolSearch / deferred tools 调研（实测 8.7 KB）、MCP 膨胀阈值与切换方案、skill 索引差距 |
 | `docs/20261110-A2A使用文档.md` | **A2A 使用文档（含本机实跑任务 id）**：每用户 endpoint/token、能力档位、配额、审计、流式与终态订阅 |
 | `docs/20261110-A2A-MVP实施记录.md` | **A2A 实施记录**：方法集、数据模型、安全模型、测试与真实 E2E |
