@@ -121,3 +121,28 @@ def test_wait_timeout_returns_actionable_receipt(isolated):
         assert "recommended_next_action" in waited
 
     run(flow())
+
+
+def test_reuse_after_close_gets_suffix(isolated):
+    async def flow():
+        host = _host(Client(content="ok"))
+        await host.spawn(task_name="probe", message="m")
+        await host.wait(targets=["probe"], timeout_s=10)
+        await host.close("probe")
+        second = await host.spawn(task_name="probe", message="m2")
+        assert second["agent_id"] == "sub:probe_2", second
+        await host.wait(targets=["probe_2"], timeout_s=10)
+
+    run(flow())
+
+
+def test_reuse_while_running_is_still_rejected(isolated):
+    async def flow():
+        host = _host(Client(delay=0.5))
+        await host.spawn(task_name="busy", message="m")
+        with pytest.raises(Exception) as exc:
+            await host.spawn(task_name="busy", message="m2")
+        assert "仍在运行" in str(exc.value)
+        await host.close("busy")
+
+    run(flow())

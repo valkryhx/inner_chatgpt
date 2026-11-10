@@ -34,7 +34,8 @@ def _dump(obj: Any) -> str:
 
 class AgentLoop:
     def __init__(self, client: LLMClient, registry: ToolRegistry, system_prompt: str,
-                 max_turns: int = 300, history_store=None, *, user_id: str = ""):
+                 max_turns: int = 300, history_store=None, *, user_id: str = "",
+                 message_injector=None):
         self.client = client
         self.registry = registry
         self.system_prompt = system_prompt
@@ -43,6 +44,8 @@ class AgentLoop:
         # Owner identity is server-generated.  It is never accepted from a tool
         # argument or model output.
         self.user_id = user_id
+        # 可选：每轮模型调用前的消息注入器（子代理 steer 用）
+        self.message_injector = message_injector
 
     # ---------- sanitation: repair dangling tool_calls ----------
     async def sanitize(self, history: list[dict]) -> bool:
@@ -186,6 +189,14 @@ class AgentLoop:
                 yield {"type": "done", "status": "stopped"}
                 return
             turn += 1
+            if self.message_injector is not None:
+                try:
+                    injected = self.message_injector() or []
+                except Exception:
+                    injected = []
+                for msg in injected:
+                    history.append(msg)
+                    yield {"type": "message_injected", "text": msg.get("content", "")}
             # streaming deltas must be yielded immediately; run() collects them.
             # We use a queue to bridge on_delta callback -> async yields.
             q: asyncio.Queue = asyncio.Queue()

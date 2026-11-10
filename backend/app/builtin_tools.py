@@ -420,7 +420,7 @@ def _build_tool_list(file_read, file_write, file_patch, list_files, code_run, lo
         Tool(
             "file_glob",
             "按文件名/路径模式查找文件。找「哪些文件叫 xxx」「这个项目有哪些 yyy 类型文件」时用它，"
-            "不要用 code_run 跑 find / ls。pattern 支持 **/*.py 这类写法；最多返回 100 个路径。",
+            "不要用 code_run 跑 find / ls。pattern 支持 **/*.py 这类写法；最多返回 100 个路径，但返回值里的 total 是完整数量，可直接用来统计文件个数。",
             {
                 "type": "object",
                 "properties": {

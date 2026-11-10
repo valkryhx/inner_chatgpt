@@ -148,6 +148,7 @@
 | `docs/20261111-Hlaudz-提示词与通用任务能力方案.md` | 方向 ③：SYSTEM_PROMPT 2→7 节、专用工具优先、skill 隐性触发、消融测试 |
 | `.claude/skills/hlaudz-e2e/SKILL.md` | **真实 e2e 验证 skill（强制使用，见 §2）** |
 | `docs/20261111-Hlaudz-P0实施与e2e实测记录.md` | **P0 实施与 e2e 实测（最新）**：改动清单、81 条新测、反向确认与变异验证、6 个 runId 与审计结论 |
+| `docs/20261111-Hlaudz-P2实施记录.md` | **P2 实施（最新）**：followup_task steer、名字钉住、通知 fold 注入、S4 实测与两个审计发现 |
 | `docs/20261111-Hlaudz工具渐进式披露调研与决策.md` | 方向 ④：ToolSearch / deferred tools 调研（实测 8.7 KB）、MCP 膨胀阈值与切换方案、skill 索引差距 |
 | `docs/20261110-A2A使用文档.md` | **A2A 使用文档（含本机实跑任务 id）**：每用户 endpoint/token、能力档位、配额、审计、流式与终态订阅 |
 | `docs/20261110-A2A-MVP实施记录.md` | **A2A 实施记录**：方法集、数据模型、安全模型、测试与真实 E2E |

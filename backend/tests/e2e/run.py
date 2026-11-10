@@ -54,6 +54,14 @@ def cases() -> dict[str, dict]:
             "tool_counts": {"spawn_agent": 2},
             "timeout_s": 420,
         },
+        "S4": {
+            "name": "subagent-steer",
+            "prompt": ("派一个子代理统计 backend 目录下有多少个 .py 文件。"
+                       "派完立刻用 followup_task 追加一条要求：再统计 .ts 文件数量。"
+                       "然后等它完成，汇报两个数字。"),
+            "expect_tools": ["spawn_agent", "followup_task", "wait_agent"],
+            "timeout_s": 480,
+        },
         "S5": {
             "name": "team-basic",
             "prompt": ("建一个 2 个任务的团队任务板：任务 A 写一句话介绍杭州，任务 B 写一句话介绍成都。"

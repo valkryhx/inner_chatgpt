@@ -161,3 +161,11 @@ def test_tools_are_registered():
 
     names = [t.name for t in build_builtin_tools(user_id=UID)]
     assert "file_glob" in names and "file_grep" in names
+
+
+def test_file_glob_description_mentions_total_count():
+    from app.builtin_tools import build_builtin_tools
+
+    tool = {t.name: t for t in build_builtin_tools(user_id=UID)}["file_glob"]
+    assert "total" in tool.description
+    assert "统计" in tool.description

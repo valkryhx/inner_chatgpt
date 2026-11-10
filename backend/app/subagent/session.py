@@ -204,6 +204,8 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
         max_turns=_max_turns(),
         history_store=base_runtime.store,
         user_id=team_ctx.user_id,
+        # 子代理完成通知：每轮模型调用前注入（fold 点）
+        message_injector=host.drain_notifications,
     )
     return TurnRuntime(
         loop=loop,

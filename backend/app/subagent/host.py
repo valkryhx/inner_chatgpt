@@ -61,6 +61,8 @@ class SubagentHost:
         self.timeout_s = _env_float("SUBAGENT_TIMEOUT_S", 300.0)
         self._change = asyncio.Event()
         self._closed = False
+        # 子代理完成通知：peek/ack 分离，供母代理在 fold 点注入
+        self._notifications: list[dict] = []
 
     # ---------------- spawn ----------------
     async def spawn(self, *, task_name: str, message: str,
@@ -134,6 +136,8 @@ class SubagentHost:
             self._touch()
             runtime = SubagentRuntime(node.ctx, parent_runtime=self.parent_runtime, spec=spec)
             await runtime.build()
+            # steer：每轮模型调用前取出父代理追加的指令
+            runtime.loop.message_injector = node.drain_pending
             node.turns = 0
 
             async def _drive():
@@ -143,7 +147,7 @@ class SubagentHost:
                         return
                     if et == "error":
                         raise SubagentError(str(ev.get("error") or "子代理执行错误"))
-                    if et in ("text_delta", "thinking_delta", "tool_start", "tool_result"):
+                    if et in ("text_delta", "thinking_delta", "tool_start", "tool_result", "message_injected"):
                         node.event_seq += 1
                         node.event_log.append({"seq": node.event_seq, "event": ev})
                         # 环形缓冲：每节点最多保留最近 2000 条事件
@@ -203,6 +207,7 @@ class SubagentHost:
                 )
             except Exception:
                 pass
+            self._notify(node)
             self._publish({
                 "type": "subagent_end",
                 "agent_id": node.agent_id,
@@ -213,6 +218,71 @@ class SubagentHost:
                 "error": node.error or "",
             })
             self._touch()
+
+    # ---------------- notifications ----------------
+    def _notify(self, node: "AgentNode") -> None:
+        self._notifications.append({
+            "id": uuid.uuid4().hex[:8],
+            "agent": node.name,
+            "status": node.status,
+            "result_chars": len(node.result or ""),
+            "preview": (node.result or "")[:400],
+        })
+
+    def peek_notifications(self, limit: int = 5) -> list[dict]:
+        return self._notifications[: max(1, int(limit))]
+
+    def ack_notifications(self, ids) -> None:
+        drop = set(ids or [])
+        if not drop:
+            return
+        self._notifications = [n for n in self._notifications if n["id"] not in drop]
+
+    def drain_notifications(self, limit: int = 5) -> list[dict]:
+        """取一批通知并 ack，返回一条可直接 append 的 user 消息。"""
+        items = self.peek_notifications(limit)
+        if not items:
+            return []
+        self.ack_notifications([n["id"] for n in items])
+        lines = [f"- {n['agent']} 已{n['status']}：{n['preview']}" for n in items]
+        extra = len(self._notifications)
+        body = "\n".join(lines)
+        if extra:
+            body += f"\n（另有 {extra} 个子代理已完成，可用 list_agents 查看）"
+        return [{
+            "role": "user",
+            "content": "[任务通知] 以下子代理已经结束，结果可直接使用；"
+                       "需要全文请 read_agent_result。\n" + body,
+        }]
+
+    # ---------------- steer ----------------
+    async def followup(self, target: str, message: str, max_per_agent: int = 5) -> dict:
+        """向运行中的子代理追加一条指令；在下一次模型调用前注入。"""
+        import hashlib
+
+        node = self.registry.get(target)
+        if node is None:
+            return {"ok": False, "error": f"未知子代理: {target}"}
+        if node.is_terminal:
+            return {"ok": False,
+                    "error": f"子代理 {node.name} 已结束（{node.status}），"
+                             "请用 read_agent_result 取结果；需要继续工作请重新 spawn_agent"}
+        text = (message or "").strip()
+        if not text:
+            return {"ok": False, "error": "message 不能为空"}
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if digest in node.followup_hashes:
+            return {"ok": True, "deduped": True, "note": "同内容已投递过，未重复注入"}
+        if len(node.followup_hashes) >= max_per_agent:
+            return {"ok": False,
+                    "error": f"该子代理的追加指令已达上限（{max_per_agent} 条）"}
+        node.followup_hashes.add(digest)
+        node.pending_messages.append({
+            "role": "user",
+            "content": f"[来自父代理的追加指令] {text}",
+        })
+        return {"ok": True, "delivered": True,
+                "note": "将在子代理下一次模型调用前注入"}
 
     # ---------------- wait ----------------
     async def wait(self, targets: Optional[list[str]] = None, condition: str = "all_terminal",

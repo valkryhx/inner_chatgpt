@@ -54,10 +54,21 @@ class AgentNode:
     event_seq: int = 0
     event_log: list[dict] = field(default_factory=list)
     quota_lease: object | None = None
+    # steer：父代理在子代理运行期间追加的指令（下一次模型调用前注入）
+    pending_messages: list[dict] = field(default_factory=list)
+    followup_hashes: set[str] = field(default_factory=set)
 
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
+
+    def drain_pending(self) -> list[dict]:
+        """取出待注入的追加指令（同步，供 AgentLoop 的 fold 点调用）。"""
+        if not self.pending_messages:
+            return []
+        out = self.pending_messages[:]
+        self.pending_messages.clear()
+        return out
 
     def notify_waiters(self) -> None:
         for ev in self.waiters:
@@ -81,6 +92,8 @@ class SubagentRegistry:
         self.max_depth = max(0, int(max_depth))
         self.max_active = max(1, int(max_active))
         self._nodes: dict[str, AgentNode] = {}
+        # 名字钉住：用过一次的名字不再复用（防止旧消息投进新 agent）
+        self._name_history: dict[str, int] = {}
 
     # ---------- queries ----------
     def get(self, name_or_id: str) -> Optional[AgentNode]:
@@ -122,6 +135,15 @@ class SubagentRegistry:
                 "请先 wait_agent + close_agent 或换一个 task_name"
             )
 
+        # 同名但旧实例已结束/已回收：自动加后缀，而不是复用旧名字
+        if name in self._name_history:
+            base = name
+            suffix = self._name_history[base] + 1
+            while (f"{base}_{suffix}" in self._name_history
+                   or self.get(f"{base}_{suffix}") is not None):
+                suffix += 1
+            name = validate_task_name(f"{base}_{suffix}")
+
         if len(self.active_nodes()) >= self.max_active:
             self._evict_one_idle()
             if len(self.active_nodes()) >= self.max_active:
@@ -140,6 +162,7 @@ class SubagentRegistry:
         )
         node = AgentNode(agent_id=ctx.agent_id, name=name, ctx=ctx, role=effective_role)
         self._nodes[name] = node
+        self._name_history[name] = self._name_history.get(name, 0) + 1
         return node
 
     def _evict_one_idle(self) -> None:

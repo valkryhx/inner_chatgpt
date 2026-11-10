@@ -75,6 +75,13 @@ def build_subagent_tools(host: SubagentHost) -> list[Tool]:
         return json.dumps({"ok": True, "closed": out.get("closed", []),
                            "note": "已释放槽位"}, ensure_ascii=False)
 
+    async def followup_task(args: dict) -> str:
+        out = await host.followup(
+            str(args.get("target", "") or ""),
+            str(args.get("message", "") or ""),
+        )
+        return json.dumps(out, ensure_ascii=False)
+
     return [
         Tool(
             "spawn_agent",
@@ -134,6 +141,21 @@ def build_subagent_tools(host: SubagentHost) -> list[Tool]:
                 "properties": {"include_closed": {"type": "boolean", "description": "是否包含已关闭"}},
             },
             list_agents,
+        ),
+        Tool(
+            "followup_task",
+            "向仍在运行的子代理追加一条指令（steer）。不会打断它当前的工具调用，"
+            "而是在它下一次模型调用前作为新的用户消息注入。子代理已结束时会被拒绝——"
+            "那种情况用 read_agent_result 取结果，需要继续工作就重新 spawn_agent。",
+            {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "子代理 task_name"},
+                    "message": {"type": "string", "description": "追加指令（自包含、可直接执行）"},
+                },
+                "required": ["target", "message"],
+            },
+            followup_task,
         ),
         Tool(
             "close_agent",
