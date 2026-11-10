@@ -16,7 +16,14 @@ DB = Path(__file__).resolve().parents[2] / "data" / "app.db"
 
 def audit(run_id: str) -> dict:
     d = RUNS / run_id
-    ev = [json.loads(line) for line in (d / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    src = d / "events.jsonl"
+    if not src.exists():
+        # 跨回合场景把两轮分开写，审计时合并
+        parts = sorted(d.glob("events_turn*.jsonl"))
+        raw = "\n".join(p.read_text(encoding="utf-8") for p in parts)
+    else:
+        raw = src.read_text(encoding="utf-8")
+    ev = [json.loads(line) for line in raw.splitlines() if line.strip()]
     summary = json.loads((d / "summary.json").read_text(encoding="utf-8"))
 
     team_id = next((e.get("team_id") for e in ev if e.get("team_id")), "")
@@ -59,7 +66,7 @@ def audit(run_id: str) -> dict:
         "task_state_counts": Counter(task_states.values()).most_common(),
         "errors": errors[:5],
         "done": done.get("status"),
-        "checks_failed": [c for c in summary.get("checks", []) if not c.get("ok")],
+        "checks_failed": _failed_checks(summary),
     }
 
 
@@ -115,5 +122,13 @@ def sse_missing(team_id: str, events: list) -> dict:
             "missing_count": len(missing), "benign_missing": benign}
 
 
+def _failed_checks(summary: dict) -> list:
+    raw = summary.get("checks") or []
+    if isinstance(raw, dict):
+        return [{"kind": k, "ok": v} for k, v in raw.items() if not v]
+    return [c for c in raw if not c.get("ok")]
+
+
 if __name__ == "__main__":
     sys.exit(main())
+
