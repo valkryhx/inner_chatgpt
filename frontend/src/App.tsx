@@ -4,6 +4,7 @@ import type { Attachment, ContextUsage, LlmModelOption, Message, Session, Stream
 import Sidebar from './components/Sidebar'
 import MessageList from './components/MessageList'
 import ModelMenu from './components/ModelMenu'
+import ReasoningMenu from './components/ReasoningMenu'
 import SessionBrowser from './components/SessionBrowser'
 import Composer from './components/Composer'
 import LoginPage from './components/LoginPage'
@@ -134,6 +135,8 @@ export default function App() {
   const [models, setModels] = useState<LlmModelOption[]>([])
   // 没有会话时选择的模型：作为下一个新会话的初始 model_id
   const [pendingModelId, setPendingModelId] = useState<string>('')
+  const [pendingEffort, setPendingEffort] = useState<string>('')
+  const [effortEcho, setEffortEcho] = useState<{ effective: string; source: string; model: string } | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [teamSnapshot, setTeamSnapshot] = useState<TeamSnapshot | null>(null)
   const [teamError, setTeamError] = useState<string | null>(null)
@@ -589,6 +592,10 @@ export default function App() {
         } else if (ev.event.type === 'team_start') {
           setTeamError(null)
         }
+      } else if (ev.type === 'reasoning_effort') {
+        // 后端回报本轮实际发出去的等级：有些网关会静默忽略不认识的档位，
+        // 用户需要看到「设了但可能没生效」，而不是以为自己选对了。
+        setEffortEcho({ effective: ev.effective || '', source: ev.source || '', model: ev.model || '' })
       } else if (ev.type === 'compaction') {
         setAutoCompacted((n) => n + 1)
       } else if (ev.type === 'done') {
@@ -605,7 +612,8 @@ export default function App() {
     }
 
     try {
-      await streamMessage(sid, text, genId, onEvent, ctrl.signal, attachments)
+      await streamMessage(sid, text, genId, onEvent, ctrl.signal, attachments,
+                          activeSession?.reasoning_effort || pendingEffort || undefined)
     } catch (e) {
       if (!ctrl.signal.aborted) {
         const msg = String(e)
@@ -708,6 +716,46 @@ export default function App() {
   })()
   const activeModelLabel = activeModel ? activeModel.model : null
 
+  // 思考等级：会话级覆盖，空=沿用模型配置。放在模型选择器后面。
+  const currentEffort = activeSession ? (activeSession.reasoning_effort || '') : ''
+
+  const changeEffort = async (effort: string) => {
+    if (streaming) return
+    if (!activeId) {
+      // 还没有会话：只记住，创建会话后的第一条消息会带上（后端按消息级覆盖处理）。
+      setPendingEffort(effort)
+      return
+    }
+    try {
+      await api.setSessionReasoningEffort(activeId, effort)
+      await loadSessions()
+      setError(null)
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  // 选了档位、但后端回报的实际生效值与选择不一致 → 说明上游没认这个档位。
+  // 这类网关是静默忽略的，不提示的话用户会一直以为生效了。
+  const chosenEffort = currentEffort || pendingEffort
+  const effortMismatch = Boolean(
+    effortEcho && effortEcho.effective && chosenEffort && effortEcho.effective !== chosenEffort,
+  )
+
+  const effortSelector = (
+    <span className="effort-wrap">
+      {effortMismatch && (
+        <span
+          className="effort-warn"
+          title={`本轮实际发出的等级是 ${effortEcho!.effective}，与你选择的 ${chosenEffort} 不一致；该模型可能不支持这一档`}
+        >
+          ⚠ 未生效
+        </span>
+      )}
+      <ReasoningMenu value={chosenEffort} disabled={streaming} onChange={changeEffort} />
+    </span>
+  )
+
   // 模型选择器：底部说明行右侧；用自定义下拉，避免把「（默认）」塞进值里被截断。
   const modelSelector = (
     <ModelMenu
@@ -796,6 +844,7 @@ export default function App() {
           modelName={activeModel?.model || ''}
           reasoningEffort={activeModel?.reasoning_effort || ''}
           modelSelector={modelSelector}
+          effortSelector={effortSelector}
         />
       </div>
       <SessionBrowser

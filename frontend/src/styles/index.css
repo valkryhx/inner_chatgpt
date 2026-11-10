@@ -1432,3 +1432,12 @@ textarea, input { caret-color: var(--clay); }
   font-size: 11.5px; color: var(--muted);
   background: var(--surface-2); border-radius: var(--r-sm);
 }
+
+/* ===== 思考等级选择器（模型选择器之后）===== */
+.effort-wrap { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.effort-warn {
+  font-size: 11.5px; color: var(--danger, #bf4d43);
+  padding: 1px 5px; border-radius: 5px;
+  background: rgba(191, 77, 67, .1);
+  cursor: help; white-space: nowrap;
+}

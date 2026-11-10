@@ -308,6 +308,15 @@ class LLMClient:
                     if resp.status_code >= 400:
                         body = (await resp.aread()).decode("utf-8", "replace")
                         msg = f"HTTP {resp.status_code}: {body[:500]}"
+                        # 思考等级不匹配（模型不支持该档）在上游一般是 400/422，
+                        # 正文往往只有一句 invalid xxx。这里补上「哪个模型 + 哪个档」，
+                        # 否则用户只会看到一段看不懂的上游错误。
+                        if resp.status_code in (400, 422) and self.s.reasoning_effort:
+                            msg += (
+                                f"\n[思考等级不匹配] 模型 {self.s.model} 不接受 "
+                                f"reasoning_effort={self.s.reasoning_effort!r}；"
+                                "请在输入框下方的思考等级里换一档，或设为「不指定」。"
+                            )
                         retryable = resp.status_code in (408, 409, 425, 429, 500, 502, 503, 504, 529)
                         if retryable and attempt < self.s.max_retries and not got_any:
                             attempt += 1

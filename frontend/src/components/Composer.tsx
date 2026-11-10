@@ -14,6 +14,8 @@ interface Props {
   reasoningEffort?: string
   /** 模型选择器由 App 注入，位置在输入框下方的说明行右侧 */
   modelSelector?: ReactNode
+  /** 思考等级选择器，紧挨在模型选择器后面 */
+  effortSelector?: ReactNode
 }
 
 function fmtK(n: number): string {
@@ -60,7 +62,7 @@ function SendIcon() {
 }
 
 export default function Composer({
-  streaming, onSend, onStop, onCompact, contextUsage, modelSelector,
+  streaming, onSend, onStop, onCompact, contextUsage, modelSelector, effortSelector,
 }: Props) {
   const [text, setText] = useState('')
   const [pending, setPending] = useState<UploadedImage[]>([])
@@ -221,6 +223,7 @@ export default function Composer({
             </>
           )}
         </span>
+        {effortSelector}
         {modelSelector}
       </div>
     </div>

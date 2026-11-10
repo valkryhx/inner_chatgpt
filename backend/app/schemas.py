@@ -23,6 +23,8 @@ class SessionOut(BaseModel):
     pinned: bool = False
     archived: bool = False
     compaction: CompactionState = Field(default_factory=CompactionState)
+    # 会话级思考等级覆盖；空字符串 = 沿用模型配置。前端下拉要读它。
+    reasoning_effort: str = ""
 
 
 class MessageOut(BaseModel):
@@ -67,6 +69,8 @@ class UpdateSessionIn(BaseModel):
     pinned: Optional[bool] = None
     archived: Optional[bool] = None
     model_id: Optional[str] = None
+    # 会话级思考等级覆盖；空字符串 = 清空覆盖（沿用模型配置）。合法值见 app/reasoning.py
+    reasoning_effort: Optional[str] = None
 
 
 class AttachmentIn(BaseModel):
@@ -80,6 +84,8 @@ class SendMessageIn(BaseModel):
     generation_id: Optional[str] = None
     # 可选：随消息发送的图片引用（必须先通过 POST /api/me/uploads 落盘）。
     attachments: list[AttachmentIn] = []
+    # 可选：本次消息临时覆盖思考等级（不改会话设置）。空=不覆盖。
+    reasoning_effort: Optional[str] = None
 
 
 class StopIn(BaseModel):

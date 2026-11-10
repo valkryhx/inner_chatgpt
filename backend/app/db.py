@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     updated_at    INTEGER NOT NULL,
     pinned        INTEGER NOT NULL DEFAULT 0,
     archived      INTEGER NOT NULL DEFAULT 0,
-    compaction    TEXT NOT NULL DEFAULT '{}'
+    compaction    TEXT NOT NULL DEFAULT '{}',
+    reasoning_effort TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
     id            TEXT PRIMARY KEY,
@@ -120,6 +121,11 @@ async def init_db() -> None:
                 await conn.execute(f"ALTER TABLE user_mcp_servers ADD COLUMN {col} {decl}")
             except Exception:
                 pass
+        # 旧库迁移：sessions 增加会话级思考等级覆盖（空=沿用模型配置）。
+        try:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT ''")
+        except Exception:
+            pass
         # 旧库迁移：users 增加唯一登录名 username（邮箱之外的登录标识）。
         try:
             await conn.execute("ALTER TABLE users ADD COLUMN username TEXT NOT NULL DEFAULT ''")
@@ -244,7 +250,8 @@ async def get_session(session_id: str, user_id: str) -> Optional[dict[str, Any]]
 
 
 async def update_session(session_id: str, user_id: str, **fields: Any) -> Optional[dict[str, Any]]:
-    allowed = {"title", "pinned", "archived", "model_id", "provider", "compaction"}
+    allowed = {"title", "pinned", "archived", "model_id", "provider", "compaction",
+               "reasoning_effort"}
     sets, vals = [], []
     for k, v in fields.items():
         if k not in allowed:

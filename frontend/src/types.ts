@@ -10,6 +10,8 @@ export interface Session {
   user_id: string
   title: string
   model_id: string
+  /** 会话级思考等级覆盖；空字符串表示沿用模型配置 */
+  reasoning_effort?: string
   provider: string
   created_at: number
   updated_at: number
@@ -243,6 +245,7 @@ export type StreamEvent =
   | { type: 'subagent_end'; agent_id: string; name?: string; status: string; result?: string; turns?: number; error?: string }
   | { type: 'subagent_status'; agent_id: string; name?: string; status: string }
   | { type: 'compaction'; summary_tokens: number; kept_messages: number; trigger?: string }
+  | { type: 'reasoning_effort'; effective: string; source: 'session' | 'model_config' | string; model: string }
   | { type: 'team_event'; event: TeamEvent }
   | { type: 'done'; message_id: string; status: 'complete' | 'stopped' | 'error' }
   | { type: 'error'; error: string }

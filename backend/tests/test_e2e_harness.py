@@ -68,3 +68,14 @@ def test_tool_result_sentinel_checks_tool_output_not_reply():
     bad = evaluate({"tool_result_contains": "no such marker"}, summary)
     assert ok[0]["ok"] is True
     assert bad[0]["ok"] is False
+
+
+def test_tool_max_counts_rejects_spin():
+    from tests.e2e.harness import evaluate, summarize
+
+    events = [{"type": "tool_start", "name": "spawn_agent"}] * 3
+    summary = summarize(events)
+    ok = evaluate({"tool_max_counts": {"spawn_agent": 3}}, summary)
+    bad = evaluate({"tool_max_counts": {"spawn_agent": 2}}, summary)
+    assert ok[0]["ok"] is True
+    assert bad[0]["ok"] is False

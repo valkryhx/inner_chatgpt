@@ -131,6 +131,13 @@ async def update_session(session_id: str, body: UpdateSessionIn, user: dict = De
         if not title:
             raise HTTPException(status_code=400, detail="title 不能为空")
         fields["title"] = title[:200]
+    if "reasoning_effort" in fields:
+        from ..reasoning import InvalidReasoningEffort, normalize_effort
+        try:
+            # 允许显式传空串清空覆盖；非法值在这里就挡掉，不要留到调模型时才炸
+            fields["reasoning_effort"] = normalize_effort(fields["reasoning_effort"])
+        except InvalidReasoningEffort as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     if "model_id" in fields:
         model_id = str(fields["model_id"] or "").strip()
         # An empty model_id means "clear the binding"; a non-empty one must be

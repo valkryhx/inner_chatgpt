@@ -146,6 +146,9 @@ def evaluate(case: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, An
     for name, count in (case.get("tool_min_counts") or {}).items():
         checks.append({"kind": "tool_min_count", "name": f"{name}>={count}",
                        "ok": tools.count(name) >= count})
+    for name, count in (case.get("tool_max_counts") or {}).items():
+        checks.append({"kind": "tool_max_count", "name": f"{name}<={count}",
+                       "ok": tools.count(name) <= count})
     for name, count in (case.get("tool_counts") or {}).items():
         checks.append({"kind": "tool_count", "name": f"{name}={count}",
                        "ok": tools.count(name) == count})

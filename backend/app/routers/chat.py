@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from .. import db
+from ..agent import with_effort
 from ..auth import get_current_user
 from ..runtime import (
     get_hub, register_generation, request_stop, unregister_generation,
@@ -333,7 +334,8 @@ router = APIRouter(prefix="/api", tags=["chat"])
 async def _event_stream(user_id: str, session_id: str, text: str, generation_id: str, message_id: str,
                         model_id: str = "", stop_event: asyncio.Event | None = None,
                         tool_policy: str = "full",
-                        attachments: list[dict] | None = None) -> AsyncIterator[str]:
+                        attachments: list[dict] | None = None,
+                        reasoning_effort: str = "") -> AsyncIterator[str]:
     # Register/capture the current streaming task at the very top.  The
     # prelude below can await runtime construction and compaction; registering
     # only after it would leave stop unable to cancel a request that is stuck
@@ -379,6 +381,8 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
         return
     try:
         ur = await hub.get_user_runtime(user_id, model_id)
+        # 会话级思考等级：派生视图，不改缓存里的 runtime（见 agent.with_effort）
+        ur = with_effort(ur, reasoning_effort)
     except Exception as e:  # noqa: BLE001
         # 典型场景：全新部署、用户还没配置任何模型（且仓库不携带 llm.yaml）。
         # 这里以 SSE 事件返回可读提示，而不是让前端只看到 500。
@@ -388,6 +392,21 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
             "hint": "请先在「设置 -> 我的模型」新增模型（base_url / api_key / model）并设为默认。",
         })
         return
+
+    # 本轮实际生效的思考等级：会话覆盖优先，否则用模型配置里的值。
+    # 有些网关（如内部中转）会**静默忽略**不认识的 reasoning_effort，
+    # 所以这里把「发出去的到底是什么」回显给前端，用户才能发现「选了但没生效」。
+    try:
+        eff_configured = (ur.model.client.s.reasoning_effort or "") if ur.model else ""
+        eff_effective = reasoning_effort or eff_configured
+        if eff_effective:
+            yield sse_frame("reasoning_effort", {
+                "effective": eff_effective,
+                "source": "session" if reasoning_effort else "model_config",
+                "model": ur.model.model_name if ur.model else "",
+            })
+    except Exception:
+        pass
 
     # 软线自动压缩（对齐 GenericAgent）：本轮前按 token 阈值判断，超软线才摘要较早消息。
     # 与硬线不同，这里会真正调用 LLM 生成摘要，并替换 checkpoint 为「摘要 + 近段」。
@@ -711,6 +730,8 @@ async def send_message(session_id: str, body: SendMessageIn, user: dict = Depend
                 user["id"], session_id, body.text, generation_id, message_id,
                 sess.get("model_id", "") or "", stop_event=stop_event,
                 attachments=attachments or None,
+                reasoning_effort=(body.reasoning_effort if body.reasoning_effort is not None
+                                  else sess.get("reasoning_effort", "") or ""),
             ):
                 yield chunk
         finally:

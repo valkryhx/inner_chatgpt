@@ -174,6 +174,28 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
     return MCPToolset.merge(toolsets)
 
 
+def with_effort(runtime, effort: str):
+    """按会话级思考等级派生一份 runtime 视图（不改缓存对象）。
+
+    runtime 是 (user, model) 级缓存，直接改它的 client 会让 A 会话的等级污染 B 会话。
+    这里只替换 model.client，其余（registry / store / 限额）共享。
+    空覆盖直接返回原对象，调用方不用分支。
+    """
+    from .llm import clone_client_with_effort
+
+    if not (effort or "").strip():
+        return runtime
+    if runtime is None or getattr(runtime, "model", None) is None:
+        return runtime
+    import copy as _copy
+
+    view = _copy.copy(runtime)
+    model = _copy.copy(runtime.model)
+    model.client = clone_client_with_effort(runtime.model.client, effort)
+    view.model = model
+    return view
+
+
 class UserRuntime:
     def __init__(self) -> None:
         self.model: Optional[BuiltModel] = None

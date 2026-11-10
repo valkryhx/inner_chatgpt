@@ -136,6 +136,12 @@ export const api = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model_id: modelId }),
     }),
+  setSessionReasoningEffort: (id: string, effort: string) =>
+    request<Session>(`/sessions/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reasoning_effort: effort }),
+    }),
   deleteSession: (id: string) => request<{ ok: boolean }>(`/sessions/${id}`, { method: 'DELETE' }),
   compact: (id: string, opts?: { instructions?: string; keep?: number }) =>
     request<{
@@ -329,6 +335,7 @@ export async function streamMessage(
   onEvent: (ev: StreamEvent) => void,
   signal?: AbortSignal,
   attachments?: Attachment[],
+  reasoningEffort?: string,
 ): Promise<void> {
   const res = await fetch(`${BASE}/sessions/${sessionId}/messages`, {
     method: 'POST',
@@ -337,6 +344,8 @@ export async function streamMessage(
       text,
       generation_id: generationId,
       ...(attachments && attachments.length ? { attachments } : {}),
+      // 会话设置已有时后端会用会话值；这里带上是为了「还没建会话就先选了档」的场景
+      ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
     }),
     signal,
   })

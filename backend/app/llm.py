@@ -50,3 +50,17 @@ def build_client_from_config(cfg: dict, *, max_tokens: int | None = None,
         reasoning_effort=(cfg.get("reasoning_effort") or None),
         system_prompt=system_prompt,
     ))
+
+
+def clone_client_with_effort(client: LLMClient, effort: str) -> LLMClient:
+    """同一端点、同一连接池，只换思考等级。
+
+    共享底层 httpx.AsyncClient（连接池），避免每次改等级都新建连接；
+    新 client 不 own 该连接，所以它的 aclose() 不会把共用的池关掉。
+    """
+    from .reasoning import apply_effort
+
+    settings = apply_effort(client.s, effort)
+    if settings is client.s:
+        return client
+    return LLMClient(settings, client=client._client)
