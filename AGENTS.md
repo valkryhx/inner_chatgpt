@@ -132,6 +132,12 @@
 
 | 文档 | 用途 |
 |---|---|
+| `docs/20261111-Hlaudz对标GA-CC优化总纲.md` | **本轮优化总纲（最新）**：对标 GA main@f234d92 与 CC 319 的现状坐标、10 项差距矩阵、P0–P3 路线图、三层测试策略 |
+| `docs/20261111-Hlaudz-内置工具与结果预算方案.md` | 方向 ①：`file_glob`/`file_grep`、统一预算层、退出码语义、写前必读、并行分组 |
+| `docs/20261111-Hlaudz-subagent与team测试优化方案.md` | 方向 ②：L3 真实 e2e 骨架 S1–S8、GA 12 类缺陷目录、steer / 名字钉住 / 通知注入 / 关闭竞态 |
+| `docs/20261111-Hlaudz-提示词与通用任务能力方案.md` | 方向 ③：SYSTEM_PROMPT 2→7 节、专用工具优先、skill 隐性触发、消融测试 |
+| `.claude/skills/hlaudz-e2e/SKILL.md` | **真实 e2e 验证 skill（强制使用，见 §2）** |
+| `docs/20261111-Hlaudz工具渐进式披露调研与决策.md` | 方向 ④：ToolSearch / deferred tools 调研（实测 8.7 KB）、MCP 膨胀阈值与切换方案、skill 索引差距 |
 | `docs/20261110-A2A使用文档.md` | **A2A 使用文档（含本机实跑任务 id）**：每用户 endpoint/token、能力档位、配额、审计、流式与终态订阅 |
 | `docs/20261110-A2A-MVP实施记录.md` | **A2A 实施记录**：方法集、数据模型、安全模型、测试与真实 E2E |
 | `docs/20261109-项目现状与文档刷新.md` | **文档刷新记录（最新）**：按 `main@3b9c68f` 核对的能力快照、README/AGENTS/实现原理的修改清单、未纳入项与后续建议 |
@@ -321,3 +327,73 @@ cd /d/git_codes/inner_chatgpt
   - **自查（写完必跑一条）**：`tail -c 200 <file>` 看结尾是否完整；`grep -c $'\r' <file>` 期望 0；含中文再 `python -c "open('<file>','rb').read().decode('utf-8')"`。
   - **写坏后的恢复顺序**（不要原样重试同一条命令）：① 看 `tail -c 300 <file>` 判断是“截断”还是“正文里撞了 delimiter”；② 若是截断，从最后一个完整章节/函数边界继续，换新 delimiter、缩小下一段；③ 若是撞 delimiter，只重写被截断的那一段；④ 逻辑类命令直接删掉 heredoc，改独立脚本重做。
 
+
+---
+
+## 2. 真实 e2e 验证（强制）
+
+**铁律：单测绿 ≠ 链路通。** `pytest backend/tests` 只证明分支逻辑正确；
+「消息有没有送达、子代理有没有被回收、前端能不能看到」必须用真实 LLM 跑一遍。
+
+GA 项目在单测全绿时用真实 e2e 抓出 12+ 个链路缺陷（关闭竞态、僵尸 running、
+任务悬挂、通知丢失），全部是单测**原理上**测不到的。Hlaudz 很可能有同类问题。
+
+### 2.1 什么时候必须跑（缺一不可）
+
+1. 改了 `backend/app/subagent/`、`team_host.py`、`team_store.py`、`team_tools.py`；
+2. 改了 `backend/app/builtin_tools.py` 或新增/删除工具；
+3. 改了 `agent.py` 的 `SYSTEM_PROMPT`、`subagent/prompts.py`、skill 索引；
+4. 改了 `routers/chat.py` 的 SSE 流、停止、回收、事件合并；
+5. 修的是链路级缺陷（通知丢失、僵尸状态、关闭竞态、任务悬挂）；
+6. 要声称某个 UX 行为「用户能看到」；
+7. 用户说「测一下 / 验证一下 / 看看效果」。
+
+### 2.2 怎么跑
+
+**必须先读 `.claude/skills/hlaudz-e2e/SKILL.md`**，按它的场景矩阵（S0–S9）挑用例。
+最少跑 **S1（subagent 基础）+ S5（team 基础）+ S0（负对照）**。
+
+三条不可省略的条件：
+
+- **真实 LLM**：拿假 LLM 跑出来的结果属于 L2，不能当链路证据；
+- **唯一 runId + 事件落盘**：`backend/tests/e2e/runs/<runId>/events.jsonl`；
+- **哨兵 token**：派活时塞随机串，要求下游复述。没复述 = 没送达。
+
+### 2.3 三层各证明什么
+
+| 层 | 命令 | 证明 |
+| --- | --- | --- |
+| L1 单测 | `pytest backend/tests -q` | 分支、边界、CAS、权限 |
+| L2 集成（假 LLM） | 同上，脚本化 `tool_calls` | 编排顺序、事件形状 |
+| L3 真实 e2e | `python -m backend.tests.e2e.run --case S1` | 链路能跑通、模型真的这么用 |
+
+**三层全绿才叫完成。** L1 绿 + L3 红 = 有链路缺陷；L3 绿 + L1 红 = 有边界缺陷。
+
+### 2.4 判据三级，措辞不许混
+
+| 级别 | 证据 | 允许说 |
+| --- | --- | --- |
+| L1 构造得出 | 代码路径存在 | 「机制已实现」 |
+| L2 运行时发了 | 事件流里出现 | 「机制已触发」 |
+| L3 用户看到了 | 前端渲染 / 截图 / 持久化消息 | 「UX 已修复」 |
+
+只有 L3 能说「用户能看到」。UI 改动必须另跑 Playwright 截图，
+或至少核对 `GET /api/sessions/{sid}/messages` 的持久化内容。
+
+### 2.5 报告必须带现场
+
+每次 e2e 结论至少给：**runId、工具调用序列、失败的断言、事件 seq、现场路径**。
+没有这三样，缺陷无法复现，等于没测。
+
+### 2.6 与 §8.5 TDD 的衔接
+
+- 单测/集成仍按 §8.5 的 RED → GREEN → REFACTOR，且必须做「stash 实现后重新变红」；
+- e2e 不参与红绿灯（跑一次分钟级），但**修链路缺陷时**要先有一条能稳定复现的 e2e，
+  再改代码；改完连跑 3 次无 flake 才算修好；
+- e2e 跑出的缺陷，落地成 L1/L2 用例后才进回归集——否则下次还会漏。
+
+### 2.7 明确不做
+
+- 不把 e2e 塞进 CI（需要真实 LLM 额度，耗时不可控）；
+- 不 mock LLM 冒充 e2e；
+- 不以「模型这次没这么做」判定产品缺陷——同一 prompt 连跑 3 次再下结论。

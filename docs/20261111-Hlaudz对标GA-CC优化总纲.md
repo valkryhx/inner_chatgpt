@@ -12,6 +12,7 @@
 | ① 内置工具补齐（glob / grep / 预算 / 退出码 / 写前必读） | `20261111-Hlaudz-内置工具与结果预算方案.md` |
 | ② subagent 异步与 agent team 稳健性 | `20261111-Hlaudz-subagent与team测试优化方案.md` |
 | ③ 提示词与通用任务能力（非代码开发领域） | `20261111-Hlaudz-提示词与通用任务能力方案.md` |
+| ④ 工具渐进式披露（ToolSearch / deferred tools）调研与决策 | `20261111-Hlaudz工具渐进式披露调研与决策.md` |
 
 ---
 
@@ -222,6 +223,7 @@ Hlaudz 缺的主要是**非代码领域**仍然适用的四条：规划与推进
 - **不照搬 GA 的 `codex_lesson_update` / `start_long_term_update`**——依赖 GA 自身机制。
 - **不在 GA 仓库做任何改动**——GA 仍在开发，本轮只读。
 - **不改现有 A2A / ACP / 图片上传**——与本轮无交集，避免牵连。
+- **不在固定工具面（19 个 / 8.7 KB）上做 tool_search**——受益为负；但 MCP 膨胀时的阈值与切换方案已写死，见子方案 ④。
 
 ---
 

@@ -45,7 +45,11 @@ misc/
 temp/
 
 # 本地 Claude Code 配置（含机器相关的 skills symlink，不入库）
-.claude/
+.claude/*
+# 例外：项目自带的真实 skill 目录入库（非 symlink），随仓库分发
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/hlaudz-e2e/
 
 # 本地保存的参考页面与截图，不入库
 claude_html/
