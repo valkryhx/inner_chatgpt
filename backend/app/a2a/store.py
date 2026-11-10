@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS a2a_agents (
     id          TEXT PRIMARY KEY,
     user_id     TEXT NOT NULL UNIQUE,
     agent_id    TEXT NOT NULL UNIQUE,
+    enabled     INTEGER NOT NULL DEFAULT 0,
     created_at  INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS a2a_tokens (
@@ -84,6 +85,13 @@ async def init_tables() -> None:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.executescript(_SCHEMA)
         # 老库升级：CREATE TABLE IF NOT EXISTS 不会补列，必须显式 ALTER。
+        # 用户级开关默认关（含老用户迁移）：站长先开实例级 env，用户再自己点开。
+        cur = await conn.execute("PRAGMA table_info(a2a_agents)")
+        agent_cols = {r[1] for r in await cur.fetchall()}
+        if "enabled" not in agent_cols:
+            await conn.execute(
+                "ALTER TABLE a2a_agents ADD COLUMN enabled INTEGER NOT NULL DEFAULT 0"
+            )
         for table in ("a2a_tokens", "a2a_tasks"):
             cur = await conn.execute(f"PRAGMA table_info({table})")
             cols = {r[1] for r in await cur.fetchall()}
@@ -100,7 +108,9 @@ async def init_tables() -> None:
 
 
 def _row_to_agent(row: aiosqlite.Row) -> dict[str, Any]:
-    return dict(row)
+    d = dict(row)
+    d["enabled"] = bool(d.get("enabled"))
+    return d
 
 
 def _row_to_token(row: aiosqlite.Row) -> dict[str, Any]:
@@ -357,3 +367,18 @@ async def list_audit(user_id: str, limit: int = 50) -> list[dict[str, Any]]:
         )
         rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def set_agent_enabled(user_id: str, enabled: bool) -> Optional[dict[str, Any]]:
+    """用户级开关：立刻生效（每次请求现查，不走缓存）。"""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA busy_timeout=5000;")
+        await conn.execute(
+            "UPDATE a2a_agents SET enabled=? WHERE user_id=?",
+            (1 if enabled else 0, user_id),
+        )
+        await conn.commit()
+        cur = await conn.execute("SELECT * FROM a2a_agents WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+    return _row_to_agent(row) if row else None

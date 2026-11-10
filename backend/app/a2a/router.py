@@ -26,6 +26,14 @@ def _require_enabled() -> None:
         raise HTTPException(status_code=404, detail="a2a_disabled")
 
 
+async def _enabled_agent_or_404(agent_id: str) -> dict:
+    """用户级开关闸门：未开启与不存在返回同一个 404，避免探测哪些 agent_id 有效。"""
+    agent = await store.get_agent_by_agent_id(agent_id)
+    if not agent or not agent.get("enabled"):
+        raise HTTPException(status_code=404, detail="agent_not_found")
+    return agent
+
+
 async def _audit(identity: dict, method: str, outcome: str, *, task_id: str = "",
                  detail: str = "", started: float = 0.0) -> None:
     """审计是旁路：写失败也绝不能影响 JSON-RPC 结果。"""
@@ -55,9 +63,7 @@ async def global_agent_card():
 @router.get("/a2a/{agent_id}/.well-known/agent-card.json")
 async def agent_card(agent_id: str, request: Request):
     _require_enabled()
-    agent = await store.get_agent_by_agent_id(agent_id)
-    if not agent:
-        raise HTTPException(status_code=404, detail="agent_not_found")
+    await _enabled_agent_or_404(agent_id)
     return cards.build_agent_card(agent_id, _base_url(request))
 
 
@@ -71,6 +77,7 @@ async def agent_card_at_base(agent_id: str, request: Request):
 @router.post("/a2a/{agent_id}")
 async def jsonrpc(agent_id: str, request: Request):
     _require_enabled()
+    await _enabled_agent_or_404(agent_id)
     started = time.monotonic()
     try:
         body = await request.json()
@@ -143,6 +150,30 @@ async def jsonrpc(agent_id: str, request: Request):
     return {"jsonrpc": "2.0", "id": req_id, "result": result}
 
 
+class AgentEnabledIn(BaseModel):
+    enabled: bool
+
+
+@api_router.post("/agent/enabled")
+async def set_agent_enabled(body: AgentEnabledIn, request: Request,
+                            user: dict = Depends(get_current_user)):
+    """用户自助开关：立刻生效，不需要重启。"""
+    _require_enabled()
+    await store.ensure_agent(user["id"])
+    agent = await store.set_agent_enabled(user["id"], bool(body.enabled))
+    base = _base_url(request)
+    aid = (agent or {}).get("agent_id", "")
+    return {
+        "agent_id": aid,
+        "enabled": bool((agent or {}).get("enabled")),
+        "instance_enabled": True,
+        "url": f"{base}/a2a/{aid}",
+        "card_url": f"{base}/a2a/{aid}/.well-known/agent-card.json",
+        "tenant": aid,
+        "tool_policies": [{"id": p, "description": describe_policy(p)} for p in POLICIES],
+    }
+
+
 class TokenIn(BaseModel):
     name: str = ""
     scopes: list[str] = Field(default_factory=lambda: ["chat"])
@@ -160,6 +191,9 @@ async def my_agent(request: Request, user: dict = Depends(get_current_user)):
         "url": f"{base}/a2a/{agent['agent_id']}",
         "card_url": f"{base}/a2a/{agent['agent_id']}/.well-known/agent-card.json",
         "tenant": agent["agent_id"],
+        # 实例级已经通过 _require_enabled；这里只报用户级
+        "instance_enabled": True,
+        "enabled": bool(agent.get("enabled")),
         "tool_policies": [{"id": p, "description": describe_policy(p)} for p in POLICIES],
     }
 

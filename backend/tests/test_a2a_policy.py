@@ -21,6 +21,15 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def enabled_agent(uid):
+    """测试用：建 agent 并打开用户级开关（产品默认是关的）。"""
+    from app.a2a import store
+
+    run(store.ensure_agent(uid))
+    run(store.set_agent_enabled(uid, True))
+    return run(store.get_agent(uid))
+
+
 @pytest.fixture()
 def isolated_db(tmp_path, monkeypatch):
     from app.a2a import store
@@ -83,7 +92,7 @@ def test_token_defaults_to_full_policy(isolated_db):
 def test_token_stores_policy_and_auth_returns_it(isolated_db):
     from app.a2a import auth, store, tokens
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     raw, info = run(tokens.create_token("u1", name="ro", tool_policy="read_only"))
     assert info["tool_policy"] == "read_only"
 
@@ -198,7 +207,7 @@ def _app():
 def test_subscribe_to_finished_task_returns_terminal_state(isolated_db):
     from app.a2a import store, tokens
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     raw, _ = run(tokens.create_token("u1", name="terminal-sub"))
     _done_task(agent["agent_id"])
 
@@ -217,7 +226,7 @@ def test_subscribe_to_finished_task_returns_terminal_state(isolated_db):
 def test_subscribe_to_restart_failed_task_shows_reason(isolated_db):
     from app.a2a import store, tokens
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     raw, _ = run(tokens.create_token("u1", name="restart"))
     _done_task(agent["agent_id"], task_id="task_died", state="TASK_STATE_FAILED", text="")
     run(store.update_task("task_died", error="server restart"))
@@ -236,7 +245,7 @@ def test_active_task_quota_is_enforced(isolated_db, monkeypatch):
     from app.a2a import service, store
     from app.a2a.errors import A2AError
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     run(store.create_task(task_id="task_busy", context_id="co_busy", user_id="u1",
                           agent_id=agent["agent_id"], session_id="s1", message_id="m0",
                           generation_id="g0", state="TASK_STATE_WORKING"))
@@ -254,7 +263,7 @@ def test_active_task_quota_is_enforced(isolated_db, monkeypatch):
 def test_audit_log_records_jsonrpc_calls(isolated_db):
     from app.a2a import store, tokens
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     raw, _ = run(tokens.create_token("u1", name="audit"))
     body = {"jsonrpc": "2.0", "id": 3, "method": "GetTask",
             "params": {"id": "task_missing"}}

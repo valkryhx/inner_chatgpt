@@ -338,6 +338,10 @@ export interface A2AAgentInfo {
   url: string
   card_url: string
   tenant: string
+  /** 用户级开关：关着时卡片与 JSON-RPC 一律 404 */
+  enabled: boolean
+  /** 实例级开关（由 INNER_A2A_ENABLED 决定，前端不可改） */
+  instance_enabled?: boolean
   /** full / read_only / chat_only，附人话说明 */
   tool_policies?: { id: string; description: string }[]
 }

@@ -16,6 +16,15 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def enabled_agent(uid):
+    """测试用：建 agent 并打开用户级开关（产品默认是关的）。"""
+    from app.a2a import store
+
+    run(store.ensure_agent(uid))
+    run(store.set_agent_enabled(uid, True))
+    return run(store.get_agent(uid))
+
+
 @pytest.fixture()
 def isolated_db(tmp_path, monkeypatch):
     from app.a2a import store
@@ -49,7 +58,7 @@ def identity_for(agent):
 def test_token_is_stored_hashed_and_resolves(isolated_db):
     from app.a2a import auth, store, tokens
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     raw, info = run(tokens.create_token("u1", name="cli", scopes=["chat"]))
 
     assert raw.startswith("hlz_a2a_")
@@ -67,8 +76,8 @@ def test_token_is_stored_hashed_and_resolves(isolated_db):
 def test_auth_rejects_missing_wrong_path_and_tenant(isolated_db):
     from app.a2a import auth, store, tokens
 
-    a = run(store.ensure_agent("u1"))
-    b = run(store.ensure_agent("u2"))
+    a = enabled_agent("u1")
+    b = enabled_agent("u2")
     raw, _ = run(tokens.create_token("u1", name="cli"))
 
     with pytest.raises(HTTPException) as exc:
@@ -87,7 +96,7 @@ def test_auth_rejects_missing_wrong_path_and_tenant(isolated_db):
 def test_revoked_token_is_rejected(isolated_db):
     from app.a2a import auth, store, tokens
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     raw, info = run(tokens.create_token("u1", name="cli"))
     run(store.revoke_token("u1", info["id"]))
     with pytest.raises(HTTPException) as exc:
@@ -98,7 +107,7 @@ def test_revoked_token_is_rejected(isolated_db):
 def test_agent_card_is_per_user_and_v1(isolated_db):
     from app.a2a import cards, store
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     card = cards.build_agent_card(agent["agent_id"], "https://hlaudz.example.test")
     iface = card["supportedInterfaces"][0]
     assert iface["url"] == f"https://hlaudz.example.test/a2a/{agent['agent_id']}"
@@ -125,7 +134,7 @@ def test_send_message_completes_and_persists(isolated_db, monkeypatch):
     from app.a2a import service, store
     from app.routers import chat
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     monkeypatch.setattr(chat, "_event_stream", _fake_stream("hello world"))
 
     task = run(service.send_message(
@@ -144,7 +153,7 @@ def test_send_message_is_idempotent(isolated_db, monkeypatch):
     from app.a2a import service, store
     from app.routers import chat
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     calls = 0
 
     async def stream(*args, **kwargs):
@@ -180,7 +189,7 @@ def test_stream_send_emits_task_artifact_and_terminal(isolated_db, monkeypatch):
     from app.a2a import service, store
     from app.routers import chat
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     monkeypatch.setattr(chat, "_event_stream", _stream_fake())
 
     async def scenario():
@@ -209,7 +218,7 @@ def test_stream_disconnect_does_not_cancel_task(isolated_db, monkeypatch):
     from app.a2a import service, store
     from app.routers import chat
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
 
     async def waiting(*args, **kwargs):
         from app.sse import sse_frame
@@ -243,8 +252,8 @@ def test_get_task_is_scoped_to_agent(isolated_db, monkeypatch):
     from app.a2a import service, store
     from app.routers import chat
 
-    a = run(store.ensure_agent("u1"))
-    b = run(store.ensure_agent("u2"))
+    a = enabled_agent("u1")
+    b = enabled_agent("u2")
     monkeypatch.setattr(chat, "_event_stream", _fake_stream("ok"))
     task = run(service.send_message(
         identity_for(a), {"message": {"messageId": "m1", "role": "ROLE_USER",
@@ -258,7 +267,7 @@ def test_cancel_task_calls_existing_stop_path(isolated_db, monkeypatch):
     from app.routers import chat
     from app.schemas import StopResult
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     seen: dict = {}
 
     async def stream(user_id, session_id, text, generation_id, message_id,
@@ -306,6 +315,8 @@ def test_router_card_and_jsonrpc_error_envelope(isolated_db, monkeypatch):
         created = client.post("/api/a2a/tokens", json={"name": "cli"}).json()
         raw = created["token"]
         agent_id = created["agent_id"]
+        from app.a2a import store as a2a_store
+        run(a2a_store.set_agent_enabled("u1", True))
         card = client.get(f"/a2a/{agent_id}/.well-known/agent-card.json")
         assert card.status_code == 200
         assert card.json()["supportedInterfaces"][0]["tenant"] == agent_id
@@ -334,6 +345,8 @@ def test_router_streaming_sse(isolated_db, monkeypatch):
     with TestClient(app) as client:
         created = client.post("/api/a2a/tokens", json={"name": "sse"}).json()
         raw, agent_id = created["token"], created["agent_id"]
+        from app.a2a import store as a2a_store
+        run(a2a_store.set_agent_enabled("u1", True))
         body = {
             "jsonrpc": "2.0", "id": 10, "method": "SendStreamingMessage",
             "params": {"message": {"messageId": "sse-1", "role": "ROLE_USER",
@@ -353,7 +366,7 @@ def test_disabled_endpoint_is_404(isolated_db, monkeypatch):
     from app.a2a import store
     from app.a2a.router import router
 
-    agent = run(store.ensure_agent("u1"))
+    agent = enabled_agent("u1")
     monkeypatch.setenv("INNER_A2A_ENABLED", "false")
     app = FastAPI()
     app.include_router(router)

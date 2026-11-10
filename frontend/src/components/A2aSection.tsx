@@ -67,6 +67,22 @@ export default function A2aSection() {
     }
   }
 
+  const toggle = async () => {
+    if (!agent) return
+    setBusy(true)
+    setError(null)
+    try {
+      const next = await api.setA2AEnabled(!agent.enabled)
+      setAgent(next)
+      setNotice(next.enabled ? 'A2A 已开启，外部可调用' : 'A2A 已关闭，外部调用一律 404')
+      setTimeout(() => setNotice(null), 2200)
+    } catch (e: any) {
+      setError(e?.message || String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const revoke = async (id: string) => {
     if (!confirm('撤销这个 token？撤销后立即失效，不可恢复。')) return
     try {
@@ -108,6 +124,30 @@ export default function A2aSection() {
             <button className="ghost-btn" onClick={() => copy(agent.url)}>复制 URL</button>
             <button className="ghost-btn" onClick={() => copy(agent.card_url)}>复制 Card</button>
           </div>
+        </div>
+      )}
+
+      {agent && (
+        <div className={'a2a-switch' + (agent.enabled ? ' on' : '')}>
+          <div className="a2a-switch-main">
+            <b>{agent.enabled ? 'A2A 已开启' : 'A2A 未开启'}</b>
+            <div className="cfg-meta">
+              {agent.enabled
+                ? '持有 token 的外部智能体可以调用你；随时可以关掉。'
+                : '不会响应任何外部调用（卡片与 JSON-RPC 都是 404），已有 token 保留。'}
+            </div>
+          </div>
+          <button
+            type="button"
+            className={'switch' + (agent.enabled ? ' on' : '')}
+            onClick={toggle}
+            disabled={busy}
+            aria-label={agent.enabled ? '关闭 A2A' : '开启 A2A'}
+            aria-pressed={agent.enabled}
+            title={agent.enabled ? '点击关闭' : '点击开启'}
+          >
+            <span className="knob" />
+          </button>
         </div>
       )}
 

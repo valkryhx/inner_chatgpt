@@ -212,6 +212,12 @@ export const api = {
 
   // ---------------- A2A per-user access ----------------
   getA2AAgent: () => request<A2AAgentInfo>('/a2a/agent'),
+  setA2AEnabled: (enabled: boolean) =>
+    request<A2AAgentInfo>('/a2a/agent/enabled', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    }),
   listA2ATokens: () => request<{ tokens: A2AToken[] }>('/a2a/tokens'),
   createA2AToken: (body: {
     name?: string
