@@ -311,3 +311,51 @@ def test_complete_path_has_no_summary(monkeypatch):
 
     assert "执行中断说明" not in (captured.get("content") or "")
     assert (captured.get("content") or "").strip() == "全部搞定"
+
+
+# ---------------- 跨代回退：本轮什么都没做也要汇报上一轮成果 ----------------
+@pytest.mark.asyncio
+async def test_summary_falls_back_to_previous_generation():
+    """真机 142451-cd65：用户说「再总结一下刚才的结果」，本轮刚开就挂了，
+    任务板属于上一代 —— 只盯当前 generation 会得出「什么都没做」，
+    而这恰恰是他最需要知道「上一轮成果还在」的时刻。
+    """
+    await db.init_db()
+    await team_store.init_tables()
+
+    prev = _ids()
+    prev_scope = _lead_scope(prev)
+    t = await team_store.create_task(prev_scope, subject="统计文件数", description="d")
+    await team_store.bind_task_owner(prev_scope, t["task_id"], "sub:counter",
+                                     expected_version=t["version"])
+    worker = TeamScope(user_id=prev["user_id"], session_id=prev["session_id"],
+                       generation_id=prev["generation_id"], team_id=prev["team_id"],
+                       agent_id="sub:counter", role="teammate")
+    await team_store.complete_task(worker, t["task_id"], expected_version=1)
+    await _finish(prev, "counter", "completed", "78 个 .py 文件")
+
+    # 第二轮：同一个 session、新的 generation、没有任务
+    new_gen = "g_new_" + uuid.uuid4().hex[:6]
+    text = await build_partial_summary(
+        user_id=prev["user_id"], session_id=prev["session_id"],
+        generation_id=new_gen, team_id="", user_text="再总结一下刚才的结果")
+
+    assert "中断前已完成" in text, f"应回退汇报上一代成果，实际 {text!r}"
+    assert "统计文件数" in text or "counter" in text
+    assert "再总结一下刚才的结果" in text
+
+    await team_store.delete_session_data(prev["user_id"], prev["session_id"])
+
+
+@pytest.mark.asyncio
+async def test_fallback_does_not_invent_history_for_stranger_session():
+    """安全边界：全新会话（没有任何历史）时，不能凭空编出上一轮成果。"""
+    await db.init_db()
+    await team_store.init_tables()
+    ids = _ids()
+
+    text = await build_partial_summary(
+        user_id=ids["user_id"], session_id=ids["session_id"],
+        generation_id="g_fresh", team_id="", user_text="第一次问")
+
+    assert text == "", f"没有历史时不该硬凑，实际 {text!r}"

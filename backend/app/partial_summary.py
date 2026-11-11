@@ -34,6 +34,42 @@ def _status_label(status: str) -> str:
     }.get(str(status or ""), str(status or "未知"))
 
 
+async def _latest_finished_generation(
+        session_id: str, user_id: str) -> tuple[list[dict], list[dict]] | None:
+    """取本会话最近一次有产出的那一代的（任务, 队友运行记录）。
+
+    只用于「本轮什么都没做就挂了」的兜底：告诉用户上一轮的成果还在。
+    读库失败一律当作没有，绝不因为兜底逻辑把收尾本身搞挂。
+    """
+    try:
+        recent_runs = await sub_store.list_runs(session_id, user_id)
+    except Exception:
+        return None
+    if not recent_runs:
+        return None
+    # 从最近往前找第一个「有完成结果或任务板记录」的 generation
+    seen: list[str] = []
+    for r in reversed(recent_runs):
+        gen = str(r.get("generation_id") or "")
+        if gen and gen not in seen:
+            seen.append(gen)
+    for gen in seen:
+        gen_runs = [r for r in recent_runs if str(r.get("generation_id") or "") == gen]
+        team_id = str(gen_runs[0].get("team_id") or "")
+        tasks: list[dict] = []
+        if team_id:
+            scope = TeamScope(user_id=user_id, session_id=session_id,
+                              generation_id=gen, team_id=team_id,
+                              agent_id="root", role="lead")
+            try:
+                tasks = await team_store.list_tasks(scope)
+            except Exception:
+                tasks = []
+        if tasks or any(str(r.get("result_text") or "") for r in gen_runs):
+            return tasks, gen_runs
+    return None
+
+
 async def build_partial_summary(*, user_id: str, session_id: str,
                                 generation_id: str, team_id: str,
                                 user_text: str = "") -> str:
@@ -55,6 +91,15 @@ async def build_partial_summary(*, user_id: str, session_id: str,
             generation_id=generation_id, team_id=team_id or "")
     except Exception:
         runs = []
+
+    # 本轮没有成果时，回退到本会话**最近**结束的那一代。
+    # 用户这一句很可能就是在延续上一轮（「再总结一下刚才的结果」），
+    # 只盯着当前 generation 会得出「什么都没做」从而什么都不汇报，
+    # 而现在恰恰是他最需要知道上一轮成果没丢的时候。
+    if not tasks and not runs:
+        latest = await _latest_finished_generation(session_id, user_id)
+        if latest:
+            tasks, runs = latest
 
     if not tasks and not runs:
         return ""
