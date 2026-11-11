@@ -110,7 +110,9 @@ def build_subagent_tools(host: SubagentHost) -> list[Tool]:
             "等子代理进展，**默认最多等到第一个实质进展就返回**（不要指望它替你等完）："
             "返回 state=event 说明有进展但没结束，你可以先做别的事再 wait；"
             "state=timeout 说明这段时间没进展，子代理仍在跑，不是失败；"
-            "state=all_terminal 才是全部结束，此时用 read_agent_result 取结果。"
+            "state=ready 说明**这一轮做完了、人还在**（空闲待命），"
+            "用 read_agent_result 取本轮结论，要它接着干就 send_message；"
+            "state=all_terminal 才是真的全部结束，此时用 read_agent_result 取结果。"
             "确实需要一次性等完时才显式传 condition=all_terminal。",
             {
                 "type": "object",

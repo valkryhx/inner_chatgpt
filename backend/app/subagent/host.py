@@ -401,6 +401,16 @@ class SubagentHost:
         sender = str(message.get("sender_agent_id") or message.get("sender") or "lead")
         sender_label = sender[4:] if sender.startswith("sub:") else sender
         content = str(message.get("content") or "")
+        # 幂等：同一条消息（按 message_id）只能入队一次。投递会被重试——重连、
+        # 循环重跑、_refill_inbox 补投都可能再走一遍，重复入队会让队友把同一件事做两遍。
+        mid = str(message.get("message_id") or "")
+        if mid:
+            if mid in node.delivered_ids:
+                return {"delivered": True, "name": name, "agent_id": node.agent_id,
+                        "duplicate": True, "idle": node.is_idle}
+            if len(node.delivered_ids) > 500:
+                node.delivered_ids.clear()
+            node.delivered_ids.add(mid)
         node.pending_messages.append({
             "role": "user",
             "content": f"[来自 {sender_label} 的团队消息] {content}",
@@ -829,6 +839,10 @@ class SubagentHost:
         here because Hlaudz has no per-teammate process to poll from.
         """
         deadline = time.monotonic() + max(0.0, float(timeout_s))
+        # 进入等待时的待处理数量。兜底轮询只在「数量变多」时返回 wake：
+        # 否则一条一直没被消费的消息会让 _idle_wait 每次轮询都立刻返回，
+        # 把外层循环变成忙循环（实测 2 秒 34 次空转）。
+        baseline = len(node.pending_messages)
         while True:
             if node.stop.is_set() or node.is_terminal:
                 return "stopped"
@@ -848,8 +862,9 @@ class SubagentHost:
                     return "stopped"
                 if time.monotonic() >= deadline:
                     return "timeout"
-                # 兜底：主动查一次是否真的有活，避免漏唤醒导致永久空闲
-                if node.pending_messages:
+                # 兜底：只有在“出现了之前没见过的消息”时才判定 wake，
+                # 避免同一条未消费消息造成空转。
+                if len(node.pending_messages) > baseline:
                     return "wake"
 
     def push_idle_notification(self, node: AgentNode, *, idle_reason: str = "available",

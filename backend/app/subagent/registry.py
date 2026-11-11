@@ -69,6 +69,9 @@ class AgentNode:
     # 本轮是否已经主动 send_message 给 lead。已发过就抑制 idle 帧，
     # 避免 lead 收到「结果」+「空闲」两条重复通知（CC m1448 zo 的做法）。
     sent_to_lead_this_round: bool = False
+    # 已投递过的 message_id。投递可能被重试（重连、循环重跑、补投），
+    # 同一条消息投两次会让队友把同一件事做两遍。
+    delivered_ids: set[str] = field(default_factory=set)
 
     @property
     def is_terminal(self) -> bool:
@@ -90,9 +93,21 @@ class AgentNode:
         return self.status == "idle"
 
     @property
+    def has_pending_work(self) -> bool:
+        """是否还有未处理的消息（已投递但这一轮还没开跑）。"""
+        return bool(self.pending_messages)
+
+    @property
     def is_settled(self) -> bool:
-        """这轮工作已了结：终态或空闲。等待/读取判定用这个。"""
-        return self.is_terminal or self.is_idle
+        """这轮工作已了结：终态，或「空闲且没有待处理消息」。
+
+        后半句是关键：``send_message`` 投递后节点状态仍是 ``idle``，要等循环被
+        唤醒才变 ``running``。如果只看状态，``wait(all_terminal)`` 会在"消息刚到、
+        活还没开干"这一瞬间误判成已了结，提前返回给 lead 一个过期结论。
+        """
+        if self.is_terminal:
+            return True
+        return self.is_idle and not self.has_pending_work
 
     def drain_pending(self) -> list[dict]:
         """取出待注入的追加指令（同步，供 AgentLoop 的 fold 点调用）。"""
@@ -110,7 +125,7 @@ class AgentNode:
         self.wake.set()
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "agent_id": self.agent_id,
             "name": self.name,
             "role": self.role,
@@ -119,6 +134,14 @@ class AgentNode:
             "result_chars": len(self.result or ""),
             "error": self.error,
         }
+        # 持久 worker 需要把「还在等活」这件事说清楚，否则模型看到 idle
+        # 不知道是「该取结果」还是「该关掉」。
+        if self.rounds:
+            out["rounds"] = self.rounds
+        if self.is_idle:
+            out["idle"] = True
+            out["pending_messages"] = len(self.pending_messages)
+        return out
 
 
 class SubagentRegistry:
