@@ -621,8 +621,9 @@ export default function App() {
         )
         patch({ ...assistantMsg, blocks: [...blocks] })
       } else if (ev.type === 'message_injected') {
-        // 平台注入的团队消息：用户要能看见「有消息进来了」，否则模型突然
-        // 改变行为会显得没有来由。与文本块同序插入，刷新后仍在。
+        // 平台注入到本轮的消息（团队消息 / 用户插话 / 子代理通知）：
+        // 用户要能看见「有消息进来了」，否则模型突然改变行为会显得没有来由。
+        // 与文本块同序插入，刷新后仍在。来源标签由 MessageList 按前缀判定。
         const textIn = ev.text || ''
         if (textIn) {
           blocks = [...blocks, { type: 'injected_message', text: textIn }]

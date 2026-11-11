@@ -67,7 +67,11 @@ export interface ReasoningBlock {
   text: string
 }
 
-/** 平台注入到本轮上下文的团队消息 / 子代理通知（用户可见，便于解释行为变化） */
+/** 平台注入到本轮上下文的消息（用户可见，便于解释行为变化）。
+ *
+ * 来源不止团队：还包括用户中途插话（steering）与子代理完成通知。
+ * 前端按 text 的前缀区分来源并显示不同标签，见 MessageList 的 InjectedNote。
+ */
 export interface InjectedMessageBlock {
   type: 'injected_message'
   text: string

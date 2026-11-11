@@ -421,20 +421,73 @@ function MessageRow({ msg, onImageSettled, onOpenWorkspace }: {
 }
 
 
-/** 平台注入的团队消息：视觉上区别于用户发言与模型正文，可折叠。 */
+/** 平台注入消息的来源分类。
+ *
+ * 以前这里把标签写死成「团队消息」，但「注入」至少有四类来源，
+ * 只有两类真来自 Agent Team。用户中途插话（steering）被显示成
+ * 「团队消息」，正是这处写死造成的误解。按文本前缀判定来源。
+ */
+type InjectedKind = {
+  label: string
+  mark: string
+  /** 去掉与标签重复的前缀，预览里不再看第二遍。 */
+  strip: RegExp | null
+}
+
+const INJECTED_KINDS: Array<{ test: (t: string) => boolean; kind: InjectedKind }> = [
+  {
+    // steering：agent_loop 注入的用户中途补充（steer_queue.wrap_user_steer）
+    test: (t) => t.startsWith('[用户在你执行过程中补充的消息]'),
+    kind: {
+      label: '你的补充',
+      mark: '↩',
+      strip: /^\[用户在你执行过程中补充的消息\]\s*/,
+    },
+  },
+  {
+    // 子代理完成通知（subagent/host.py 的 _notification_chunks）
+    test: (t) => t.startsWith('[任务通知]'),
+    kind: {
+      label: '子代理完成',
+      mark: '✓',
+      strip: /^\[任务通知\]\s*/,
+    },
+  },
+  {
+    // teammate / lead 投递的团队消息（subagent/host.py 的 deliver_team_message）
+    test: (t) => /^\[来自 [^\]]+ 的团队消息\]/.test(t),
+    kind: {
+      label: '团队消息',
+      mark: '↩',
+      strip: /^\[来自 [^\]]+ 的团队消息\]\s*/,
+    },
+  },
+]
+
+const INJECTED_FALLBACK: InjectedKind = { label: '平台提示', mark: '·', strip: null }
+
+function classifyInjected(text: string): InjectedKind {
+  for (const { test, kind } of INJECTED_KINDS) {
+    if (test(text)) return kind
+  }
+  return INJECTED_FALLBACK
+}
+
+/** 平台注入到本轮的上下文消息：视觉上区别于用户发言与模型正文，可折叠。 */
 function InjectedNote({ text }: { text: string }) {
   const [open, setOpen] = useState(false)
   const NEWLINE = String.fromCharCode(10)
-  // 标签已经写了「团队消息」，预览里把重复的前缀去掉，避免同一句话看两遍。
-  const body = text.replace(/^\[来自 [^\]]+ 的团队消息\]\s*/, '')
+  const kind = classifyInjected(text)
+  // 标签已经说明了来源，预览里把重复的前缀去掉，避免同一句话看两遍。
+  const body = kind.strip ? text.replace(kind.strip, '') : text
   const firstLine = body.split(NEWLINE)[0] || ''
   const multi = body.includes(NEWLINE) || body.length > firstLine.length
   return (
     <div className="injected-note">
       <button type="button" className="injected-note-head" onClick={() => setOpen((v) => !v)}
               aria-expanded={open}>
-        <span className="injected-note-mark" aria-hidden="true">↩</span>
-        <span className="injected-note-label">团队消息</span>
+        <span className="injected-note-mark" aria-hidden="true">{kind.mark}</span>
+        <span className="injected-note-label">{kind.label}</span>
         <span className="injected-note-preview">{firstLine}</span>
         {multi && <span className="injected-note-caret">{open ? '收起' : '展开'}</span>}
       </button>

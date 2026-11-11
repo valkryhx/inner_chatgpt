@@ -1497,8 +1497,8 @@ textarea, input { caret-color: var(--clay); }
 .mcp-state.ok .mcp-dot { background: #4f8a5b; }
 .mcp-state.bad .mcp-dot { background: var(--danger); }
 
-/* 平台注入的团队消息：与用户气泡、模型正文都不混淆，
-   目的只是让用户看到「这条消息改变了模型的下一步」。 */
+/* 平台注入到本轮的上下文消息（团队消息 / 用户插话 / 子代理通知）：
+   与用户气泡、模型正文都不混淆，目的只是让用户看到「这条消息改变了模型的下一步」。 */
 .injected-note {
   margin: 8px 0;
   border-left: 2px solid var(--line-strong);
