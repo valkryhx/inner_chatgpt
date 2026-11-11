@@ -11,6 +11,7 @@ import json
 from typing import Any, Awaitable, Callable
 
 from . import team_store
+from .logging_setup import team_event
 from .scope import TeamScope
 
 
@@ -400,11 +401,25 @@ class TeamHost:
         child agents.
         """
         if self._deliver_sink is None:
+            team_event("delivery_no_sink", message_id=message.get("message_id", ""),
+                       recipient=message.get("recipient_agent_id", ""),
+                       team_id=self.scope.team_id)
             return {"delivered": False, "reason": "no delivery sink (no live agent)"}
         try:
-            return self._deliver_sink(message) or {"delivered": False, "reason": "empty result"}
+            out = self._deliver_sink(message) or {"delivered": False, "reason": "empty result"}
         except Exception as exc:  # noqa: BLE001 - delivery must not lose the stored row
+            team_event("delivery_error", message_id=message.get("message_id", ""),
+                       recipient=message.get("recipient_agent_id", ""),
+                       team_id=self.scope.team_id,
+                       error=f"{type(exc).__name__}: {exc}")
             return {"delivered": False, "reason": f"{type(exc).__name__}: {exc}"}
+        if not out.get("delivered"):
+            # 落库成功但投递失败：这是「消息看似发了、其实没人收到」的分界点，
+            # 排查时必须能看到原因。
+            team_event("delivery_failed", message_id=message.get("message_id", ""),
+                       recipient=message.get("recipient_agent_id", ""),
+                       team_id=self.scope.team_id, reason=str(out.get("reason") or ""))
+        return out
 
     async def consume_inbox(self, *, limit: int = 20) -> list[dict[str, Any]]:
         """Take and mark-consumed this agent's pending messages."""

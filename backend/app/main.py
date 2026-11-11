@@ -10,14 +10,24 @@ from fastapi.staticfiles import StaticFiles
 
 from . import db
 from .config import ROOT_DIR, llm_yaml_available, load_llm_settings
+from .logging_setup import setup_logging
 from .routers import auth, chat, me, media, sessions, skills, team, workspace_files
 from .a2a import router as a2a_router
 from .runtime import RuntimeHub, set_hub
 from .schemas import HealthOut
 
+# 必须早于其它模块的模块级 logger 调用：否则 handler 还没装上，
+# 启动阶段的日志会静默丢失。
+_LOG_CONFIG = setup_logging()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import logging
+
+    logging.getLogger(__name__).info(
+        "logging ready: level=%s team_log=%s",
+        _LOG_CONFIG["level"], _LOG_CONFIG["team_log"] or "(disabled)")
     await db.init_db()
     from .a2a import store as a2a_store
     await a2a_store.init_tables()

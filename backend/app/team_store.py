@@ -15,6 +15,7 @@ from typing import Any, Optional
 import aiosqlite
 
 from .config import DB_PATH
+from .logging_setup import team_event
 from .scope import TeamScope
 
 TERMINAL_TASK_STATUSES = frozenset({"completed", "cancelled"})
@@ -509,9 +510,14 @@ async def claim_task(scope: TeamScope, task_id: str, *, expected_version: int) -
         ok = (cur.rowcount or 0) == 1
     if not ok:
         task = await get_task(scope, task_id)
-        return {"ok": False, "reason": "not_found" if task is None else "conflict"}
+        reason = "not_found" if task is None else "conflict"
+        team_event("task_claim_failed", task_id=task_id, actor=scope.agent_id,
+                   team_id=scope.team_id, reason=reason)
+        return {"ok": False, "reason": reason}
     task = await get_task(scope, task_id)
     assert task is not None
+    team_event("task_claimed", task_id=task_id, actor=scope.agent_id,
+               team_id=scope.team_id, version=task.get("version"))
     await emit_event(scope, "task_updated", {"task": task, "action": "claim"}, task_id=task_id)
     return {"ok": True, "task": task}
 
@@ -529,9 +535,16 @@ async def complete_task(scope: TeamScope, task_id: str, *, expected_version: int
         ok = (cur.rowcount or 0) == 1
     if not ok:
         task = await get_task(scope, task_id)
-        return {"ok": False, "reason": "not_found" if task is None else "not_owner_or_conflict"}
+        reason = "not_found" if task is None else "not_owner_or_conflict"
+        # owner 不匹配是协作里最隐蔽的一类失败：任务明明在，但干活的人不是 owner。
+        team_event("task_complete_failed", task_id=task_id, actor=scope.agent_id,
+                   team_id=scope.team_id, reason=reason,
+                   actual_owner=(task or {}).get("owner_agent_id", ""))
+        return {"ok": False, "reason": reason}
     task = await get_task(scope, task_id)
     assert task is not None
+    team_event("task_completed", task_id=task_id, actor=scope.agent_id,
+               team_id=scope.team_id, version=task.get("version"))
     await emit_event(scope, "task_updated", {"task": task, "action": "complete"}, task_id=task_id)
     return {"ok": True, "task": task}
 
@@ -569,6 +582,8 @@ async def bind_task_owner(scope: TeamScope, task_id: str, owner_agent_id: str, *
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         if not await _deps_complete(conn, scope, task_id):
+            team_event("task_bind_blocked", task_id=task_id, actor=owner_agent_id,
+                       team_id=scope.team_id, reason="blocked_by_incomplete")
             return {"ok": False, "reason": "blocked"}
         cur = await conn.execute(
             f"UPDATE team_tasks SET status='in_progress',owner_agent_id=?,version=version+1,updated_at=? "
@@ -613,6 +628,9 @@ async def send_message(scope: TeamScope, *, recipient: str, kind: str,
            "sender_agent_id": scope.agent_id, "recipient_agent_id": target,
            "kind": kind or "note", "content": content, "created_at": ts,
            "delivered_at": 0, "read_at": 0, "state": "queued"}
+    team_event("message_queued", message_id=mid, sender=scope.agent_id,
+               recipient=target, team_id=scope.team_id, kind=kind or "note",
+               content_chars=len(content or ""))
     await emit_event(scope, "team_message", {"message": msg})
     return msg
 
@@ -692,6 +710,10 @@ async def consume_inbox(scope: TeamScope, *, limit: int = 20) -> list[dict[str, 
         row["read_at"] = ts
         row["delivered_at"] = row.get("delivered_at") or ts
         row["state"] = "consumed"
+    if rows:
+        team_event("inbox_consumed", agent=scope.agent_id, team_id=scope.team_id,
+                   count=len(rows),
+                   message_ids=[r["message_id"] for r in rows[:10]])
     return rows
 
 

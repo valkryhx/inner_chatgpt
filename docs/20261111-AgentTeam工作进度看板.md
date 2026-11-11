@@ -8,7 +8,7 @@
 | 项 | 值 |
 |---|---|
 | 分支 / HEAD | `main` @ `9ec0ba3` |
-| 后端单测 | **535 passed** |
+| 后端单测 | **541 passed** |
 | 前端构建 | 通过 |
 | 持久化开关 | `TEAMMATE_IDLE_TIMEOUT_S`（**默认 0 = 关闭**，行为与历史一致） |
 | AGENTS.md 待更新 | 是（本文档写完后再补） |
@@ -23,7 +23,40 @@
 
 ## 3. 已完成（按时间倒序）
 
-### ✅ P-A 边界摸排（本轮，未提交前）
+### ✅ 日志基础设施（本轮）
+
+**发现的问题比预想严重**：项目里有 29 处 `logger.*` 调用，但**从未配置过 handler**，
+uvicorn 只管自己的 logger，`app.*` 的日志全部被静默丢弃。所以多智能体协作出问题时
+根本没有痕迹可查 —— 只能靠 print 和猜。
+
+新增 `backend/app/logging_setup.py`：
+
+| 能力 | 开关 | 说明 |
+|---|---|---|
+| 应用日志可见 | `HLZ_LOG_LEVEL=INFO` | 默认 WARNING，不改变现有噪音 |
+| 应用日志落文件 | `HLZ_APP_LOG=app.log` | 按 20MB 轮转，留 5 份 |
+| **团队事件 JSONL** | `HLZ_TEAM_LOG=1` | `backend/data/logs/team-<日期>.jsonl`，50MB 轮转留 10 份 |
+
+团队事件是**每行一条 JSON**，字段平铺，可直接 grep `message_id` / agent 名：
+
+```
+{"ts":"...","event":"message_delivered","agent":"keeper","message_id":"tmsg_...",
+ "sender":"root","was_idle":true,"pending":1}
+```
+
+埋点覆盖了协作的完整链路：`message_queued` → `message_delivered` / `message_undelivered`
+→ `inbox_consumed` → `agent_round_done` → `agent_idle_wait` → `agent_end`，
+外加 `task_claimed` / `task_completed` / `task_complete_failed`（带 `actual_owner`，
+owner 不匹配是最隐蔽的一类失败）/ `task_bind_blocked` / `delivery_failed`。
+
+**为什么不另开一个 agent 监测**：另一个 agent 看不到别人的运行时，它真正能做的还是
+"读日志"。要排查竞态、消息丢失、状态不一致，必须在事件发生的那一刻记录事实，
+事后靠另一个 agent 猜是做不到的。**先有日志，才谈得上多一双眼睛。**
+
+**验证**：单测 535 → 541（新增 6 条，含"应用 logger 真的有 handler"这条核心回归）；
+真机跑通两个场景，34 条事件完整复盘了一次协作（见上）。
+
+### ✅ P-A 边界摸排
 
 在 P-A 落地后专门摸排"实现能跑之后真正会出问题的地方"，**抓到 3 个新缺陷**：
 
@@ -133,3 +166,5 @@ E1 是最值得记的：它不是"实现写错"，而是**持久化引入的新�
 
 - 2026-11-11：首版，记录 D1–D4 + P-A 完成状态。
 - 2026-11-11（第二轮）：P-A 边界摸排完成，抓到 E1–E3 并修复；单测 524 → 535。
+- 2026-11-11（第三轮）：补日志基础设施（此前 29 处 logger 调用全部无效）；
+  单测 535 → 541，真机验证协作事件流可复盘。

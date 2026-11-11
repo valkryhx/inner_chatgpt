@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 import uuid
@@ -18,8 +19,11 @@ from .context import AgentContext
 from .events import EventBuffer
 from .registry import AgentNode, SubagentError, SubagentRegistry
 from .runtime import SubagentRuntime, SubagentSpec
+from ..logging_setup import team_event
 from ..quota import QuotaExceeded, get_quota
 from ..scope import TeamScope
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_WAIT_TIMEOUT = 60.0
 MAX_READ_CHARS = 20000
@@ -248,11 +252,18 @@ class SubagentHost:
                 if not node.sent_to_lead_this_round:
                     self.push_idle_notification(node, idle_reason="available")
                 node.sent_to_lead_this_round = False
-                reason = await self._idle_wait(
-                    node,
-                    timeout_s=min(self.idle_timeout_s,
-                                  max(0.0, deadline - time.monotonic())),
-                )
+                idle_budget = min(self.idle_timeout_s,
+                                  max(0.0, deadline - time.monotonic()))
+                team_event(
+                    "agent_round_done", agent=node.name, agent_id=node.agent_id,
+                    team_id=self.ctx.team_id, round=node.rounds, turns=node.turns,
+                    result_chars=len(node.result or ""),
+                    idle_budget_s=round(idle_budget, 1))
+                reason = await self._idle_wait(node, timeout_s=idle_budget)
+                team_event("agent_idle_wait", agent=node.name,
+                           team_id=self.ctx.team_id,
+                           round=node.rounds, reason=reason,
+                           pending=len(node.pending_messages))
                 if reason == "stopped":
                     if not node.is_terminal:
                         node.status = "stopped" if node.stop.is_set() else "completed"
@@ -309,6 +320,10 @@ class SubagentHost:
             except Exception:
                 pass
             await self._notify(node)
+            team_event("agent_end", agent=node.name, agent_id=node.agent_id,
+                       team_id=self.ctx.team_id,
+                       status=node.status, rounds=node.rounds, turns=node.turns,
+                       error=node.error or "")
             self._publish({
                 "type": "subagent_end",
                 "agent_id": node.agent_id,
@@ -391,6 +406,9 @@ class SubagentHost:
 
         node = self.registry.get(name)
         if node is None:
+            team_event("message_undelivered", agent=name,
+                       team_id=self.ctx.team_id,
+                       reason="no_live_agent", delivered=False)
             return {"delivered": False,
                     "reason": f"没有名为 {name} 的活着的 agent（可能还未 spawn 或已被 close）"}
         if node.is_terminal:
@@ -406,6 +424,8 @@ class SubagentHost:
         mid = str(message.get("message_id") or "")
         if mid:
             if mid in node.delivered_ids:
+                team_event("message_duplicate", agent=name,
+                           team_id=self.ctx.team_id, message_id=mid)
                 return {"delivered": True, "name": name, "agent_id": node.agent_id,
                         "duplicate": True, "idle": node.is_idle}
             if len(node.delivered_ids) > 500:
@@ -418,6 +438,10 @@ class SubagentHost:
         # 唤醒 idle 的队友：否则它睡到超时才发现有新消息。
         node.wake.set()
         self._touch()
+        team_event("message_delivered", agent=name, message_id=mid or "",
+                   team_id=self.ctx.team_id,
+                   sender=sender_label, was_idle=node.is_idle,
+                   pending=len(node.pending_messages))
         return {"delivered": True, "name": name, "agent_id": node.agent_id,
                 "idle": node.is_idle}
 
