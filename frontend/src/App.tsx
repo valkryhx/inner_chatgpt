@@ -431,7 +431,38 @@ export default function App() {
   }
 
   const send = async (text: string, attachments: Attachment[] = []) => {
-    if ((!text.trim() && attachments.length === 0) || streaming) return
+    if (!text.trim() && attachments.length === 0) return
+    // 生成中再按发送 = 把这句话插进正在跑的回合（steering），
+    // 而不是被直接吞掉或另起一轮。后端 mode:"queue" 负责判定；
+    // 若此刻回合刚好结束，后端会降级为普通发送并直接返回流式响应。
+    if (streaming) {
+      if (attachments.length) {
+        setError('生成过程中暂不支持带图片插话，等当前任务结束后再发。')
+        return
+      }
+      const sid = activeId
+      if (!sid) return
+      try {
+        const out = await api.queueMessage(sid, text)
+        if (out?.queued) {
+          setMessages((prev) => [...prev, {
+            id: 'local_steer_' + Date.now(),
+            session_id: sid,
+            role: 'user',
+            content: text,
+            reasoning: '',
+            blocks: text ? [{ type: 'text' as const, text }] : [],
+            status: 'queued',
+            created_at: Date.now(),
+          }])
+          setSendPulse((n) => n + 1)
+          setError(null)
+        }
+      } catch (e) {
+        setError(String(e))
+      }
+      return
+    }
     setError(null)
     setTeamSnapshot(null)
     setTeamError(null)

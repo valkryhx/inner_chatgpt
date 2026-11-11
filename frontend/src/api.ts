@@ -165,6 +165,16 @@ export const api = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ generation_id: generationId, message_id: messageId }),
     }),
+  /** 生成中把一句话插进正在跑的回合（steering），不另开一轮。 */
+  queueMessage: (id: string, text: string) =>
+    request<{ queued: boolean; generation_id: string; queue_depth: number }>(
+      `/sessions/${id}/messages`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text, mode: 'queue' }),
+      },
+    ),
   // description 是模型实际看到的版本（带 [MCP: <server>] 来源前缀），
   // raw_description 是 server 原始描述，source 是来源标签。
   mcpTools: () =>

@@ -55,6 +55,8 @@ class TurnRuntime:
     user_id: str = ""
     team: TeamHost | None = None
     team_id: str = ""
+    # 本轮 generation id：插话队列的键需要它（见 app/steer_queue.py）。
+    generation_id: str = ""
     # 本轮的 GA 会话集合；未启用 / 预检失败时为 None（spec §11.3）。
     acp: AcpSessionManager | None = None
     # 本轮的能力档位（A2A token 决定；网页端恒为 full）。
@@ -239,6 +241,16 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
         """
         async def _drain() -> list[dict[str, Any]]:
             injected: list[dict[str, Any]] = []
+            # 用户中途插话优先于系统通知：用户的话是本回合要处理的新要求，
+            # 通知是已经发生的事实。先给模型看指令，更符合「边跑边改需求」的直觉。
+            try:
+                from ..steer_queue import get_queue, wrap_user_steer
+                q = get_queue(team_ctx.user_id, team_ctx.session_id, team_ctx.generation_id)
+                for item in q.drain():
+                    injected.append({"role": "user",
+                                     "content": wrap_user_steer(item["text"])})
+            except Exception:  # noqa: BLE001 - 队列读失败不能拖垮本轮
+                pass
             try:
                 for row in await team_store.consume_inbox(team_scope, limit=20):
                     sender = str(row.get("sender_agent_id") or "")
@@ -288,6 +300,10 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
         # 收工前的团队闸：队友还在跑就别结束这一轮
         team_gate=_team_gate,
     )
+    # 标记：本注入器已经会 drain 用户插话队列。非 team 路径据此避免再装一个，
+    # 否则同一条消息会被两个注入器各取一次（其中一次取到空，看起来没事，
+    # 但队列语义会变得难以推理）。
+    loop._steer_aware = True
     return TurnRuntime(
         loop=loop,
         host=host,
@@ -298,6 +314,7 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
         user_id=team_ctx.user_id,
         team=team_host,
         team_id=team_id,
+        generation_id=team_ctx.generation_id,
         acp=acp,
         tool_policy=policy_level,
     )

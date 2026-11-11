@@ -79,6 +79,34 @@ def detect_artifacts(output_text: str) -> list[dict[str, Any]]:
     return _json_objects_from_text(output_text)
 
 
+def _ensure_steer_injector(ur, user_id: str, session_id: str) -> None:
+    """给「没有 team 的普通对话」装用户插话注入器。
+
+    team 路径的注入器已经会 drain 用户队列（见 subagent/session.py），
+    这里靠 ``_steer_aware`` 标记跳过，避免同一条消息被注入两次。
+    """
+    loop = getattr(ur, "loop", None)
+    if loop is None or getattr(loop, "_steer_aware", False):
+        return
+    generation_id = str(getattr(ur, "generation_id", "") or "")
+    if not generation_id:
+        # 拿不到 generation 就无法定位队列；普通路径宁可插话失效，
+        # 也不能把消息塞进一个谁也取不到的队列。
+        return
+
+    def _inject() -> list[dict[str, Any]]:
+        try:
+            from .steer_queue import get_queue, wrap_user_steer
+            q = get_queue(user_id, session_id, generation_id)
+            return [{"role": "user", "content": wrap_user_steer(item["text"])}
+                    for item in q.drain()]
+        except Exception:  # noqa: BLE001 - 插话读失败不能拖垮本轮
+            return []
+
+    loop.message_injector = _inject
+    loop._steer_aware = True
+
+
 async def run_agent_stream(
     ur,
     session_id: str,
@@ -112,6 +140,8 @@ async def run_agent_stream(
             await store.set(user_id, session_id, history)
         else:
             await store.set(session_id, history)
+
+    _ensure_steer_injector(ur, user_id, session_id)
 
     async for ev in ur.loop.run_stream(history, stop_event=stop_event, session_id=session_id):
         et = ev.get("type")

@@ -386,6 +386,13 @@ function MessageRow({ msg, onImageSettled, onOpenWorkspace }: {
   return (
     <div className={'msg ' + (isUser ? 'user' : 'assistant') + (msg.status === 'error' ? ' has-error' : '')}>
       <div className="bubble-col">
+        {/* 生成中投递的插话：明确标注「已插入当前任务」，
+            否则用户会以为它像普通消息一样另起了一轮。 */}
+        {msg.status === 'queued' && (
+          <div className="steer-badge" title="会插入正在执行的任务，不会另起一轮">
+            已插入当前任务
+          </div>
+        )}
         {hasReasoning && !hasReasoningBlocks && <ReasoningSection text={msg.reasoning} live={isActiveStream} />}
         {renderBlocks(blocks, isUser, isActiveStream, !isActiveStream, onImageSettled, onOpenWorkspace)}
         {!hasTextBlocks && msg.content && (
