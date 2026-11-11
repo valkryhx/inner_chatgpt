@@ -19,6 +19,12 @@ interface Props {
   sendPulse?: number
   /** code_run 等步骤的「工作区」入口。 */
   onOpenWorkspace?: () => void
+  /**
+   * 从搜索结果跳转过来时，要定位的那条消息。
+   * 只在 focusNonce 变化时生效一次，用户随后手动滚动不回弹。
+   */
+  focusMessageId?: string | null
+  focusNonce?: number
 }
 
 /* ---------- 工具步骤行（L2 过程层）：单行 + 状态点 + 点击展开 ---------- */
@@ -384,7 +390,10 @@ function MessageRow({ msg, onImageSettled, onOpenWorkspace }: {
     msg.status !== 'stopped' &&
     !hasVisibleContent
   return (
-    <div className={'msg ' + (isUser ? 'user' : 'assistant') + (msg.status === 'error' ? ' has-error' : '')}>
+    <div
+      className={'msg ' + (isUser ? 'user' : 'assistant') + (msg.status === 'error' ? ' has-error' : '')}
+      data-msg-id={msg.id}
+    >
       <div className="bubble-col">
         {/* 生成中投递的插话：明确标注「已插入当前任务」，
             否则用户会以为它像普通消息一样另起了一轮。 */}
@@ -552,13 +561,15 @@ function MessageActions({ msg }: { msg: Message }) {
 /** 距离底部多少像素以内，仍视为“用户想跟随新内容”。 */
 const FOLLOW_THRESHOLD_PX = 96
 
-export default function MessageList({ messages, streaming, autoCompacted, sessionKey, sendPulse, onOpenWorkspace }: Props) {
+export default function MessageList({ messages, streaming, autoCompacted, sessionKey, sendPulse, onOpenWorkspace, focusMessageId, focusNonce }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const innerRef = useRef<HTMLDivElement>(null)
   const followRef = useRef(true)
   const frameRef = useRef<number | null>(null)
   const lastScrollTopRef = useRef(0)
   const programmaticUntilRef = useRef(0)
+  // 已经定位过的 focusNonce，避免每次 render 重复滚动同一个目标。
+  const focusAppliedRef = useRef<number | undefined>(undefined)
 
   const pinToBottom = useCallback(() => {
     const el = scrollRef.current
@@ -618,6 +629,28 @@ export default function MessageList({ messages, streaming, autoCompacted, sessio
     lastScrollTopRef.current = 0
     schedulePinToBottom('auto')
   }, [sessionKey, schedulePinToBottom])
+
+  // 从搜索结果跳进来时，滚到命中的那条消息而不是贴底。
+  // 依赖 messages：切会话后历史是异步加载的，目标节点要等它到达才存在。
+  useLayoutEffect(() => {
+    if (!focusMessageId) return
+    if (focusAppliedRef.current === focusNonce) return
+    const el = scrollRef.current
+    if (!el) return
+    const node = el.querySelector<HTMLElement>(
+      `[data-msg-id="${CSS.escape(focusMessageId)}"]`
+    )
+    if (!node) return
+    // 定位意图优先于贴底：先关掉跟随，否则下一帧的贴底会把它拽回底部。
+    followRef.current = false
+    focusAppliedRef.current = focusNonce
+    node.scrollIntoView({ block: 'center', behavior: 'auto' })
+    lastScrollTopRef.current = el.scrollTop
+    programmaticUntilRef.current = performance.now() + 200
+    // 一次性高亮，让用户看清落到哪条上；动画结束自己褪掉。
+    node.classList.add('msg-flash')
+    window.setTimeout(() => node.classList.remove('msg-flash'), 1600)
+  }, [focusMessageId, focusNonce, messages])
 
   // 用户按发送是比“正在浏览历史”更高优先级的意图：立即恢复跟随并贴底，
   // 保证乐观插入的用户消息第一眼就能看到，而不是停留在旧的历史位置。

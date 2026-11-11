@@ -14,6 +14,8 @@ interface Props {
   onOpenSettings: () => void
   onLogout: () => void
   onOpenAllSessions: () => void
+  /** 打开历史对话正文搜索面板。 */
+  onOpenSearch: () => void
 }
 
 function timeAgo(ts: number): string {
@@ -39,6 +41,7 @@ export default function Sidebar({
   onOpenSettings,
   onLogout,
   onOpenAllSessions,
+  onOpenSearch,
 }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
@@ -127,7 +130,7 @@ export default function Sidebar({
         <button className="side-nav-item" onClick={onCreate}>
           <span aria-hidden="true">＋</span> 新建 <span className="kbd">Ctrl Shift O</span>
         </button>
-        <button className="side-nav-item" disabled title="搜索（未实现）">
+        <button className="side-nav-item" onClick={onOpenSearch}>
           <span aria-hidden="true">⌕</span> 搜索 <span className="kbd">Ctrl Shift K</span>
         </button>
         <button className="side-nav-item" disabled title="项目（未实现）">

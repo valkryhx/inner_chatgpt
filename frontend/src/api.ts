@@ -12,6 +12,7 @@ import type {
   Session,
   SessionDetail,
   Message,
+  MessageSearchResult,
   UploadedImage,
   StopResult,
   StreamEvent,
@@ -124,6 +125,11 @@ export const api = {
       body: JSON.stringify({ title, model_id: modelId ?? '' }),
     }),
   getSession: (id: string) => request<SessionDetail>(`/sessions/${id}`),
+  searchMessages: (q: string, limit = 20, sessionId = '') => {
+    const params = new URLSearchParams({ q, limit: String(limit) })
+    if (sessionId) params.set('session_id', sessionId)
+    return request<MessageSearchResult>(`/sessions/search?${params.toString()}`)
+  },
   getContextUsage: (id: string) => request<ContextUsage>(`/sessions/${id}/context`),
   renameSession: (id: string, title: string) =>
     request<Session>(`/sessions/${id}`, {

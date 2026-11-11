@@ -1,6 +1,8 @@
 """会话 CRUD 路由（多用户：全部依赖当前用户，DAO 按 user_id 隔离）。"""
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from .. import db
@@ -11,6 +13,7 @@ from ..schemas import (
     ContextUsageOut,
     CreateSessionIn,
     MessageOut,
+    MessageSearchOut,
     SessionDetailOut,
     SessionListOut,
     SessionOut,
@@ -19,6 +22,31 @@ from ..schemas import (
 from ..tokens import message_token_counter
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
+
+
+@router.get("/search", response_model=MessageSearchOut)
+async def search_sessions(
+    q: str = "",
+    limit: int = 20,
+    session_id: str = "",
+    user: dict = Depends(get_current_user),
+):
+    """按正文关键词检索当前用户的历史对话。
+
+    只搜 user / assistant 两类消息：system 消息是平台注入的，命中它会让用户
+    搜到一段对话里根本看不见的文本。
+    """
+    started = time.perf_counter()
+    limit = max(1, min(int(limit or 20), 100))
+    hits, has_more = await db.search_messages(
+        user["id"], q, limit=limit, session_id=session_id
+    )
+    return MessageSearchOut(
+        query=q,
+        hits=hits,
+        has_more=has_more,
+        elapsed_ms=round((time.perf_counter() - started) * 1000, 2),
+    )
 
 
 @router.get("", response_model=SessionListOut)

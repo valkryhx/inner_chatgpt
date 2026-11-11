@@ -234,6 +234,27 @@ export interface SessionDetail {
   messages: Message[]
 }
 
+/** 一条正文搜索命中：所属会话 + 上下文片段 + 片段内命中位置。 */
+export interface MessageSearchHit {
+  message_id: string
+  session_id: string
+  session_title: string
+  role: 'user' | 'assistant' | 'system'
+  snippet: string
+  /** 片段内命中起点；-1 表示片段中不含原样关键词，不高亮。 */
+  match_offset: number
+  match_length: number
+  created_at: number
+  session_updated_at: number
+}
+
+export interface MessageSearchResult {
+  query: string
+  hits: MessageSearchHit[]
+  has_more: boolean
+  elapsed_ms: number
+}
+
 /** stop 接口返回的已落库 assistant 快照，用于避免 abort 后历史覆盖本地内容。 */
 export interface StopResult {
   ok: boolean

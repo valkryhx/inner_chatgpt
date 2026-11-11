@@ -68,7 +68,7 @@ export default function SessionBrowser({ open, activeId, onClose, onSelect, onDe
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="搜索会话标题…"
+            placeholder="按标题筛选已加载的会话…（搜正文请用 ⌕ 搜索）"
             autoFocus
           />
         </div>

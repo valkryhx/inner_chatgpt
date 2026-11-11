@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, getToken, setToken, streamMessage } from './api'
-import type { Attachment, ContextUsage, LlmModelOption, McpServerStatus, Message, Session, StreamEvent, TeamEvent, TeamSnapshot, User } from './types'
+import type { Attachment, ContextUsage, LlmModelOption, McpServerStatus, Message, MessageSearchHit, Session, StreamEvent, TeamEvent, TeamSnapshot, User } from './types'
 import Sidebar from './components/Sidebar'
 import MessageList from './components/MessageList'
 import ModelMenu from './components/ModelMenu'
 import ReasoningMenu from './components/ReasoningMenu'
 import SessionBrowser from './components/SessionBrowser'
+import SessionSearch from './components/SessionSearch'
 import Composer from './components/Composer'
 import LoginPage from './components/LoginPage'
 import SettingsModal from './components/SettingsModal'
@@ -124,6 +125,11 @@ export default function App() {
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [sessions, setSessions] = useState<Session[]>([])
   const [allSessionsOpen, setAllSessionsOpen] = useState(false)
+  const [searchOpen, setSearchOpen] = useState(false)
+  // 搜索结果跳转：目标消息 id + nonce（同一个 id 再次点击也要重新定位）。
+  const [focusMsg, setFocusMsg] = useState<{ id: string; nonce: number } | null>(null)
+  // 单调递增，避免以 Date.now() 做 nonce 时同毫秒两次点击被去重掉。
+  const focusNonceRef = useRef(0)
   const [activeId, setActiveId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [streaming, setStreaming] = useState(false)
@@ -335,9 +341,35 @@ export default function App() {
     setSettingsOpen(false)
   }
 
+  // Ctrl/Cmd+Shift+K 是侧栏提示的快捷键，全局监听（输入框里也要触发）。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase()
+      if (key !== 'k' || !e.shiftKey || !(e.ctrlKey || e.metaKey)) return
+      e.preventDefault()
+      setSearchOpen(true)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
   const selectSession = (id: string) => {
     if (streaming) return
     setActiveId(id)
+  }
+
+  // 搜索命中跳转：切会话 + 记录要定位的消息。
+  // 跨会话跳转必须尊重 selectSession 的 streaming 守卫：生成中切走的话，
+  // 流结束时按原 sid 的 loadMessages 会把旧会话的消息写进新会话的视图。
+  // 同一会话内定位不受影响——那只是滚动，不动 activeId。
+  const openSearchHit = (hit: MessageSearchHit) => {
+    const crossSession = hit.session_id !== activeId
+    if (crossSession && streaming) {
+      setNotice('正在生成中。停止或等待完成后再跳转到其他会话；同会话内定位不受影响。')
+      return
+    }
+    setFocusMsg({ id: hit.message_id, nonce: ++focusNonceRef.current })
+    if (crossSession) setActiveId(hit.session_id)
   }
 
   const createSession = async () => {
@@ -833,6 +865,7 @@ export default function App() {
         onOpenSettings={() => setSettingsOpen(true)}
         onLogout={doLogout}
         onOpenAllSessions={() => setAllSessionsOpen(true)}
+        onOpenSearch={() => setSearchOpen(true)}
       />
       <div className="main">
         <div className="main-header">
@@ -886,6 +919,8 @@ export default function App() {
           sessionKey={activeId}
           sendPulse={sendPulse}
           onOpenWorkspace={() => setWorkspaceOpen(true)}
+          focusMessageId={focusMsg?.id ?? null}
+          focusNonce={focusMsg?.nonce}
         />
         <Composer
           streaming={streaming}
@@ -906,6 +941,11 @@ export default function App() {
         onClose={() => setAllSessionsOpen(false)}
         onSelect={(id) => { selectSession(id); setAllSessionsOpen(false) }}
         onDelete={deleteSession}
+      />
+      <SessionSearch
+        open={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        onOpenHit={openSearchHit}
       />
       <TeamPanel
         snapshot={teamSnapshot}

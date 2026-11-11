@@ -48,6 +48,28 @@ class SessionDetailOut(BaseModel):
     messages: list[MessageOut]
 
 
+class MessageSearchHit(BaseModel):
+    """一条正文命中：所属会话 + 上下文片段 + 片段内命中位置。"""
+    message_id: str
+    session_id: str
+    session_title: str = ""
+    role: str = ""
+    snippet: str = ""
+    # 片段内命中起点；-1 表示片段中不含原样关键词（大小写/裁切导致），前端不高亮。
+    match_offset: int = -1
+    match_length: int = 0
+    created_at: int = 0
+    session_updated_at: int = 0
+
+
+class MessageSearchOut(BaseModel):
+    query: str = ""
+    hits: list[MessageSearchHit] = Field(default_factory=list)
+    has_more: bool = False
+    # 服务端耗时（毫秒），便于判断是否需要上 FTS5。
+    elapsed_ms: float = 0.0
+
+
 class ContextUsageOut(BaseModel):
     used_tokens: int = 0
     context_window: int = 0

@@ -333,6 +333,90 @@ async def list_messages(session_id: str) -> list[dict[str, Any]]:
     return [_row_to_message(r) for r in rows]
 
 
+def _snippet(text: str, needle: str, before: int = 40, after: int = 120) -> tuple[str, int]:
+    """截取命中位置附近的一段可读上下文。
+
+    返回 (片段, 片段内命中起点)。命中位置按原文字符下标计算，调用方据此
+    在前端精确高亮；片段两端用省略号标记被裁掉的部分。
+    """
+    low = text.lower()
+    pos = low.find(needle.lower())
+    if pos < 0:
+        return text[: before + after].replace("\n", " "), -1
+    start = max(0, pos - before)
+    end = min(len(text), pos + len(needle) + after)
+    # 落盘正文里的换行会把列表行撑开，片段统一压成单行。
+    frag = text[start:end].replace("\n", " ")
+    offset = pos - start
+    if start > 0:
+        prefix = "…"
+        frag = prefix + frag
+        offset += len(prefix)
+    if end < len(text):
+        frag = frag + "…"
+    return frag, offset
+
+
+async def search_messages(
+    user_id: str,
+    query: str,
+    limit: int = 20,
+    session_id: str = "",
+) -> tuple[list[dict[str, Any]], bool]:
+    """按正文关键词检索该用户的历史消息。
+
+    用户隔离靠 `JOIN sessions ... WHERE s.user_id=?`——`messages` 表本身没有
+    user_id 列，任何绕过这个 join 的查询都会跨用户泄漏。
+
+    返回 (命中列表, 是否还有更多)。每条命中带会话标题与正文片段，
+    前端据此渲染结果行并跳到对应消息。
+    """
+    q = (query or "").strip()
+    if not q:
+        return [], False
+    # LIKE 里的 % / _ 是通配符；用户搜 "50%" 或 "a_b" 时必须当字面量，
+    # 否则会命中无关内容。先转义反斜杠本身，再转义两个通配符。
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    like = f"%{escaped}%"
+    sql = (
+        "SELECT m.id, m.session_id, m.role, m.content, m.created_at, "
+        "       s.title AS session_title, s.updated_at AS session_updated_at "
+        "FROM messages m JOIN sessions s ON s.id = m.session_id "
+        "WHERE s.user_id = ? AND s.archived = 0 AND m.role IN ('user','assistant') "
+        "  AND m.content LIKE ? ESCAPE '\\'"
+    )
+    params: list[Any] = [user_id, like]
+    if session_id:
+        sql += " AND m.session_id = ?"
+        params.append(session_id)
+    sql += " ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?"
+    params.append(limit + 1)
+
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(sql, params)
+        rows = await cur.fetchall()
+
+    has_more = len(rows) > limit
+    hits: list[dict[str, Any]] = []
+    for r in rows[:limit]:
+        d = dict(r)
+        snippet, offset = _snippet(d.get("content") or "", q)
+        hits.append({
+            "message_id": d["id"],
+            "session_id": d["session_id"],
+            "session_title": d.get("session_title") or "新会话",
+            "role": d["role"],
+            "snippet": snippet,
+            # 片段内命中起点（-1 表示片段里不含原样关键词，前端不高亮）。
+            "match_offset": offset,
+            "match_length": len(q),
+            "created_at": d["created_at"],
+            "session_updated_at": d.get("session_updated_at") or 0,
+        })
+    return hits, has_more
+
+
 async def mark_stale_streaming_stopped(session_id: str) -> int:
     """把某会话内遗留的 assistant streaming 消息收敛为 stopped（调用方需自行确认无活跃生成）。"""
     async with aiosqlite.connect(DB_PATH) as conn:
