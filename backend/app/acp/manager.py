@@ -85,6 +85,11 @@ _STDERR_SETTLE_SLEEP_S = 0.02
 # ga_wait 的 result_preview 长度。
 _PREVIEW_CHARS = 400
 
+# ga_result 的默认读取上限。与 tool_budget.DEFAULT_MAX_RESULT_CHARS 对齐：
+# 比它更小没有意义（预算层还要再截一次），更大会让单条工具结果挤占上下文。
+# 真机事故前是 20000，模型经常读到半截还不知道全文多少。
+_DEFAULT_RESULT_MAX_CHARS = 50_000
+
 # 终态：进入后 manager 不再改写状态（spec §9.2）。
 _TERMINAL_STATUSES = frozenset({"completed", "errored", "stopped"})
 
@@ -387,14 +392,44 @@ class AcpSessionManager:
         self,
         agent_id: str,
         *,
-        max_chars: int = 20000,
+        max_chars: int = _DEFAULT_RESULT_MAX_CHARS,
         full: bool = False,
         close: bool = False,
+        force_close: bool = False,
     ) -> dict[str, Any]:
-        """读结果；``full=True`` 取全量文本，``close=True`` 顺手释放打开名额。"""
-        entry = self._session_or_raise(agent_id)
+        """读结果；``full=True`` 取全量文本，``close=True`` 顺手释放打开名额。
+
+        两条防事故规则（2026-11-11 真机事故后加）：
+
+        1. **截断与关闭互斥**：结果会被截断时拒绝 ``close``，否则等于"没读完就
+           销毁"——真机上模型传了 ``close=true, max_chars=8000`` 而全文 13223 字符，
+           之后想再读只拿到 ``KeyError: 未知的 GA 会话``。要关就先读全，
+           或显式传 ``force_close=true``（见 tools 层）。
+        2. **关闭后仍可读**：结果落库，``_session_or_raise`` 查不到内存会话时
+           回落到持久化层，返回 ``source="db"``。
+        """
+        limit = max(0, int(max_chars))
+        entry = self._entries.get(agent_id)
+
+        if entry is None:
+            # 内存里没有：可能是上一轮/已关闭的会话，从落库结果里取。
+            stored = await self._load_persisted(agent_id)
+            if stored is None:
+                raise KeyError(f"未知的 GA 会话: {agent_id}")
+            return self._persisted_payload(stored, limit=limit, full=full, close=close)
+
         snap = entry.session.snapshot()
         text = snap["full_text"] if full else snap["result"]
+        truncated = bool(limit and len(text) > limit)
+
+        if truncated and close and not force_close:
+            # 绝不静默销毁没读完的结果：明确报错，让调用方先读全。
+            raise ValueError(
+                f"拒绝关闭：结果会被截断到 {limit} 字符，而全文 {len(text)} 字符。"
+                "关闭会永久销毁未读部分。请先调大 max_chars（或传 full=true）读完，"
+                "再单独用 ga_result(close=true) 关闭；确实要丢弃剩余部分就传 force_close=true。"
+            )
+
         payload: dict[str, Any] = {
             "agent_id": snap["agent_id"],
             "status": snap["status"],
@@ -403,9 +438,9 @@ class AcpSessionManager:
             "stop_reason": self._stop_reasons.get(agent_id, ""),
             "tool_calls": snap["tool_calls"],
             "error": snap["error"],
+            "source": "live",
         }
-        limit = max(0, int(max_chars))
-        if limit and len(text) > limit:
+        if truncated:
             payload["result"] = text[:limit]
             payload["truncated"] = True
             payload["result_chars"] = len(text)
@@ -413,6 +448,10 @@ class AcpSessionManager:
                 f"结果已截断到 {limit} 字符（全文 {len(text)} 字符）；"
                 "需要全文请传 full=true 或调大 max_chars"
             )
+
+        # 落库：关闭后仍能读回（同一 agent_id）。失败不影响本次返回。
+        await self._persist_result(agent_id, snap)
+
         if close:
             # 关会话会把仍在跑的 prompt 收敛成终态；但已有的终态（例如正常
             # completed）不能被关闭动作降级成 stopped（spec §9.2：终态只进一次）。
@@ -544,10 +583,19 @@ class AcpSessionManager:
             session.status = "stopped"
 
     async def _close_session(self, agent_id: str) -> None:
-        """停掉并释放一条会话（``ga_result close=true`` / 超限回收用）。"""
+        """停掉并释放一条会话（``ga_result close=true`` / 超限回收用）。
+
+        关闭前先把结果落库，保证「关了就再也读不到」这种事不会发生
+        （2026-11-11 真机事故的直接修复）。
+        """
         entry = self._entries.get(agent_id)
         if entry is None:
             return
+        # 先落库再销毁：即使后面 close 抛错，结果也已经保住。
+        try:
+            await self._persist_result(agent_id, entry.session.snapshot())
+        except Exception as exc:  # noqa: BLE001 - 落库失败不该阻止关闭
+            logger.warning("GA 结果落库失败（agent_id=%s）：%s", agent_id, exc)
         await self._stop_entry(entry)
         try:
             await entry.session.close()
@@ -556,6 +604,69 @@ class AcpSessionManager:
             self._sessions.pop(agent_id, None)
             self._stop_reasons.pop(agent_id, None)
             await _quietly(unregister(entry.lease))
+
+    # ------------------------------------------------------------ 结果持久化
+
+    async def _persist_result(self, agent_id: str, snap: dict[str, Any]) -> None:
+        """把一次快照写到 ``ga_runs``。调用方可忽略失败（只影响关闭后补读）。"""
+        try:
+            from . import store as ga_store
+        except Exception:  # pragma: no cover - 模块缺失时降级为「不落库」
+            return
+        await ga_store.save_result(
+            agent_id,
+            user_id=self.ctx.user_id,
+            session_id=self.ctx.session_id,
+            generation_id=self.ctx.generation_id,
+            status=str(snap.get("status") or ""),
+            result_text=str(snap.get("result") or ""),
+            full_text=str(snap.get("full_text") or ""),
+            error=str(snap.get("error") or ""),
+            stop_reason=self._stop_reasons.get(agent_id, ""),
+            tool_calls=int(snap.get("tool_calls") or 0),
+            prompts=int(snap.get("prompts") or 0),
+        )
+
+    async def _load_persisted(self, agent_id: str) -> dict[str, Any] | None:
+        """内存里没有会话时，从 ``ga_runs`` 读回快照（关闭后补读的路径）。"""
+        try:
+            from . import store as ga_store
+        except Exception:
+            return None
+        try:
+            return await ga_store.load_result(agent_id)
+        except Exception as exc:  # noqa: BLE001 - 读失败按「不存在」处理
+            logger.warning("GA 结果读取失败（agent_id=%s）：%s", agent_id, exc)
+            return None
+
+    def _persisted_payload(
+        self, stored: dict[str, Any], *, limit: int, full: bool, close: bool
+    ) -> dict[str, Any]:
+        """把落库行拼成与 ``ga_result`` 一致的结构，并标注 ``source="db"``。"""
+        text = str(stored.get("full_text") or "") if full else str(
+            stored.get("result_text") or ""
+        )
+        payload: dict[str, Any] = {
+            "agent_id": stored.get("agent_id", ""),
+            "status": stored.get("status", ""),
+            "prompts": int(stored.get("prompts") or 0),
+            "result": text,
+            "stop_reason": stored.get("stop_reason", ""),
+            "tool_calls": int(stored.get("tool_calls") or 0),
+            "error": stored.get("error", ""),
+            # 明确区分来源：live = 本次进程内的会话，db = 已关闭会话的历史快照
+            "source": "db",
+            "closed": True,
+        }
+        if limit and len(text) > limit:
+            payload["result"] = text[:limit]
+            payload["truncated"] = True
+            payload["result_chars"] = len(text)
+            payload["note"] = (
+                f"结果已截断到 {limit} 字符（全文 {len(text)} 字符）；"
+                "需要全文请传 full=true 或调大 max_chars"
+            )
+        return payload
 
     def _check_open_cap(self) -> None:
         cap = max(1, int(self.settings.max_open_user))

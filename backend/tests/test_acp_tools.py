@@ -85,8 +85,11 @@ def test_wait_defaults():
 def test_result_close_flag():
     mgr = FakeManager()
     run(tools_of(mgr)["ga_result"].call({"agent_id": "ga_x", "close": True, "full": True}))
+    # 默认上限 50000：与 tool_budget.DEFAULT_MAX_RESULT_CHARS 对齐
+    # （原 20000 太小，真机上出现过「读到半截还不知道全文多少」的事故）。
     assert mgr.calls[0] == ("result", "ga_x",
-                            {"max_chars": 20000, "full": True, "close": True})
+                            {"max_chars": 50000, "full": True, "close": True,
+                             "force_close": False})
 
 
 def test_tool_errors_become_readable_text():
@@ -107,7 +110,8 @@ def test_result_close_string_false_is_false():
     run(tools_of(mgr)["ga_result"].call(
         {"agent_id": "ga_x", "close": "false", "full": "0"}))
     assert mgr.calls[0] == ("result", "ga_x",
-                            {"max_chars": 20000, "full": False, "close": False})
+                            {"max_chars": 50000, "full": False, "close": False,
+                             "force_close": False})
 
 
 def test_serialization_failure_becomes_readable_text():

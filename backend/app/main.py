@@ -38,6 +38,12 @@ async def lifespan(app: FastAPI):
         await subagent_store.mark_stale_running_as_errored("server restart")
     except Exception:
         pass
+    # GA 会话结果快照表：关闭后仍能补读（2026-11-11 事故后加）。
+    try:
+        from .acp import store as ga_store
+        await ga_store.init_tables()
+    except Exception:
+        pass
     # Team facts + generation leases. Recover every active lease left by the
     # previous process before accepting requests, otherwise a single stale row
     # would block that session forever.

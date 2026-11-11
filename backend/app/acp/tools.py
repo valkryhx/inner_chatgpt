@@ -23,7 +23,13 @@ _SPAWN_DESC = (
 )
 
 _WAIT_DESC = "等待 GA 完成。超时只表示还在跑，不会终止它。"
-_RESULT_DESC = "读取 GA 的最终答复与工具调用统计。"
+_RESULT_DESC = (
+    "读取 GA 的最终答复与工具调用统计。\n"
+    "  - 默认上限 50000 字符；不够就读不全，会明确告诉你全文多少字符。\n"
+    "  - close=true 与截断互斥：结果会被截断时拒绝关闭，避免「没读完就销毁」。\n"
+    "    要关就先读全，或显式传 force_close=true 丢弃剩余部分。\n"
+    "  - 已关闭的会话仍可读（结果落库），返回 source=\"db\"。"
+)
 _SEND_DESC = "对同一 GA 会话追加指令（一次只能有一个进行中的 prompt）。"
 _STOP_DESC = "停止 GA（先发 session/cancel，2 秒后强制结束进程树）。"
 
@@ -97,11 +103,15 @@ def build_acp_tools(manager: AcpSessionManager) -> list[Tool]:
             agent_id = _agent_id(args)
             if not agent_id:
                 raise ValueError("agent_id 不能为空")
+            # force_close 是逃生口：只有当调用方明确知道剩余部分可以丢弃时才用。
+            # 正常路径下「截断 + close」会被 manager 拒绝（见 _RESULT_DESC）。
+            force_close = _as_bool(args.get("force_close", False))
             out = await manager.result(
                 agent_id,
-                max_chars=int(args.get("max_chars", 20000) or 20000),
+                max_chars=int(args.get("max_chars", 50000) or 50000),
                 full=_as_bool(args.get("full", False)),
                 close=_as_bool(args.get("close", False)),
+                force_close=force_close,
             )
             return _dumps(out)
         except Exception as e:  # noqa: BLE001
@@ -177,14 +187,23 @@ def build_acp_tools(manager: AcpSessionManager) -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "agent_id": {"type": "string"},
-                    "max_chars": {"type": "integer", "description": "默认 20000"},
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "默认 50000；超限会截断并告知全文长度",
+                    },
                     "full": {
                         "type": "boolean",
                         "description": "默认 false；true 取全量文本而不是最终答复",
                     },
                     "close": {
                         "type": "boolean",
-                        "description": "默认 false；true 读完顺手释放打开会话名额",
+                        "description": "默认 false；true 读完顺手释放打开会话名额。"
+                                       "结果会被截断时会被拒绝（防没读完就销毁）",
+                    },
+                    "force_close": {
+                        "type": "boolean",
+                        "description": "默认 false；即使结果被截断也强制关闭。"
+                                       "只在确定剩余内容可以丢弃时使用",
                     },
                 },
                 "required": ["agent_id"],
