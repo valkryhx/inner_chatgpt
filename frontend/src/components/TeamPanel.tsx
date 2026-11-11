@@ -17,6 +17,37 @@ const TASK_LABEL: Record<TeamTaskStatus, string> = {
   cancelled: '已取消',
 }
 
+/** 提示用户「怎么说话才会建 Team」。
+ *
+ * 为什么需要：模型是靠提示词在 spawn_agent（一次执行）和
+ * task_create + spawn_teammate（持久任务板）之间做选择，
+ * 用户说「派两个 sub」几乎总会走前者。这不写在界面上，
+ * 用户只能靠猜——所以把关键词直接摆在标题旁边。
+ */
+const TEAM_KEYWORDS = [
+  '建个任务板',
+  '拆成 N 个任务',
+  '我要看到进度',
+  '任务 A 完成后再做 B',
+]
+
+/** 关键词提示块：标题行与空状态共用，避免两处文案分叉。 */
+function TeamHint() {
+  return (
+    <div className="team-hint">
+      <p className="team-hint-lead">
+        说这些词会建 Team（有任务板、能看进度、可跨轮）：
+      </p>
+      <ul className="team-hint-list">
+        {TEAM_KEYWORDS.map((k) => <li key={k}>「{k}」</li>)}
+      </ul>
+      <p className="team-hint-foot">
+        说「派两个子代理」只会起 <code>subagent</code>：一次性执行，无任务板。
+      </p>
+    </div>
+  )
+}
+
 /** 面板一次最多渲染多少行；超出必须显式告知，不能静默截断 */
 const ROW_LIMIT = 200
 
@@ -86,6 +117,8 @@ function TaskCard({ task }: { task: TeamTask }) {
 
 export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop }: Props) {
   const [tab, setTab] = useState<'tasks' | 'messages' | 'events'>('tasks')
+  // 关键词提示默认收起：它只帮"不知道怎么触发"的用户，不该占常驻空间。
+  const [hintOpen, setHintOpen] = useState(false)
   const tasks = snapshot?.tasks || []
   const messages = snapshot?.messages || []
   const events = snapshot?.events || []
@@ -128,6 +161,15 @@ export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop 
                 {starting && (
                   <span className="team-starting-tail" aria-live="polite">[正在启动...]</span>
                 )}
+                <button
+                  type="button"
+                  className="team-hint-toggle"
+                  onClick={() => setHintOpen((v) => !v)}
+                  aria-expanded={hintOpen}
+                  title="如何让 Hlaudz 建立 Agent Team"
+                >
+                  {hintOpen ? '收起' : '怎么触发？'}
+                </button>
               </div>
             </div>
             {streaming && onStop && (
@@ -143,10 +185,25 @@ export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop 
             )}
           </header>
 
+          {/* 提示放在 header 外面：header 是横向 flex，右侧还有 status/停止按钮，
+              放里面只能拿到一半宽度，文字会挤成窄条。 */}
+          {hintOpen && <div className="team-hint-wrap"><TeamHint /></div>}
+
           {!team ? (
             !starting && (
               <div className="team-content team-content-idle">
                 <p className="team-idle-hint">发送消息后，Lead 会自动建立本轮 Agent Team。</p>
+                {/* 这里只做引导，不复制提示块：提示块由标题旁的按钮统一控制，
+                    两处各渲染一份会让同一个提示出现两次。 */}
+                {!hintOpen && (
+                  <p className="team-idle-hint team-idle-hint-sub">
+                    不确定怎么说？点标题旁的
+                    <button type="button" className="team-hint-toggle team-hint-inline"
+                            onClick={() => setHintOpen(true)}>
+                      怎么触发？
+                    </button>
+                  </p>
+                )}
               </div>
             )
           ) : (

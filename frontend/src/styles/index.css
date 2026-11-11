@@ -833,13 +833,50 @@ textarea, input { caret-color: var(--clay); }
   font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase;
   color: var(--muted); font-weight: 700;
 }
-.team-heading { min-width: 0; }
+/* 标题列占满剩余宽度（原 min-width:0 会让它在 flex 里被右侧 status 挤得很窄，
+   展开提示时文字只能排成一窄条）。 */
+.team-heading { flex: 1 1 auto; min-width: 0; }
 .team-title-row { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
 .team-head h2 { margin: 3px 0 0; font-size: 16px; line-height: 1.3; font-weight: 650; }
 .team-starting-tail {
   flex-shrink: 0; color: var(--muted); opacity: .78;
   font-size: 9.5px; font-weight: 450; letter-spacing: .01em;
   white-space: nowrap;
+}
+/* 「怎么触发」提示：小字、次要、默认收起。
+   作用是让用户知道该说什么词才会建 Team，而不是去猜。 */
+.team-hint-toggle {
+  flex-shrink: 0; margin-left: auto;
+  border: none; background: transparent; padding: 0;
+  color: var(--muted); opacity: .72;
+  font-size: 9.5px; font-weight: 500; letter-spacing: .01em;
+  text-decoration: underline; text-decoration-style: dotted;
+  text-underline-offset: 2px; cursor: pointer;
+  white-space: nowrap;
+  transition: opacity 120ms var(--ease), color 120ms var(--ease);
+}
+.team-hint-toggle:hover { opacity: 1; color: var(--ink-2); }
+/* 提示块的外壳：占满面板宽度（它不在横向 flex 的 header 里）。 */
+.team-hint-wrap { padding: 0 16px; }
+.team-hint {
+  margin-top: 8px; padding: 8px 10px;
+  background: var(--canvas); border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 10.5px; line-height: 1.65; color: var(--ink-2);
+}
+.team-hint-lead { margin: 0 0 5px; }
+.team-hint-list {
+  margin: 0 0 6px; padding-left: 14px;
+  color: var(--ink-2);
+}
+.team-hint-list li { margin: 1px 0; }
+.team-hint-foot {
+  margin: 0; color: var(--muted); opacity: .85;
+  padding-top: 5px; border-top: 1px dashed var(--line);
+}
+.team-hint code {
+  padding: 0 3px; border-radius: 3px;
+  background: var(--surface-2); font-size: 10px;
 }
 .team-stop-btn {
   margin-left: auto; flex-shrink: 0;
@@ -877,6 +914,11 @@ textarea, input { caret-color: var(--clay); }
 .team-idle-hint {
   margin: 0; color: var(--muted); font-size: 10.5px; line-height: 1.6;
   opacity: .78;
+}
+.team-idle-hint-sub { margin-top: 6px; }
+/* 嵌在正文小字里的按钮：跟着正文排版，不要变成独立控件 */
+.team-hint-inline {
+  margin-left: 3px; font-size: 10.5px; opacity: .85;
 }
 .team-empty {
   padding: 26px 14px; text-align: center; color: var(--muted);
