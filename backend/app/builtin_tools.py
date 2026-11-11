@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .run_guard import WORKSPACE_PYTHON_GUARD, protected_code_reason, workspace_env
+from .run_guard import guard_argv, protected_code_reason, shell_code_reason, workspace_env
 from .skill_store import load_skill_content
 from .file_search import file_glob as _file_glob, file_grep as _file_grep
 from .tools import Tool
@@ -225,13 +225,25 @@ async def _run_code_impl(
     lease = ProcessLease(user_id, session_id, generation_id, agent_id)
     try:
         if code_type in ("python", "py"):
-            fd, tmp_path = tempfile.mkstemp(suffix=".ai.py", prefix="inner_")
+            # 脚本落在 workspace/.tmp 里，而不是系统临时目录：
+            # 守卫要求「脚本本身可读」，若放在系统 Temp 就得把整个 Temp 加入
+            # 可读根（那是共享目录，不该放行）。
+            script_dir = cwd / ".tmp"
+            script_dir.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(suffix=".ai.py", prefix="inner_",
+                                            dir=str(script_dir))
             os.close(fd)
             with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(code)
-            cmd = [sys.executable, "-X", "utf8", "-u", "-c",
-                   WORKSPACE_PYTHON_GUARD, tmp_path, str(cwd)]
+            # 可读根显式传给孩子进程：与 file_read 共用同一份定义，
+            # 否则「file_read 能读、code_run 不能读」会在两个方向都变成缺陷。
+            cmd = guard_argv(tmp_path, cwd, user_id=user_id)
         elif code_type in ("powershell", "ps1", "pwsh", "bash", "sh", "shell"):
+            # shell 不加载我们的审计钩子，只能静态拦明显的越界访问。
+            # 这是已知弱项，宁可拒绝得保守一点。
+            shell_blocked = shell_code_reason(code)
+            if shell_blocked:
+                return _err(f"shell 分支限制：{shell_blocked}")
             cmd = (["powershell", "-NoProfile", "-NonInteractive", "-Command", code]
                    if os.name == "nt" else ["bash", "-c", code])
         else:
@@ -251,7 +263,7 @@ async def _run_code_impl(
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env=workspace_env(cwd),
+                env=workspace_env(cwd, user_id=user_id),
                 **kwargs,
             )
             lease.proc = proc
