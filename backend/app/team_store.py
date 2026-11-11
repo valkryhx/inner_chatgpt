@@ -399,8 +399,27 @@ async def create_task(scope: TeamScope, *, subject: str, description: str = "",
     task_id = new_id("task")
     ts = now_ms()
     blocked = [str(x) for x in (blocked_by or []) if str(x)]
+    clean_subject = subject.strip()
     async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
+        # 幂等：同一团队里已有同名且未完成的任务时复用，而不是再插一行。
+        # 模型很容易因为「上一步返回失败」而重做整段计划（真机 runId
+        # 125016-824c 里 reclaim 误报 conflict，lead 就重新创建了 2 个任务，
+        # 任务板上多出两行没人认领的僵尸任务）。平台按 subject 去重，
+        # 既保住任务板卫生，也避免同一个任务被两拨人各做一遍。
+        where, where_args = _scope_where(scope)
+        cur = await conn.execute(
+            f"SELECT * FROM team_tasks WHERE {where} AND subject=? "
+            "AND status IN ('pending','in_progress') ORDER BY created_at ASC LIMIT 1",
+            (*where_args, clean_subject),
+        )
+        existing = await cur.fetchone()
+        if existing is not None:
+            team_event("task_create_deduped", task_id=existing["task_id"],
+                       actor=scope.agent_id, team_id=scope.team_id,
+                       subject=clean_subject[:80])
+            return dict(existing)
         for dep in blocked:
             cur = await conn.execute(
                 "SELECT 1 FROM team_tasks WHERE task_id=? AND user_id=? AND session_id=? "
@@ -553,6 +572,21 @@ async def reclaim_task(scope: TeamScope, task_id: str, *, expected_version: int)
     where, args = _scope_where(scope)
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
+        # 幂等：任务本来就是 pending 且无人认领时，reclaim 的目标状态已经达成，
+        # 直接返回成功。以前这里会落到下面的 CAS 失败分支返回 "conflict"，
+        # 模型据此以为"释放失败"，于是**重新创建一个同名任务**，任务板上留下
+        # 重复行（真机 runId 125016-824c 就这样多出 2 个僵尸任务）。
+        cur = await conn.execute(
+            f"SELECT status, owner_agent_id, version FROM team_tasks "
+            f"WHERE task_id=? AND {where}",
+            (task_id, *args),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return {"ok": False, "reason": "not_found"}
+        if str(row[0] or "") == "pending" and not str(row[1] or ""):
+            task = await get_task(scope, task_id)
+            return {"ok": True, "task": task, "already_released": True}
         cur = await conn.execute(
             f"UPDATE team_tasks SET status='pending',owner_agent_id='',version=version+1,updated_at=? "
             f"WHERE task_id=? AND {where} AND status='in_progress' AND version=?",
