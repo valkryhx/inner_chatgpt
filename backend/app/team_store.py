@@ -7,6 +7,7 @@ subagent run is one execution attempt.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from typing import Any, Optional
@@ -19,6 +20,44 @@ from .scope import TeamScope
 TERMINAL_TASK_STATUSES = frozenset({"completed", "cancelled"})
 TASK_STATUSES = frozenset({"pending", "in_progress", "completed", "cancelled"})
 TEAM_STATUSES = frozenset({"active", "completed", "stopped", "failed", "stale"})
+
+# 消息投递状态：queued -> delivered -> consumed；held/dropped 是非正常路径。
+# 参考 CC319 的 receipt 状态机（m0188）与 GA 的 mailbox state 字段。
+MESSAGE_STATES = frozenset({"queued", "delivered", "consumed", "held", "dropped"})
+
+# lead 的多种写法都要落到同一个收件箱。模型会写 lead / root / main / team-lead，
+# 内部 agent_id 却是 "root"；不归一化就会出现「发给 lead」和「root 收件箱」两个篮子。
+LEAD_ALIASES = frozenset({"lead", "root", "main", "team-lead", "team_lead"})
+LEAD_AGENT_ID = "root"
+SUBAGENT_PREFIX = "sub:"
+
+_AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,31}$")
+
+
+def normalize_agent_id(raw: str | None) -> str:
+    """把任意写法的收件人归一到内部 agent_id。
+
+    lead/root/main/team-lead -> "root"；poet / sub:poet / sub:poet_2 -> "sub:<name>"。
+    空值与非法名字返回空串，由调用方决定是拒绝还是兜底——本函数不做策略判断。
+    """
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    if text in LEAD_ALIASES:
+        return LEAD_AGENT_ID
+    if text.startswith(SUBAGENT_PREFIX):
+        name = text[len(SUBAGENT_PREFIX):]
+    else:
+        name = text
+    # 去掉模型可能带上的路径/斜杠写法（/root/poet）
+    name = name.replace(chr(92), "/").rstrip("/").split("/")[-1]
+    return SUBAGENT_PREFIX + name if name else ""
+
+
+def agent_name_of(agent_id: str) -> str:
+    """内部 agent_id -> 裸名（用于 roster 查找与展示）。"""
+    text = str(agent_id or "")
+    return text[len(SUBAGENT_PREFIX):] if text.startswith(SUBAGENT_PREFIX) else text
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS team_runs (
@@ -80,12 +119,23 @@ CREATE TABLE IF NOT EXISTS team_messages (
     content             TEXT NOT NULL,
     created_at          INTEGER NOT NULL,
     delivered_at        INTEGER NOT NULL DEFAULT 0,
-    read_at             INTEGER NOT NULL DEFAULT 0
+    read_at             INTEGER NOT NULL DEFAULT 0,
+    state               TEXT NOT NULL DEFAULT 'queued'
 );
 CREATE INDEX IF NOT EXISTS idx_team_messages_scope
     ON team_messages(user_id, session_id, generation_id, team_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_team_messages_recipient
     ON team_messages(team_id, recipient_agent_id, read_at);
+
+-- 名字钉住（CC319 的 sendMessagePins / GA 的 name_pins）：一个名字第一次送达时
+-- 绑定到那个 agent。名字被复用后，旧名字的消息不能默默投给新 agent，否则就是串名。
+CREATE TABLE IF NOT EXISTS team_name_pins (
+    team_id     TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    agent_id    TEXT NOT NULL,
+    pinned_at   INTEGER NOT NULL,
+    PRIMARY KEY (team_id, name)
+);
 
 CREATE TABLE IF NOT EXISTS team_events (
     team_id       TEXT NOT NULL,
@@ -131,6 +181,18 @@ async def init_tables() -> None:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute("PRAGMA foreign_keys=ON;")
         await conn.executescript(_SCHEMA)
+        # 旧库迁移：team_messages 增加投递状态列（幂等）。已有行按 read_at 回填，
+        # 否则升级后所有历史消息都会被当成「未投递」重放一遍。
+        try:
+            await conn.execute(
+                "ALTER TABLE team_messages ADD COLUMN state TEXT NOT NULL DEFAULT 'queued'")
+            await conn.execute(
+                "UPDATE team_messages SET state='consumed' WHERE read_at>0")
+            await conn.execute(
+                "UPDATE team_messages SET state='delivered' "
+                "WHERE read_at=0 AND delivered_at>0")
+        except Exception:
+            pass
         await conn.commit()
 
 
@@ -422,6 +484,16 @@ async def _deps_complete(conn: aiosqlite.Connection, scope: TeamScope, task_id: 
     return (await cur.fetchone()) is None
 
 
+async def task_is_blocked(scope: TeamScope, task_id: str) -> bool:
+    """True when ``task_id`` still has an incomplete ``blocked_by`` dependency.
+
+    Public so callers can refuse *before* doing expensive work (e.g. spawning a
+    teammate that would only be torn down again once the bind is rejected).
+    """
+    async with aiosqlite.connect(DB_PATH) as conn:
+        return not await _deps_complete(conn, scope, task_id)
+
+
 async def claim_task(scope: TeamScope, task_id: str, *, expected_version: int) -> dict[str, Any]:
     where, args = _scope_where(scope)
     async with aiosqlite.connect(DB_PATH) as conn:
@@ -486,9 +558,18 @@ async def reclaim_task(scope: TeamScope, task_id: str, *, expected_version: int)
 
 async def bind_task_owner(scope: TeamScope, task_id: str, owner_agent_id: str, *,
                           expected_version: int) -> dict[str, Any]:
+    """Assign a pending task to an agent, refusing one whose blockers are open.
+
+    ``claim_task`` has always checked ``blocked_by``; this path did not, which
+    made dependencies advisory: ``spawn_teammate(team_task_id=...)`` bound a
+    blocked task and ran it early. Both assignment paths must share the rule,
+    otherwise "blocked" only means "blocked if you happen to use task_update".
+    """
     where, args = _scope_where(scope)
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
+        if not await _deps_complete(conn, scope, task_id):
+            return {"ok": False, "reason": "blocked"}
         cur = await conn.execute(
             f"UPDATE team_tasks SET status='in_progress',owner_agent_id=?,version=version+1,updated_at=? "
             f"WHERE task_id=? AND {where} AND status='pending' AND owner_agent_id='' AND version=?",
@@ -508,20 +589,30 @@ async def bind_task_owner(scope: TeamScope, task_id: str, owner_agent_id: str, *
 # ---------------- messages ----------------
 async def send_message(scope: TeamScope, *, recipient: str, kind: str,
                        content: str) -> dict[str, Any]:
+    """Enqueue one message row.
+
+    ``recipient`` is normalized to an internal agent id here rather than at the
+    call site: every writer (lead tools, teammate tools, retries) must land in
+    the same inbox, and a bare name and ``sub:``-prefixed name are the same
+    agent. Leaving that to callers is exactly how a message gets stored under
+    ``poet`` while the worker polls ``sub:poet`` and never sees it.
+    """
     mid = new_id("tmsg")
     ts = now_ms()
+    target = normalize_agent_id(recipient) or str(recipient or "").strip()
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute(
             "INSERT INTO team_messages(message_id,team_id,user_id,session_id,generation_id,"
-            "sender_agent_id,recipient_agent_id,kind,content,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "sender_agent_id,recipient_agent_id,kind,content,created_at,state) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,'queued')",
             (mid, scope.team_id, scope.user_id, scope.session_id, scope.generation_id,
-             scope.agent_id, recipient, kind or "note", content, ts),
+             scope.agent_id, target, kind or "note", content, ts),
         )
         await conn.commit()
     msg = {"message_id": mid, "team_id": scope.team_id,
-           "sender_agent_id": scope.agent_id, "recipient_agent_id": recipient,
-           "kind": kind or "note", "content": content, "created_at": ts}
+           "sender_agent_id": scope.agent_id, "recipient_agent_id": target,
+           "kind": kind or "note", "content": content, "created_at": ts,
+           "delivered_at": 0, "read_at": 0, "state": "queued"}
     await emit_event(scope, "team_message", {"message": msg})
     return msg
 
@@ -549,11 +640,141 @@ async def mark_message_read(scope: TeamScope, message_id: str) -> bool:
     where, args = _scope_where(scope)
     async with aiosqlite.connect(DB_PATH) as conn:
         cur = await conn.execute(
-            f"UPDATE team_messages SET read_at=? WHERE message_id=? AND {where} AND read_at=0",
+            f"UPDATE team_messages SET read_at=?, state='consumed' "
+            f"WHERE message_id=? AND {where} AND read_at=0",
             (now_ms(), message_id, *args),
         )
         await conn.commit()
         return (cur.rowcount or 0) == 1
+
+
+async def consume_inbox(scope: TeamScope, *, limit: int = 20) -> list[dict[str, Any]]:
+    """Take the messages addressed to this agent and mark them consumed.
+
+    This is the delivery step, not a read: the caller is about to inject the
+    returned rows into the agent's next model turn. Marking them in the same
+    transaction that returns them is what makes delivery at-most-once instead
+    of "read forever, inject sometimes".
+
+    Only rows still in ``queued``/``delivered`` are eligible; a crashed consumer
+    therefore re-receives nothing it already acknowledged, which is the same
+    trade-off CC319 makes (``Sze`` prunes consumed rows).
+    """
+    target = normalize_agent_id(scope.agent_id) or scope.agent_id
+    where, args = _scope_where(scope)
+    ts = now_ms()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA busy_timeout=5000;")
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await conn.execute(
+                f"SELECT * FROM team_messages WHERE {where} "
+                "AND recipient_agent_id=? AND state IN ('queued','delivered') "
+                "ORDER BY created_at ASC LIMIT ?",
+                (*args, target, max(1, min(int(limit), 200))),
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+            if rows:
+                ids = [r["message_id"] for r in rows]
+                placeholders = ",".join("?" for _ in ids)
+                await conn.execute(
+                    f"UPDATE team_messages SET read_at=?, delivered_at=CASE "
+                    f"WHEN delivered_at=0 THEN ? ELSE delivered_at END, state='consumed' "
+                    f"WHERE message_id IN ({placeholders}) AND {where}",
+                    (ts, ts, *ids, *args),
+                )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+    for row in rows:
+        row["read_at"] = ts
+        row["delivered_at"] = row.get("delivered_at") or ts
+        row["state"] = "consumed"
+    return rows
+
+
+async def mark_messages_delivered(scope: TeamScope, message_ids: list[str]) -> int:
+    """Best-effort 'delivered' marker for rows that were pushed into a live agent."""
+    ids = [str(x) for x in (message_ids or []) if str(x)]
+    if not ids:
+        return 0
+    where, args = _scope_where(scope)
+    placeholders = ",".join("?" for _ in ids)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            f"UPDATE team_messages SET delivered_at=?, state='delivered' "
+            f"WHERE message_id IN ({placeholders}) AND {where} AND state='queued'",
+            (now_ms(), *ids, *args),
+        )
+        await conn.commit()
+        return cur.rowcount or 0
+
+
+# ---------------- name pins ----------------
+async def pin_name(scope: TeamScope, name: str, agent_id: str) -> dict[str, Any]:
+    """Bind ``name`` to ``agent_id`` on first use; refuse a later rebind.
+
+    Mirrors CC319 ``sendMessagePins`` / GA ``NamePins``. Without this, closing a
+    teammate and spawning another one under the same name makes old messages
+    silently land on the new agent — the classic cross-talk bug.
+    """
+    key = (name or "").strip().lower()
+    agent = normalize_agent_id(agent_id) or str(agent_id or "").strip()
+    if not key or not agent:
+        raise ValueError("name and agent_id are required")
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA busy_timeout=5000;")
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await conn.execute(
+                "SELECT agent_id FROM team_name_pins WHERE team_id=? AND name=?",
+                (scope.team_id, key),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                pinned = str(row["agent_id"])
+                await conn.rollback()
+                if pinned != agent:
+                    raise ValueError(
+                        f"名字 {key!r} 已钉在 {pinned} 上，不能再绑定到 {agent}；"
+                        "请换一个名字或先 close_agent 释放")
+                return {"name": key, "agent_id": pinned, "created": False}
+            await conn.execute(
+                "INSERT INTO team_name_pins(team_id,name,agent_id,pinned_at) VALUES(?,?,?,?)",
+                (scope.team_id, key, agent, now_ms()),
+            )
+            await conn.commit()
+        except ValueError:
+            raise
+        except BaseException:
+            await conn.rollback()
+            raise
+    return {"name": key, "agent_id": agent, "created": True}
+
+
+async def resolve_name(scope: TeamScope, name: str) -> str:
+    """Name -> agent id, honoring an existing pin.
+
+    Unpinned names default to ``sub:<name>`` so a first message to a teammate
+    that has not been pinned yet still lands in the right inbox.
+    """
+    key = (name or "").strip().lower()
+    if not key:
+        return ""
+    if key in LEAD_ALIASES:
+        return LEAD_AGENT_ID
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT agent_id FROM team_name_pins WHERE team_id=? AND name=?",
+            (scope.team_id, key),
+        )
+        row = await cur.fetchone()
+    if row is not None:
+        return str(row[0])
+    return normalize_agent_id(name)
 
 
 async def converge_orphaned_active_teams(user_id: str, session_id: str) -> int:

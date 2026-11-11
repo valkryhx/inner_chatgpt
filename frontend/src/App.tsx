@@ -589,6 +589,14 @@ export default function App() {
             : b,
         )
         patch({ ...assistantMsg, blocks: [...blocks] })
+      } else if (ev.type === 'message_injected') {
+        // 平台注入的团队消息：用户要能看见「有消息进来了」，否则模型突然
+        // 改变行为会显得没有来由。与文本块同序插入，刷新后仍在。
+        const textIn = ev.text || ''
+        if (textIn) {
+          blocks = [...blocks, { type: 'injected_message', text: textIn }]
+          patch({ ...assistantMsg, blocks })
+        }
       } else if (ev.type === 'team_event') {
         setTeamGenerationId(genId)
         setTeamSnapshot((prev) => mergeTeamEvent(prev, ev.event))

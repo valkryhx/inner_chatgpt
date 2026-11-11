@@ -146,8 +146,23 @@ class SubagentHost:
             self._touch()
             runtime = SubagentRuntime(node.ctx, parent_runtime=self.parent_runtime, spec=spec)
             await runtime.build()
+            # 让 teammate 的 send_message 能真的把消息推进父代理队列，
+            # 而不是只写库等父代理自己想起来轮询。
+            runtime.lead_delivery_sink = self.push_team_message
             # steer：每轮模型调用前取出父代理追加的指令
             runtime.loop.message_injector = node.drain_pending
+            # 本轮开始前先把库里积压的收件箱消息取出来（发送时对方恰好不在
+            # 活体队列里，只能靠这一步补投）。
+            if getattr(runtime, "team_host", None) is not None:
+                try:
+                    for row in await runtime.team_host.consume_inbox(limit=20):
+                        node.pending_messages.append({
+                            "role": "user",
+                            "content": f"[来自 {self._sender_label(row)} 的团队消息] "
+                                       f"{row.get('content', '')}",
+                        })
+                except Exception:  # noqa: BLE001 - 补投失败不能拖垮子代理
+                    pass
             node.turns = 0
 
             async def _drive():
@@ -234,7 +249,87 @@ class SubagentHost:
             })
             self._touch()
 
-    # ---------------- notifications ----------------
+    @staticmethod
+    def _sender_label(row: dict[str, Any]) -> str:
+        sender = str(row.get("sender_agent_id") or row.get("sender") or "lead")
+        return sender[4:] if sender.startswith("sub:") else sender
+
+    # ---------------- team message delivery ----------------
+    def deliver_team_message(self, target: str, message: dict[str, Any]) -> dict[str, Any]:
+        """Push one team message into a live agent's pre-turn queue.
+
+        This is the hard-delivery path: a message written by ``send_message`` is
+        handed to the agent's own loop, which injects it before its next model
+        call. Without it, "cooperation" degenerates into the model remembering to
+        call ``list_messages`` — which real runs showed it often does not.
+
+        Address resolution accepts both ``sub:<name>`` and a bare name, because
+        the lead writes the name it saw in ``spawn_teammate``'s reply.
+        """
+        name = str(target or "").strip()
+        if name.startswith("sub:"):
+            name = name[4:]
+        name = name.replace(chr(92), "/").rstrip("/").split("/")[-1].lower()
+        if not name:
+            return {"delivered": False, "reason": "收件人为空"}
+
+        node = self.registry.get(name)
+        if node is None:
+            return {"delivered": False,
+                    "reason": f"没有名为 {name} 的活着的 agent（可能还未 spawn 或已被 close）"}
+        if node.is_terminal:
+            return {"delivered": False,
+                    "reason": f"agent {name} 已结束（{node.status}），"
+                              "消息已入库；需要它继续工作请重新 spawn_agent"}
+
+        sender = str(message.get("sender_agent_id") or message.get("sender") or "lead")
+        sender_label = sender[4:] if sender.startswith("sub:") else sender
+        content = str(message.get("content") or "")
+        node.pending_messages.append({
+            "role": "user",
+            "content": f"[来自 {sender_label} 的团队消息] {content}",
+        })
+        self._touch()
+        return {"delivered": True, "name": name, "agent_id": node.agent_id}
+
+    def push_team_message(self, message: dict[str, Any]) -> None:
+        """Queue a teammate->lead message for the lead's next turn.
+
+        The lead's "inbox" is the notification queue the main loop already drains
+        before every model call, so reusing it keeps one injection point instead
+        of adding a second poller that could disagree about ordering.
+        """
+        sender = str(message.get("sender_agent_id") or message.get("sender") or "")
+        sender_label = sender[4:] if sender.startswith("sub:") else (sender or " teammate")
+        content = str(message.get("content") or "")
+        kind = str(message.get("kind") or "note")
+        item = {
+            "id": uuid.uuid4().hex[:16],
+            "agent": sender_label,
+            "status": f"消息（{kind}）",
+            "result_chars": len(content),
+            "preview": content[:400],
+            "is_message": True,
+        }
+        self._notifications.append(item)
+        self._touch()
+
+    async def deliver_pending_inbox(self, team_host) -> int:
+        """Drain this generation's durable inbox into the live queue, once per turn.
+
+        Used at turn start so a message sent while the agent was between turns is
+        not lost: the sender could not push it (no live task at that instant), but
+        the row is still ``queued`` in the database.
+        """
+        try:
+            rows = await team_host.consume_inbox(limit=20)
+        except Exception:  # noqa: BLE001 - a broken inbox must not fail the turn
+            return 0
+        for row in rows:
+            self.push_team_message(row)
+        return len(rows)
+
+
     async def _notify(self, node: "AgentNode") -> None:
         item = {
             "id": uuid.uuid4().hex[:16],

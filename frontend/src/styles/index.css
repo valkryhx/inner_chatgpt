@@ -1489,3 +1489,48 @@ textarea, input { caret-color: var(--clay); }
 .mcp-state.bad { color: var(--danger); }
 .mcp-state.ok .mcp-dot { background: #4f8a5b; }
 .mcp-state.bad .mcp-dot { background: var(--danger); }
+
+/* 平台注入的团队消息：与用户气泡、模型正文都不混淆，
+   目的只是让用户看到「这条消息改变了模型的下一步」。 */
+.injected-note {
+  margin: 8px 0;
+  border-left: 2px solid var(--line-strong);
+  padding-left: 10px;
+}
+.injected-note-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  width: 100%;
+  border: none;
+  background: transparent;
+  padding: 2px 0;
+  text-align: left;
+  cursor: pointer;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.injected-note-mark { color: var(--ink-3); }
+.injected-note-label {
+  flex: none;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.injected-note-preview {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-3);
+}
+.injected-note-caret { flex: none; color: var(--ink-3); }
+.injected-note-body {
+  margin: 4px 0 0;
+  padding: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  white-space: pre-wrap;
+}

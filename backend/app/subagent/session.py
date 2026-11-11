@@ -118,7 +118,24 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
     def _team_event(ev: dict[str, Any]) -> None:
         buffer.put({"type": "team_event", "event": ev})
 
-    team_host = TeamHost(team_scope, event_sink=_team_event)
+    def _deliver(message: dict[str, Any]) -> dict[str, Any]:
+        """Route a just-stored team message to whichever side is alive.
+
+        Lead -> teammate goes to that child's pre-turn queue; teammate -> lead
+        goes to the lead's notification queue.  Doing this here (rather than
+        leaving it to the model to call ``list_messages``) is what makes
+        collaboration a platform guarantee instead of a model habit.
+        """
+        recipient = str(message.get("recipient_agent_id") or "")
+        sender = str(message.get("sender_agent_id") or "")
+        if team_store.normalize_agent_id(recipient) == team_store.LEAD_AGENT_ID:
+            if sender and team_store.normalize_agent_id(sender) != team_store.LEAD_AGENT_ID:
+                host.push_team_message(message)
+                return {"delivered": True, "name": team_store.LEAD_AGENT_ID}
+            return {"delivered": False, "reason": "lead 给自己发的消息不需要投递"}
+        return host.deliver_team_message(recipient, message)
+
+    team_host = TeamHost(team_scope, event_sink=_team_event, deliver_sink=_deliver)
 
     async def _spawn_teammate(**kwargs: Any) -> dict[str, Any]:
         return await host.spawn(
@@ -129,9 +146,19 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
             role="teammate",
         )
 
+    async def _close_teammate(name: str) -> None:
+        """撤销一次派活（绑定被拒时用），确保不留孤儿 agent 占着槽位。"""
+        if not (name or "").strip():
+            return
+        try:
+            await host.close(name)
+        except Exception:  # noqa: BLE001 - 清理失败不应掩盖真实的拒绝原因
+            pass
+
     if policy_level == POLICY_FULL:
         for t in build_lead_tools(team_host, spawn_fn=_spawn_teammate):
             merged.add(t)
+        team_host._close_fn = _close_teammate
 
     # Teammate has its own TeamHost instance.  Mirror durable events produced by
     # teammate tools into the lead's SSE queue whenever the lead invokes any team
@@ -203,6 +230,29 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
     # 3) 独立的 AgentLoop：**必须挂主对话的 history_store**，
     #    否则主对话的 assistant/tool 消息不会落 session_history，下一轮上下文就丢了。
     #    （子代理用独立的侧链表，与这里无关。）
+    def _lead_injector():
+        """Lead 的注入点：团队收件箱 + 子代理结束通知。
+
+        收件箱从数据库「消费」（一次标记 consumed，不会重复注入），通知走内存队列。
+        两者都在每轮模型调用前合并注入，这样 teammate 发来的消息不依赖模型主动
+        轮询 —— 这正是真实 e2e 中消息「发了但没人看到」的根因。
+        """
+        async def _drain() -> list[dict[str, Any]]:
+            injected: list[dict[str, Any]] = []
+            try:
+                for row in await team_store.consume_inbox(team_scope, limit=20):
+                    sender = str(row.get("sender_agent_id") or "")
+                    label = sender[4:] if sender.startswith("sub:") else (sender or "成员")
+                    injected.append({
+                        "role": "user",
+                        "content": f"[来自 {label} 的团队消息] {row.get('content', '')}",
+                    })
+            except Exception:  # noqa: BLE001 - 收件箱读失败不能拖垮本轮
+                pass
+            injected.extend(host.drain_notifications())
+            return injected
+        return _drain()
+
     loop = AgentLoop(
         base_runtime.model.client,
         merged,
@@ -210,8 +260,8 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
         max_turns=_max_turns(),
         history_store=base_runtime.store,
         user_id=team_ctx.user_id,
-        # 子代理完成通知：每轮模型调用前注入（fold 点）
-        message_injector=host.drain_notifications,
+        # 子代理完成通知 + 团队收件箱：每轮模型调用前注入（fold 点）
+        message_injector=_lead_injector,
     )
     return TurnRuntime(
         loop=loop,

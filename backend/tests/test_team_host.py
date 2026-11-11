@@ -177,6 +177,12 @@ def test_spawn_false_result_is_not_reported_as_success(isolated_db):
 
 
 def test_spawn_failure_reclaims_bound_task(isolated_db):
+    """spawn 抛错时任务必须停在 pending 且没有 owner。
+
+    顺序已改为「先 spawn 再绑定」：绑定发生在 spawn 成功之后，所以失败时压根
+    没有产生 owner。外部可观察的不变量不变——没有幽灵 owner——只是不再有一次
+    无意义的 in_progress -> pending 版本往返，因此 version 保持 0。
+    """
     async def flow():
         async def boom(**kwargs):
             raise RuntimeError("spawn failed")
@@ -187,7 +193,7 @@ def test_spawn_failure_reclaims_bound_task(isolated_db):
             await host.spawn_teammate(task_name="a", message="do", team_task_id=task["task_id"])
         row = await host.get_task(task["task_id"])
         assert row["status"] == "pending" and row["owner_agent_id"] == ""
-        assert row["version"] == 2
+        assert row["version"] == task["version"], "失败的派活不应改动任务版本"
 
     run(flow())
 

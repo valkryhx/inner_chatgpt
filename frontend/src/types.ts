@@ -67,6 +67,12 @@ export interface ReasoningBlock {
   text: string
 }
 
+/** 平台注入到本轮上下文的团队消息 / 子代理通知（用户可见，便于解释行为变化） */
+export interface InjectedMessageBlock {
+  type: 'injected_message'
+  text: string
+}
+
 /** 子代理过程事件（卡片内时间线用） */
 export interface SubagentEventItem {
   kind: 'text' | 'reasoning' | 'tool_start' | 'tool_result'
@@ -190,6 +196,7 @@ export type MessageBlock =
   | ChartBlock
   | ReasoningBlock
   | SubagentBlock
+  | InjectedMessageBlock
 
 export interface Message {
   id: string
@@ -247,6 +254,7 @@ export type StreamEvent =
   | { type: 'compaction'; summary_tokens: number; kept_messages: number; trigger?: string }
   | { type: 'reasoning_effort'; effective: string; source: 'session' | 'model_config' | string; model: string }
   | { type: 'team_event'; event: TeamEvent }
+  | { type: 'message_injected'; text: string }
   | { type: 'done'; message_id: string; status: 'complete' | 'stopped' | 'error' }
   | { type: 'error'; error: string }
 

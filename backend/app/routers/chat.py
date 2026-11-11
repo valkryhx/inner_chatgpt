@@ -625,6 +625,13 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                 team_event = ev.get("event") or {}
                 await _persist("streaming")
                 yield frame("team_event", team_event)
+            elif et == "message_injected":
+                # 团队消息 / 子代理通知被注入到主对话上下文。前端要能看到
+                # 「有条消息进来了」，否则用户只看到模型突然改变行为。
+                text_in = str(ev.get("text") or "")
+                blocks.append({"type": "injected_message", "text": text_in})
+                await _persist("streaming")
+                yield frame("message_injected", {"text": text_in})
             elif et == "error":
                 terminal_status = "error"
                 yield frame("error", {"error": ev.get("error", "unknown error")})

@@ -27,9 +27,20 @@ ROOT_AGENT_HINT = """
   依赖排序或让用户看到任务进度时，先把工作拆成任务，再用 `spawn_teammate` 绑定任务派活。
 - 派活前用 `task_create` 写清 subject、description、完成标准；依赖任务用 `blocked_by`。
   阻塞下一步的关键路径仍然自己做，不要为了显得并行而创建 Team 任务。
+- **`blocked_by` 是硬约束**：被阻塞的任务既不能用 `task_update(action="claim")` 认领，
+  也不能用 `spawn_teammate(team_task_id=...)` 绑定，两条路径都会返回 `blocked`。
+  想跑被阻塞的任务，必须先让它依赖的任务变成 `completed`，不要试图绕过。
 - lead 负责创建/分配/回收任务。`spawn_teammate(team_task_id=...)` 的服务端绑定动作
   已经把任务置为 in_progress 并设置 owner，teammate 不要再 claim 同一任务；直接执行并用
   `task_get` 读取到的 version 调 `task_update(action="complete")`。
+- **起名字要一次性想好**：`close_agent` 之后用同一个 task_name 再派，服务端会给新 agent
+  加后缀（`worker` -> `worker_2`），而旧名字已钉在旧 agent 上。重名复用会让任务 owner
+  对不上、teammate 无法完成自己的任务。串行派同类工作时直接用 `worker_a` / `worker_b`
+  这样明确不同的名字。
+- **消息是平台投递的，不是靠对方来读**：`send_message` 成功后，收件人下一次模型调用前
+  必然看到这条消息；返回里的 `live` 说明对方此刻是否在运行。你不需要（也不应该）为了
+  「让对方知道」而反复 `list_messages`。反过来，别人发给你的消息会以
+  `[来自 X 的团队消息]` 的形式自动出现在你的上下文里，看到就按它行动。
 - teammate 只能更新绑定给自己的任务，只能通过 `send_message` 向 lead/root 汇报；
   不要让 teammate 互相广播或自由对话。
 - 任何 team_id / user_id / session_id / generation_id / agent_id 都由服务端注入。
@@ -57,6 +68,11 @@ SUBAGENT_HINT = """
   不能派生新的子代理。任务要求只读时，用工具读完即止，不要写文件或改数据。
 - 如果任务已经由 lead 绑定给你（owner 是你），不要再次 claim；先
   `task_get` 读取 version，完成后直接 `task_update(action="complete", expected_version=...)`。
+- **收到 `[来自 X 的团队消息]` 时**，那是 lead（或其他成员）通过平台投递过来的指令，
+  不是用户新开的对话。按它调整当前工作，并在最终答复里说明你怎么处理了这条消息。
+  你不需要为了收消息去轮询 `list_messages`——平台会在你每一轮开始前把新消息放进上下文。
+- 汇报用 `send_message(recipient="lead", kind="result")`：平台会把它直接投递给 lead，
+  lead 下一轮就能看到。不要把结论只写在自己的最终答复里等 lead 来问。
 - 产出图片时写到自己的工作目录，最终答复用标准 Markdown `![说明](文件名.png)` 引用；严禁把产物复制到 `frontend/dist`、仓库源码、系统目录，也禁止用 `127.0.0.1` 绝对 URL。
 """.strip()
 

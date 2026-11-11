@@ -77,7 +77,6 @@ def _build_tools(host: TeamHost, *, teammate: bool) -> list[Tool]:
             content=str(args.get("content", "")),
             kind=str(args.get("kind", "note") or "note"),
         ))
-
     async def list_messages(args: dict) -> str:
         # The closure enforces teammate inbox isolation as a second boundary,
         # independently of the Host implementation.
@@ -141,11 +140,20 @@ def _build_tools(host: TeamHost, *, teammate: bool) -> list[Tool]:
         ),
         Tool(
             "send_message",
-            "给当前团队发送消息。lead 可发给 teammate；teammate 只能发给 lead/root。",
+            "给当前团队发送消息。**平台会把它直接投递给收件人**：对方在运行时"
+            "会在下一次模型调用前看到它，不需要对方主动轮询，也不需要你先等它。"
+            "收件人写法：写 teammate 的名字（如 poet）或 sub:poet 都可以，"
+            "两种写法落到同一个收件箱；发给 lead 时写 lead / root / main 均可。"
+            "返回里 live=true 表示对方正在运行、消息已进入它的待处理队列；"
+            "live=false 表示当前没有活着的同名 agent，消息已入库，"
+            "等它下一次启动时投递（要它现在就干活请用 spawn_teammate）。"
+            "⚠️ 想改变一个**正在运行**的 teammate 的行为，优先用这个工具；"
+            "它只影响对方下一轮，不会打断当前工具调用。",
             {
                 "type": "object",
                 "properties": {
-                    "recipient": {"type": "string"},
+                    "recipient": {"type": "string",
+                                  "description": "收件人：teammate 名字（poet 或 sub:poet），或 lead/root"},
                     "content": {"type": "string"},
                     "kind": {"type": "string", "enum": ["note", "result", "request"]},
                 },

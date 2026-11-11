@@ -30,7 +30,8 @@ class TeamHost:
 
     def __init__(self, scope: TeamScope, *, quota_manager=None,
                  spawn_fn: Callable[..., Awaitable[dict[str, Any]]] | None = None,
-                 event_sink: Callable[[dict[str, Any]], None] | None = None):
+                 event_sink: Callable[[dict[str, Any]], None] | None = None,
+                 deliver_sink: Callable[[dict[str, Any]], dict[str, Any]] | None = None):
         if not isinstance(scope, TeamScope):
             raise TypeError("scope must be a TeamScope")
         if scope.role not in ("lead", "teammate"):
@@ -39,6 +40,10 @@ class TeamHost:
         self._quota_manager = quota_manager
         self._spawn_fn = spawn_fn
         self._event_sink = event_sink
+        # Delivers a stored message into a live agent's pending queue.  Injected
+        # by the turn runtime, which is the only layer that knows which agents
+        # are currently alive in this generation.
+        self._deliver_sink = deliver_sink
         self._lifecycle_lease = None
         # Every durable event read/write through this host is mirrored to the
         # SSE sink.  A cursor prevents replay of events already seen by a
@@ -257,17 +262,24 @@ class TeamHost:
                              team_task_id: str = "",
                              expected_version: int | None = None,
                              max_turns: int = 0) -> dict[str, Any]:
-        """Create/bind an owner and invoke the injected spawn protocol.
+        """Spawn a teammate and bind it to a team task.
 
-        This module intentionally does not import the chat/subagent runtime.  The
-        caller supplies ``spawn_fn``; if it fails, a task bound by this call is
-        reclaimed using CAS so a failed spawn cannot leave a phantom owner.
+        Order matters: the agent is spawned **first**, and the task is bound to
+        the agent id the registry actually assigned.  Binding the requested name
+        up front looks equivalent but is not -- a name that was used before gets
+        a suffix (``worker`` -> ``worker_2``), so the task ended up owned by an
+        id no live agent has.  The teammate then could not complete its own task
+        and the lead had to do it.
+
+        If the bind fails (blocked or a version conflict) the just-spawned agent
+        is closed again, so a rejected spawn leaves nothing behind.
         """
         self._require_lead()
         if self._spawn_fn is None:
             raise TeamHostError("spawn_fn is not configured")
         if not (task_name or "").strip():
             raise TeamHostError("task_name is required")
+
         task = None
         if team_task_id:
             task = await self.get_task(team_task_id)
@@ -275,27 +287,77 @@ class TeamHost:
                 raise TeamHostError("task not found")
             if expected_version is None:
                 expected_version = int(task.get("version", 0))
-            bound = await self.bind_task_owner(
-                team_task_id, f"sub:{task_name}", expected_version=expected_version
-            )
-            if not bound.get("ok"):
-                return bound
-            task = bound.get("task")
+            # Refuse before spawning: a blocked task must not cost a whole agent
+            # start-stop cycle just to be rejected at the bind step.
+            if await team_store.task_is_blocked(self.scope, team_task_id):
+                return {"ok": False, "task": task, "reason": "blocked",
+                        "note": "任务依赖（blocked_by）尚未完成，未派活；"
+                                "先完成被依赖的任务再绑定"}
+
         try:
             spawned = await self._spawn_fn(
                 task_name=task_name, message=message, team_task_id=team_task_id,
+                # A hint only: the registry may suffix a reused name, so the
+                # authoritative owner is whatever the spawn returns.
                 owner_agent_id=f"sub:{task_name}", max_turns=max_turns,
                 scope=self.scope,
             )
         except Exception:
-            if task is not None:
-                await self.reclaim(team_task_id, expected_version=int(task["version"]))
             raise
         if isinstance(spawned, dict) and spawned.get("ok") is False:
-            if task is not None:
-                await self.reclaim(team_task_id, expected_version=int(task["version"]))
             return {"ok": False, "task": task, "spawn": spawned}
+
+        if task is not None:
+            # Bind to the real identity, not the requested one.
+            owner = ""
+            if isinstance(spawned, dict):
+                owner = str(spawned.get("agent_id") or "")
+                if not owner:
+                    actual = str(spawned.get("name") or "")
+                    owner = f"sub:{actual}" if actual else ""
+            owner = owner or f"sub:{task_name}"
+            try:
+                bound = await self.bind_task_owner(
+                    team_task_id, owner, expected_version=int(expected_version or 0))
+            except Exception:
+                await self._close_spawned(spawned)
+                raise
+            if not bound.get("ok"):
+                await self._close_spawned(spawned)
+                return {"ok": False, "task": task,
+                        "reason": bound.get("reason", ""),
+                        "spawn": spawned,
+                        "note": ("任务依赖未完成或版本冲突，已撤销本次派活；"
+                                 "先完成 blocked_by 指向的任务再派")}
+            task = bound.get("task")
+            if isinstance(spawned, dict):
+                spawned["agent_id"] = owner
+                spawned["task_id"] = team_task_id
+            await self._pin_owner(owner, task_name)
         return {"ok": True, "task": task, "spawn": spawned}
+
+    async def _pin_owner(self, agent_id: str, task_name: str) -> None:
+        """Pin the spawn name to this agent so later sends cannot cross-talk."""
+        name = team_store.agent_name_of(agent_id)
+        for key in {name, task_name}:
+            try:
+                await team_store.pin_name(self.scope, key, agent_id)
+            except ValueError:
+                # Already pinned to a different agent: keep the existing pin
+                # rather than rebinding, which would be the cross-talk path.
+                pass
+
+    async def _close_spawned(self, spawned: Any) -> None:
+        """Best-effort teardown of an agent whose task binding was refused."""
+        if not isinstance(spawned, dict):
+            return
+        closer = getattr(self, "_close_fn", None)
+        if not callable(closer):
+            return
+        try:
+            await closer(str(spawned.get("name") or ""))
+        except Exception:  # noqa: BLE001 - cleanup must not mask the real error
+            pass
 
     async def send_message(self, *, recipient: str, content: str,
                            kind: str = "note") -> dict[str, Any]:
@@ -304,12 +366,58 @@ class TeamHost:
         if not (content or "").strip():
             raise TeamHostError("content is required")
         if self.scope.role == "teammate" and recipient not in ("lead", "root"):
-            raise TeamHostError("teammates may only message the lead")
+            if team_store.normalize_agent_id(recipient) != team_store.LEAD_AGENT_ID:
+                raise TeamHostError("teammates may only message the lead")
+
+        # Resolve through the pin table so a bare name, ``sub:<name>`` and a
+        # previously-pinned name all reach the same inbox. Delivery itself is
+        # driven by whichever host owns the live agent (see deliver_pending).
+        resolved = await team_store.resolve_name(self.scope, recipient)
         message = await team_store.send_message(
-            self.scope, recipient=recipient, kind=kind, content=content
+            self.scope, recipient=resolved or recipient, kind=kind, content=content
         )
+        delivered = self._deliver(message)
+        message["live"] = bool(delivered.get("delivered"))
+        if delivered.get("delivered"):
+            await team_store.mark_messages_delivered(
+                self.scope, [message["message_id"]])
+            message["state"] = "delivered"
+        if not message["live"]:
+            message["delivery_note"] = (
+                "当前没有活着的 agent 占用这个名字；消息已入库，"
+                "对方下一轮 turn 开始时会被投递"
+            )
         await self._observe_events()
         return message
+
+    def _deliver(self, message: dict[str, Any]) -> dict[str, Any]:
+        """Push a just-stored message into a live agent's pending queue.
+
+        Writing the row is not delivery: without this the model only ever sees
+        teammate messages if it happens to call ``list_messages``, which is what
+        made "cooperation" depend on the model remembering to poll. The sink is
+        injected by the turn runtime, which owns both the lead loop and the
+        child agents.
+        """
+        if self._deliver_sink is None:
+            return {"delivered": False, "reason": "no delivery sink (no live agent)"}
+        try:
+            return self._deliver_sink(message) or {"delivered": False, "reason": "empty result"}
+        except Exception as exc:  # noqa: BLE001 - delivery must not lose the stored row
+            return {"delivered": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+    async def consume_inbox(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Take and mark-consumed this agent's pending messages."""
+        return await team_store.consume_inbox(self.scope, limit=limit)
+
+    async def pin_name(self, name: str, agent_id: str) -> dict[str, Any]:
+        try:
+            return await team_store.pin_name(self.scope, name, agent_id)
+        except ValueError as exc:
+            raise TeamHostError(str(exc)) from exc
+
+    async def resolve_name(self, name: str) -> str:
+        return await team_store.resolve_name(self.scope, name)
 
     async def list_messages(self, *, recipient: str = "",
                             unread_only: bool = False,
@@ -318,6 +426,10 @@ class TeamHost:
         # different recipient.  The server-side actor wins over this argument.
         if self.scope.role == "teammate":
             recipient = self.scope.agent_id
+        elif recipient:
+            # Read the same namespace the writer used: a message stored for
+            # "root" must be found by recipient="lead" (and vice versa).
+            recipient = team_store.normalize_agent_id(recipient) or recipient
         return await team_store.list_messages(
             self.scope, recipient=recipient,
             unread_only=unread_only, limit=limit,

@@ -102,7 +102,24 @@ class SubagentRuntime:
                 agent_id=self.ctx.agent_id,
                 role="teammate",
             )
-            team_host = TeamHost(team_scope)
+
+            def _deliver(message: dict) -> dict:
+                """A teammate's message to the lead reaches the lead's queue.
+
+                The teammate cannot touch the lead's宿主 directly; the sink is a
+                callable handed in by the parent host, so the lead's next model
+                call sees the message without polling.
+                """
+                sink = getattr(self, "lead_delivery_sink", None)
+                if sink is None:
+                    return {"delivered": False, "reason": "父代理投递通道未就绪"}
+                try:
+                    return sink(message) or {"delivered": True}
+                except Exception as exc:  # noqa: BLE001 - 入库成功即可，投递失败要如实返回
+                    return {"delivered": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+            team_host = TeamHost(team_scope, deliver_sink=_deliver)
+            self.team_host = team_host
             for tool in build_teammate_tools(team_host):
                 merged.add(tool)
         self.registry = merged

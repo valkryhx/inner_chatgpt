@@ -121,7 +121,8 @@ class SubagentRegistry:
     def create_child(self, parent_ctx: AgentContext, name: str, *,
                      team_id: str = "", role: str = "general") -> AgentNode:
         """校验并注册一个子节点。冲突/越界时抛 SubagentError（不静默改名）。"""
-        name = validate_task_name(name)
+        requested = validate_task_name(name)
+        name = requested
 
         if parent_ctx.depth + 1 > self.max_depth:
             raise SubagentError(
@@ -161,6 +162,7 @@ class SubagentRegistry:
             role="teammate",
         )
         node = AgentNode(agent_id=ctx.agent_id, name=name, ctx=ctx, role=effective_role)
+        node.requested_name = validate_task_name(requested or name)
         self._nodes[name] = node
         self._name_history[name] = self._name_history.get(name, 0) + 1
         return node

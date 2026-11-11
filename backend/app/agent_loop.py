@@ -16,6 +16,7 @@ Design reference: GenericAgent genericagent/core/loop.py::agent_runner_loop.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from typing import Any, AsyncIterator, Optional
 
@@ -192,6 +193,11 @@ class AgentLoop:
             if self.message_injector is not None:
                 try:
                     injected = self.message_injector() or []
+                    # 注入器需要读库（团队收件箱）时是异步的；这里是 async 生成器，
+                    # 直接 await 即可，不必为了「同步注入」再加一层缓存。
+                    if inspect.isawaitable(injected):
+                        injected = await injected
+                    injected = injected or []
                 except Exception:
                     injected = []
                 for msg in injected:

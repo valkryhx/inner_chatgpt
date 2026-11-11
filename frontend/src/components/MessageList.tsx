@@ -263,6 +263,9 @@ function renderBlocks(
       out.push(<SummaryCard key={'sum_' + i} block={block} />)
     } else if (block.type === 'reasoning') {
       out.push(<ReasoningSection key={'reason_' + i} text={block.text} live={i === liveIdx} />)
+    } else if (block.type === 'injected_message') {
+      const note = (block as { type: 'injected_message'; text: string }).text || ''
+      if (note) out.push(<InjectedNote key={'inj_' + i} text={note} />)
     } else if (block.type === 'chart') {
       out.push(<ChartView key={'chart_' + i} spec={block.spec} />)
     } else if (block.type === 'subagent') {
@@ -364,6 +367,7 @@ function MessageRow({ msg, onImageSettled, onOpenWorkspace }: {
     if (b.type === 'text' || b.type === 'reasoning') return !!b.text
     if (b.type === 'tool') return true
     if (b.type === 'chart' || b.type === 'summary') return true
+    if (b.type === 'injected_message') return !!(b as { text?: string }).text
     if (b.type === 'attachments') return !!((b as { items?: unknown[] }).items || []).length
     if (b.type === 'subagent') {
       const s = b as SubagentBlock
@@ -405,6 +409,29 @@ function MessageRow({ msg, onImageSettled, onOpenWorkspace }: {
         {!isUser && !isActiveStream && (msg.content || hasVisibleBlocks) && <MessageActions msg={msg} />}
         {!isUser && <RunFooter msg={msg} live={isActiveStream} />}
       </div>
+    </div>
+  )
+}
+
+
+/** 平台注入的团队消息：视觉上区别于用户发言与模型正文，可折叠。 */
+function InjectedNote({ text }: { text: string }) {
+  const [open, setOpen] = useState(false)
+  const NEWLINE = String.fromCharCode(10)
+  // 标签已经写了「团队消息」，预览里把重复的前缀去掉，避免同一句话看两遍。
+  const body = text.replace(/^\[来自 [^\]]+ 的团队消息\]\s*/, '')
+  const firstLine = body.split(NEWLINE)[0] || ''
+  const multi = body.includes(NEWLINE) || body.length > firstLine.length
+  return (
+    <div className="injected-note">
+      <button type="button" className="injected-note-head" onClick={() => setOpen((v) => !v)}
+              aria-expanded={open}>
+        <span className="injected-note-mark" aria-hidden="true">↩</span>
+        <span className="injected-note-label">团队消息</span>
+        <span className="injected-note-preview">{firstLine}</span>
+        {multi && <span className="injected-note-caret">{open ? '收起' : '展开'}</span>}
+      </button>
+      {open && multi && <p className="injected-note-body">{body}</p>}
     </div>
   )
 }
