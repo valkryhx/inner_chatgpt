@@ -10,7 +10,67 @@ interface Props {
 }
 
 function fmt(ts: number): string {
-  return new Date(ts).toLocaleString('zh-CN', { hour12: false })
+  // created_at 可能缺失/非数字（旧数据或被改坏的响应），别让 toLocaleString 抛异常。
+  const n = typeof ts === 'number' && Number.isFinite(ts) ? ts : 0
+  if (!n) return ''
+  try {
+    return new Date(n).toLocaleString('zh-CN', { hour12: false })
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 把服务端返回的一条命中规整成组件可安全渲染的形状。
+ *
+ * 这是白屏的第一道防线（第二道是 ErrorBoundary）：脏数据在这里被消化掉，
+ * 而不是让它在渲染期抛异常、再去指望边界兜。宁可少显示字段，
+ * 也不能让一条脏数据击穿整棵组件树。
+ */
+function normalizeHit(raw: unknown): MessageSearchHit | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  const messageId = typeof r.message_id === 'string' ? r.message_id : ''
+  const sessionId = typeof r.session_id === 'string' ? r.session_id : ''
+  // 没有 id 的结果点不动、也定位不到，直接丢弃。
+  if (!messageId || !sessionId) return null
+
+  const snippet = typeof r.snippet === 'string' ? r.snippet : ''
+  const offset = typeof r.match_offset === 'number' && Number.isFinite(r.match_offset)
+    ? Math.trunc(r.match_offset)
+    : -1
+  const length = typeof r.match_length === 'number' && Number.isFinite(r.match_length)
+    ? Math.max(0, Math.trunc(r.match_length))
+    : 0
+
+  return {
+    message_id: messageId,
+    session_id: sessionId,
+    session_title: typeof r.session_title === 'string' ? r.session_title : '',
+    role: r.role === 'assistant' ? 'assistant' : r.role === 'user' ? 'user' : 'system',
+    snippet,
+    // 越界的 offset 一律降级成「不高亮」，避免 slice 出错位文本。
+    match_offset: offset >= 0 && offset + length <= snippet.length ? offset : -1,
+    match_length: length,
+    created_at: typeof r.created_at === 'number' && Number.isFinite(r.created_at)
+      ? r.created_at
+      : 0,
+    session_updated_at: typeof r.session_updated_at === 'number'
+      && Number.isFinite(r.session_updated_at) ? r.session_updated_at : 0,
+  }
+}
+
+/** 把整个响应规整成 { hits, hasMore }，任何异常形状都不抛。 */
+function normalizeResult(raw: unknown): { hits: MessageSearchHit[]; hasMore: boolean } {
+  if (!raw || typeof raw !== 'object') return { hits: [], hasMore: false }
+  const r = raw as Record<string, unknown>
+  const list = Array.isArray(r.hits) ? r.hits : []
+  const hits: MessageSearchHit[] = []
+  for (const item of list) {
+    const h = normalizeHit(item)
+    if (h) hits.push(h)
+  }
+  return { hits, hasMore: r.has_more === true }
 }
 
 /** 把片段按命中位置切成三段，中间那段高亮。 */
@@ -75,9 +135,15 @@ export default function SessionSearch({ open, onClose, onOpenHit }: Props) {
     try {
       const r = await api.searchMessages(keyword, 30)
       if (seq !== seqRef.current) return
-      setHits(r.hits)
-      setHasMore(r.has_more)
-      setElapsed(r.elapsed_ms)
+      // 不信任线上响应的形状：规整失败也不能抛，否则整个应用白屏。
+      const { hits: safeHits, hasMore: safeMore } = normalizeResult(r)
+      setHits(safeHits)
+      setHasMore(safeMore)
+      setElapsed(
+        typeof (r as { elapsed_ms?: unknown })?.elapsed_ms === 'number'
+          ? (r as { elapsed_ms: number }).elapsed_ms
+          : 0,
+      )
       setCursor(0)
     } catch (e: any) {
       if (seq !== seqRef.current) return

@@ -1651,3 +1651,32 @@ textarea, input { caret-color: var(--clay); }
   0%, 30% { background: var(--clay-soft); border-radius: var(--r-md); }
   100% { background: transparent; }
 }
+
+/* 渲染错误边界的降级界面：出错时必须仍然可读、可恢复，绝不能空白 */
+.crash-panel {
+  margin: 16px;
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13.5px;
+  line-height: 1.65;
+}
+.crash-title { font-weight: 650; margin-bottom: 6px; }
+.crash-msg {
+  color: var(--muted);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  margin-bottom: 12px;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
+}
+.crash-actions { display: flex; gap: 8px; }
+/* 最外层边界：撑满视口居中，保证哪怕整页崩了也不是一片白 */
+#root > .crash-panel {
+  margin: auto;
+  max-width: 520px;
+  margin-top: 18vh;
+}

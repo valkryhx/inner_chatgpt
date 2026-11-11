@@ -7,6 +7,7 @@ import ModelMenu from './components/ModelMenu'
 import ReasoningMenu from './components/ReasoningMenu'
 import SessionBrowser from './components/SessionBrowser'
 import SessionSearch from './components/SessionSearch'
+import ErrorBoundary from './components/ErrorBoundary'
 import Composer from './components/Composer'
 import LoginPage from './components/LoginPage'
 import SettingsModal from './components/SettingsModal'
@@ -942,11 +943,13 @@ export default function App() {
         onSelect={(id) => { selectSession(id); setAllSessionsOpen(false) }}
         onDelete={deleteSession}
       />
-      <SessionSearch
-        open={searchOpen}
-        onClose={() => setSearchOpen(false)}
-        onOpenHit={openSearchHit}
-      />
+      <ErrorBoundary label="搜索面板" onError={() => setSearchOpen(false)}>
+        <SessionSearch
+          open={searchOpen}
+          onClose={() => setSearchOpen(false)}
+          onOpenHit={openSearchHit}
+        />
+      </ErrorBoundary>
       <TeamPanel
         snapshot={teamSnapshot}
         open={teamOpen}
