@@ -516,9 +516,25 @@ class AcpSessionManager:
             time.sleep(_STOP_ALL_NOW_POLL_S)
 
     async def close_all(self) -> None:
-        """本轮结束的收尾：停掉 → 关传输 → 交还租约 → 清表。"""
+        """本轮结束的收尾：停掉 → **落库** → 关传输 → 交还租约 → 清表。
+
+        落库这一步（2026-11-11 补）解决的是：回合结束时仍在跑的 GA 会话，
+        结果本来随着 ``_entries.clear()`` 一起消失，下一轮 ``ga_result`` 会
+        报 ``KeyError: 未知的 GA 会话``。内部子代理有 ``finish_run`` 兜底，
+        ACP 这边原先没有对应动作，属于遗漏。
+
+        顺序很重要：先 ``stop_all()`` 让在途 prompt 收敛成终态（completed /
+        stopped），再读快照落库，最后才关进程。反过来会存到 running 状态。
+        """
         await self.stop_all()
         entries = list(self._entries.items())
+        # 落库必须在 clear 之前：clear 之后就再也拿不到 snapshot 了。
+        for agent_id, entry in entries:
+            try:
+                await self._persist_result(agent_id, entry.session.snapshot())
+            except Exception as exc:  # noqa: BLE001 - 落库失败不能阻止收尾
+                logger.warning("GA 结果落库失败（close_all, agent_id=%s）：%s",
+                               agent_id, exc)
         self._entries.clear()
         self._sessions.clear()
         self._stop_reasons.clear()

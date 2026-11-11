@@ -208,6 +208,82 @@ def test_unknown_agent_still_raises(monkeypatch):
     run(scenario())
 
 
+# ---------------- 规则 3：close_all 也要落库 ----------------
+
+def test_close_all_persists_running_session_result(monkeypatch):
+    """回合结束时还没取过的 GA 会话，close_all 必须把结果落库。
+
+    内部子代理有 finish_run 兜底，ACP 原先没有对应动作：
+    close_all 直接 _entries.clear()，结果随内存一起消失，
+    下一轮 ga_result 只能拿到 KeyError。
+    """
+    monkeypatch.setenv("FAKE_GA_MODE", "chunks")
+
+    async def scenario():
+        mgr = make()
+        out = await mgr.spawn(task="say hi")
+        aid = out["agent_id"]
+        await mgr.wait(aid, timeout_s=10)
+        # 故意**不**调 ga_result，直接走回合收尾
+        await mgr.close_all()
+        assert aid not in mgr._sessions, "close_all 之后内存会话应已清空"
+        # 新 manager 模拟「下一轮」：内存里一定没有这条会话
+        mgr2 = make()
+        try:
+            return await mgr2.result(aid)
+        finally:
+            await mgr2.close_all()
+
+    r = run(scenario())
+    assert r.get("source") == "db", "close_all 必须落库，否则下一轮读不到"
+    assert r["result"] == "hello world"
+    assert r["status"] == "completed"
+
+
+def test_close_all_persists_full_text(monkeypatch):
+    """close_all 落库要保留全文，供下一轮 full=true 读取。"""
+    monkeypatch.setenv("FAKE_GA_MODE", "chunks")
+
+    async def scenario():
+        mgr = make()
+        out = await mgr.spawn(task="say hi")
+        aid = out["agent_id"]
+        await mgr.wait(aid, timeout_s=10)
+        await mgr.close_all()
+        mgr2 = make()
+        try:
+            return await mgr2.result(aid, full=True)
+        finally:
+            await mgr2.close_all()
+
+    r = run(scenario())
+    assert r["source"] == "db"
+    assert "hello world" in r["result"]
+
+
+def test_close_all_records_stopped_status(monkeypatch):
+    """close_all 先 stop 再落库：状态应是终态，不能存成 running。"""
+    monkeypatch.setenv("FAKE_GA_MODE", "hang")
+
+    async def scenario():
+        mgr = make()
+        out = await mgr.spawn(task="do something slow")
+        aid = out["agent_id"]
+        # 不等它完成，直接收尾（这就是「回合结束时还在跑」的场景）
+        await mgr.close_all()
+        mgr2 = make()
+        try:
+            return await mgr2.result(aid)
+        finally:
+            await mgr2.close_all()
+
+    r = run(scenario())
+    assert r["source"] == "db"
+    assert r["status"] in ("stopped", "errored", "completed"), \
+        f"必须是终态，实际 {r['status']}"
+    assert r["status"] != "running", "落库不能存成 running（顺序错了）"
+
+
 # ---------------- 默认上限 ----------------
 
 def test_default_max_chars_matches_budget_layer():
