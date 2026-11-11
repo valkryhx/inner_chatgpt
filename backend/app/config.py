@@ -70,6 +70,22 @@ class LLMSettings:
         return self.wire_api == "openai_responses"
 
 
+def _retries_from(m: dict[str, Any]) -> int:
+    """重试预算：配置 > 环境变量(HLZ_LLM_MAX_RETRIES) > 默认 4，硬上限 8。
+
+    把「配置缺省」和「配置写了 0」区分开：0 是"不重试"的有效选择，
+    不能被当成空值回落到默认。
+    """
+    from .llm_client import max_retries_from_env
+    raw = m.get("max_retries")
+    if raw is None or str(raw).strip() == "":
+        return max_retries_from_env()
+    try:
+        return max(0, min(int(raw), 8))
+    except (TypeError, ValueError):
+        return max_retries_from_env()
+
+
 def llm_yaml_available() -> bool:
     """仓库内 llm.yaml 是否存在。
 
@@ -131,6 +147,8 @@ def load_llm_settings(profile: str | None = None) -> LLMSettings:
         temperature=float(m.get("temperature", defaults.get("temperature", 1.0))),
         max_tokens=int(m.get("max_tokens", defaults.get("max_tokens", 8192))),
         timeout=int(m.get("read_timeout", 120)),
-        max_retries=int(m.get("max_retries", 3)),
+        # 重试预算：配置里显式给了就用它（钳制到 0..8），否则交给环境变量/默认。
+        # 以前硬编码 3 会让 HLZ_LLM_MAX_RETRIES 在这条装配路径上失效。
+        max_retries=_retries_from(m),
         reasoning_effort=m.get("reasoning_effort"),
     )

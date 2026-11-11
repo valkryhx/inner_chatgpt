@@ -137,6 +137,55 @@ async def test_live_delivered_message_is_not_reinjected_into_lead_inbox():
     await team_store.delete_session_data(uid, sid)
 
 
+# ---------- 边界 6：回收槽位不推 stopping 帧 ----------
+def _capture_publishes(monkeypatch, host):
+    """记录 host._publish 推出去的事件（EventBuffer 是队列，不便回头翻）。"""
+    seen: list[dict] = []
+    real = host._publish
+
+    def _spy(ev):
+        seen.append(ev)
+        return real(ev)
+
+    host._publish = _spy
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_reclaiming_settled_idle_worker_does_not_emit_stopping():
+    """干完活的空闲队友被回收时，前端不该先闪「停止中」再变「已完成」。
+
+    它并没有被打断，只是槽位被收回；推 stopping 与事实不符。
+    """
+    host = _host()
+    seen = _capture_publishes(None, host)
+    node = host.registry.create_child(host.ctx, "keeper", team_id="team_x")
+    node.status = "idle"
+    node.rounds = 1
+    node.result = "已完成"
+
+    await host._stop_node(node, reason="close")
+
+    statuses = [e.get("status") for e in seen if e.get("type") == "subagent_status"]
+    assert "stopping" not in statuses, f"回收不该推 stopping，实际推了 {statuses}"
+    assert node.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_stopping_frame_still_emitted_for_real_interrupt():
+    """正向对照：真正打断一个在跑的队友，仍要推 stopping（面板不能一直「运行中」）。"""
+    host = _host()
+    seen = _capture_publishes(None, host)
+    node = host.registry.create_child(host.ctx, "busy", team_id="team_x")
+    node.status = "running"
+    node.rounds = 1
+
+    await host._stop_node(node, reason="close")
+
+    statuses = [e.get("status") for e in seen if e.get("type") == "subagent_status"]
+    assert "stopping" in statuses, f"真打断必须推 stopping，实际 {statuses}"
+
+
 # ---------- 边界 2：idle 队友被 stop 时，idle_wait 要立刻返回 ----------
 @pytest.mark.asyncio
 async def test_stop_breaks_idle_wait_immediately():

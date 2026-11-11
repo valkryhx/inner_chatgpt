@@ -324,6 +324,13 @@ class SubagentHost:
                        team_id=self.ctx.team_id,
                        status=node.status, rounds=node.rounds, turns=node.turns,
                        error=node.error or "")
+            # 异常结束的队友占着的任务必须释放，否则任务板会烂在死 agent 手里：
+            # 真机 runId 121743-7329 里两个 worker 因上游持续 502 而 errored，
+            # 它们的任务永远停在 in_progress，第三个任务永远等不到依赖完成。
+            # 团队韧性要求「一个 agent 出问题不能拖垮整个团队」——这里由平台
+            # 兜底，不依赖模型记得手动 reclaim。
+            if node.status in ("errored", "stopped") and runtime is not None:
+                await self._release_dead_agent_tasks(node, runtime)
             self._publish({
                 "type": "subagent_end",
                 "agent_id": node.agent_id,
@@ -339,6 +346,37 @@ class SubagentHost:
     def _sender_label(row: dict[str, Any]) -> str:
         sender = str(row.get("sender_agent_id") or row.get("sender") or "lead")
         return sender[4:] if sender.startswith("sub:") else sender
+
+    async def _release_dead_agent_tasks(self, node: AgentNode, runtime) -> None:
+        """把「死掉的队友」还占着的任务放回 pending，让 lead 能重新派活。
+
+        只处理 owner 就是它、且还是 ``in_progress`` 的任务。用 CAS 更新，
+        拿不到就跳过——绝不能把别人刚接手的任务抢回来。
+        """
+        team_host = getattr(runtime, "team_host", None)
+        if team_host is None:
+            return
+        try:
+            tasks = await team_host.list_tasks()
+        except Exception:  # noqa: BLE001 - 释放失败不能影响收尾
+            return
+        released: list[str] = []
+        for row in tasks or []:
+            if (str(row.get("owner_agent_id") or "") != node.agent_id
+                    or str(row.get("status") or "") != "in_progress"):
+                continue
+            try:
+                out = await team_host.update_task(
+                    str(row.get("task_id") or ""), "reclaim",
+                    expected_version=int(row.get("version") or 0))
+            except Exception:  # noqa: BLE001
+                continue
+            if out.get("ok"):
+                released.append(str(row.get("task_id") or ""))
+        if released:
+            team_event("task_released_on_failure", agent=node.name,
+                       agent_id=node.agent_id, team_id=self.ctx.team_id,
+                       status=node.status, task_ids=released[:10])
 
     async def _refill_inbox(self, node: AgentNode, runtime) -> int:
         """把库里积压的团队消息补进待注入队列。
@@ -800,17 +838,7 @@ class SubagentHost:
         return {"ok": True, "closed": closed, "status": node.status}
 
     async def _stop_node(self, node: AgentNode, *, reason: str = "close") -> None:
-        # 关闭是有成本的（最多等 2s 优雅退出）。先把状态广播出去，
-        # 否则面板在这段时间里仍显示「运行中」，用户会以为关不掉。
         was_idle = node.is_idle
-        if not node.is_terminal and node.status != "stopping":
-            node.status = "stopping"
-            self._publish({
-                "type": "subagent_status",
-                "agent_id": node.agent_id,
-                "name": node.name,
-                "status": "stopping",
-            })
         # 记 completed 而不是 stopped 的两种情形：这个 agent 其实已经干完活了，
         # 被回收的只是它的槽位。记 stopped 会让前端显示「已停止」——用户会以为
         # 自己打断了它，而事实是它的任务已经完成、结果也交回去了。
@@ -819,10 +847,24 @@ class SubagentHost:
         #      释放并发槽位）。此时若它正跑到一半、或还有没处理的消息，那就是
         #      真的被打断，必须保留 stopped。
         settled = was_idle and not node.has_pending_work
-        if (reason == "drain" or settled) and node.rounds > 0 and not node.error:
+        reclaim = ((reason == "drain" or settled) and node.rounds > 0
+                   and not node.error)
+        if reclaim:
             # 状态先置 completed，再等它真的退出（finally 里会持久化这个值）；
             # 循环看到 stop 时会保留已有的终态，不会覆盖回 stopped。
             node.status = "completed"
+        # 关闭是有成本的（最多等 2s 优雅退出）。先广播「停止中」，否则面板在这段
+        # 时间里仍显示「运行中」，用户会以为关不掉。
+        # 回收槽位（reclaim）时不推：它并不是被打断，推 stopping 会让前端先闪一下
+        # 「停止中」再变「已完成」，与事实不符。
+        elif not node.is_terminal and node.status != "stopping":
+            node.status = "stopping"
+            self._publish({
+                "type": "subagent_status",
+                "agent_id": node.agent_id,
+                "name": node.name,
+                "status": "stopping",
+            })
         node.stop.set()
         node.wake.set()
         await self._join_task(node, grace_s=2.0)

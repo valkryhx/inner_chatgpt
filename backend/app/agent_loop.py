@@ -18,10 +18,54 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
+import os
 from typing import Any, AsyncIterator, Optional
 
 from .llm_client import ChatResult, LLMClient, LLMError
 from .tools import ToolRegistry
+
+logger = logging.getLogger(__name__)
+
+
+def _llm_retry_limit_from_env(default: int = 2) -> int:
+    """模型调用彻底失败后允许的续跑次数。
+
+    上限 3：续跑本身要重发整段上下文，次数多了只是把额度烧在一个坏掉的上游上。
+    """
+    raw = (os.environ.get("HLZ_AGENT_LLM_RETRIES") or "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        return default
+    return max(0, min(n, 3))
+
+
+def _team_grace_from_env(default: int = 3) -> int:
+    """lead 想收工但团队还有活时，允许续跑的轮数。
+
+    硬上限是必须的：没有它，「等队友」会变成永不结束的循环（队友可能一直在
+    idle 待命）。默认 3 轮足够接住「等 reader 回来」这类典型场景。
+    """
+    raw = (os.environ.get("HLZ_LEAD_TEAM_GRACE_TURNS") or "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        return default
+    return max(0, min(n, 10))
+
+
+def _llm_retry_notice(event: str, attempt: int, err: Exception) -> None:
+    """把续跑写进团队事件流，便于复盘"这次协作里断过几次、恢没恢复"。"""
+    try:
+        from .logging_setup import team_event
+        team_event(event, attempt=attempt, error=str(err)[:300])
+    except Exception:
+        pass
 
 
 def _dump(obj: Any) -> str:
@@ -36,7 +80,7 @@ def _dump(obj: Any) -> str:
 class AgentLoop:
     def __init__(self, client: LLMClient, registry: ToolRegistry, system_prompt: str,
                  max_turns: int = 300, history_store=None, *, user_id: str = "",
-                 message_injector=None):
+                 message_injector=None, team_gate=None):
         self.client = client
         self.registry = registry
         self.system_prompt = system_prompt
@@ -47,6 +91,10 @@ class AgentLoop:
         self.user_id = user_id
         # 可选：每轮模型调用前的消息注入器（子代理 steer 用）
         self.message_injector = message_injector
+        # 可选：团队待续跑闸。模型想收工时调用它；返回非空字符串表示
+        # 「还有团队工作在跑」并给出原因，循环据此续跑而不是结束。
+        # Team 之外永远是 None，行为与历史完全一致。
+        self.team_gate = team_gate
 
     # ---------- sanitation: repair dangling tool_calls ----------
     async def sanitize(self, history: list[dict]) -> bool:
@@ -185,6 +233,11 @@ class AgentLoop:
             pass
 
         turn = 0
+        # 模型调用彻底失败后的续跑计数（与 turn 分开：续跑不应该吃掉正常轮数预算）
+        llm_retries = 0
+        llm_retry_limit = _llm_retry_limit_from_env()
+        # 团队待续跑预算：lead 想收工但队友还在跑时允许续几轮。
+        team_grace_left = _team_grace_from_env()
         while turn < self.max_turns:
             if stopped():
                 yield {"type": "done", "status": "stopped"}
@@ -241,6 +294,31 @@ class AgentLoop:
                         yield {"type": "text_delta", "text": text}
                 result = await drive_task
             except LLMError as e:
+                # 调用层（llm_client）已经把网络级重试用完才抛到这里。到这一层
+                # 说明该模型调用彻底失败。直接结束整轮对单 agent 是"如实报错"，
+                # 对 team 是灾难：lead 一死，它派的队友还在跑、任务板还有
+                # pending，用户拿不到任何结论。真机 runId 111915-64a6 就是这么
+                # 僵死 927 秒的。
+                #
+                # 续跑只重发**模型调用**，不重跑任何工具：history 原样保留，
+                # 模型看到自己已完成的工具结果后继续。因此重试是幂等的。
+                if (not stopped()) and llm_retries < llm_retry_limit:
+                    llm_retries += 1
+                    logger.warning("模型调用失败，续跑（%s/%s）：%s",
+                                   llm_retries, llm_retry_limit, str(e)[:300])
+                    yield {"type": "llm_retry", "attempt": llm_retries,
+                           "limit": llm_retry_limit, "error": str(e)}
+                    # 给模型一句可执行的话，而不是把整段异常塞进上下文。
+                    history.append({
+                        "role": "user",
+                        "content": ("[平台提示] 上一次模型调用因接口中断失败了，"
+                                    "这不是你的错误，也不代表任务无法继续。"
+                                    "请从中断处继续完成当前任务：已执行过的工具结果都在上下文里，"
+                                    "不要重复执行它们，直接往下做。"),
+                    })
+                    _llm_retry_notice("agent_loop_continue", llm_retries, e)
+                    continue
+                _llm_retry_notice("agent_loop_gave_up", llm_retries, e)
                 yield {"type": "error", "error": str(e)}
                 return
             except asyncio.CancelledError:
@@ -274,6 +352,31 @@ class AgentLoop:
                         await self.history_store.set(self.user_id, session_id, history)
                     else:
                         await self.history_store.set(session_id, history)
+                # 团队待续跑闸：lead 说「等 reader」之后模型可能就结束了这一轮，
+                # 而队友还在跑、结果还没回来。此时收工 = 队友的结论永远没人接
+                # （真机 runId 111915-64a6 里任务 3 就是这样永久 pending 的）。
+                # 只有确认「确实还有活着的队友 / 未消费的消息」才续跑，
+                # 并且有硬上限，队友全部结束后立即收工。
+                if (not stopped()) and team_grace_left > 0 and self.team_gate is not None:
+                    try:
+                        pending = self.team_gate()
+                        if inspect.isawaitable(pending):
+                            pending = await pending
+                    except Exception:  # noqa: BLE001 - 闸坏了不能卡住对话
+                        pending = None
+                    if pending:
+                        team_grace_left -= 1
+                        mine = team_grace_left
+                        _llm_retry_notice("lead_wait_team", mine, Exception(str(pending)[:200]))
+                        history.append({
+                            "role": "user",
+                            "content": f"[平台提示] {pending}\n"
+                                       "不要就此结束：等它们的结果回来，然后用它们"
+                                       "完成任务、更新任务板，最后再给用户一个完整结论。",
+                        })
+                        yield {"type": "team_wait", "reason": str(pending),
+                               "grace_left": mine}
+                        continue
                 yield {"type": "done", "status": "complete"}
                 return
 

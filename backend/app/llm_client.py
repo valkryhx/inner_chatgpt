@@ -6,20 +6,142 @@ Design reference: GenericAgent genericagent/llm/core.py (_openai_stream/_parse_o
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import os
+import random
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
 _RESP_CACHE_KEY = str(uuid.uuid4())
 REASONING_MARK = "@@reasoning@@"
+
+# 上游说"过一会儿再来"的错误码。与 GA llm/core.py:658 的 _RETRYABLE 一致。
+RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 529})
+# 配置/权限/参数问题：重试一百次也不会好，反而白烧额度。
+NEVER_RETRY_STATUS = frozenset({400, 401, 402, 403, 404, 405, 413, 422})
+
+# 单次 run() 里重试等待的累计上限。Web 多用户下无限等待等于挂死一个会话。
+# 取 180s 对齐 CC319 的时间窗常量思想（m0591:126130）。
+RETRY_WAIT_BUDGET_S = 180.0
+BACKOFF_BASE_S = 0.8
+BACKOFF_CAP_S = 8.0
+
+
+def max_retries_from_env(default: int = 4) -> int:
+    """重试预算：默认 4，可用 HLZ_LLM_MAX_RETRIES 覆盖，硬上限 8。
+
+    上限是必须的：误配成 100 会让一个坏掉的上游把整个会话挂在那里反复重试。
+    """
+    raw = (os.environ.get("HLZ_LLM_MAX_RETRIES") or "").strip()
+    if not raw:
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        return default
+    return max(0, min(n, 8))
+
+
+def _retry_after_s(resp: httpx.Response) -> Optional[float]:
+    """上游给的 Retry-After（秒）。优先听它的，别自作聪明。"""
+    raw = (resp.headers or {}).get("retry-after", "")
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        pass
+    try:  # 也接受 HTTP-date，但只用常见的秒数形式，避免引入解析依赖
+        from email.utils import parsedate_to_datetime
+        import datetime as _dt
+        when = parsedate_to_datetime(raw)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_dt.timezone.utc)
+        delta = (when - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except Exception:
+        return None
+
+
+def _backoff_s(attempt: int, retry_after: Optional[float] = None) -> float:
+    """指数退避 + 抖动；有 Retry-After 就听上游的。"""
+    if retry_after is not None:
+        return min(retry_after, BACKOFF_CAP_S * 4)
+    base = min(BACKOFF_BASE_S * (2 ** max(0, attempt)), BACKOFF_CAP_S)
+    return base * (0.75 + random.random() * 0.5)
 
 
 class LLMError(Exception):
     """Model request failed (provider error / HTTP failure)."""
+
+
+def _llm_retry_event(event: str, attempt: int, msg: str, *,
+                     waited: float = 0.0, reason: str = "") -> None:
+    """把重试写进团队事件流，便于 `tools/team_timeline.py` 复盘 API 中断。
+
+    重试**不写进对话历史**（GA 的做法）：它是瞬时状态，写进 history 会让模型
+    以为自己说错过什么。前端/日志能看见就够了。
+    """
+    try:
+        from .logging_setup import team_event
+        team_event(event, attempt=attempt, waited=round(waited, 2),
+                   reason=reason or "", error=str(msg or "")[:300])
+    except Exception:
+        pass
+
+
+def _collect_chat_tool_calls_delta(tcs: list[dict], tc_buf: dict) -> None:
+    """累积流式 chat/completions 的 tool_calls 分片。"""
+    for tc in tcs:
+        i2 = tc.get("index", 0)
+        has_name = bool((tc.get("function") or {}).get("name"))
+        if i2 not in tc_buf:
+            if has_name or not tc_buf:
+                tc_buf[i2] = {"id": tc.get("id") or "", "name": "", "args": ""}
+            else:
+                i2 = max(tc_buf)
+        if has_name:
+            tc_buf[i2]["name"] = tc["function"]["name"]
+        if (tc.get("function") or {}).get("arguments"):
+            tc_buf[i2]["args"] += tc["function"]["arguments"]
+        if tc.get("id") and not tc_buf[i2]["id"]:
+            tc_buf[i2]["id"] = tc["id"]
+
+
+def _collect_chat_tool_calls(tcs: list[dict], tc_buf: dict) -> None:
+    """非流式 chat/completions 的 tool_calls（一次性完整给出）。"""
+    for i, tc in enumerate(tcs):
+        fn = tc.get("function") or {}
+        tc_buf[i] = {"id": tc.get("id") or "", "name": fn.get("name") or "",
+                     "args": fn.get("arguments") or ""}
+
+
+def _responses_text(evt: dict) -> str:
+    """非流式 responses 的正文：拼接 output 里的 output_text 分片。"""
+    parts: list[str] = []
+    for item in (evt.get("output") or []):
+        for c in (item.get("content") or []):
+            if c.get("type") in ("output_text", "text") and c.get("text"):
+                parts.append(str(c["text"]))
+    return "".join(parts)
+
+
+def _collect_responses_body(evt: dict, tc_buf: dict) -> None:
+    """非流式 responses 的 function_call 项。"""
+    for i, item in enumerate((evt.get("output") or [])):
+        if item.get("type") == "function_call":
+            tc_buf[i] = {"id": item.get("call_id") or item.get("id") or "",
+                         "name": item.get("name") or "",
+                         "args": item.get("arguments") or ""}
 
 
 @dataclass
@@ -40,7 +162,7 @@ class LLMSettings:
     temperature: float = 1.0
     max_tokens: Optional[int] = 8192
     timeout: int = 120
-    max_retries: int = 2
+    max_retries: int = field(default_factory=max_retries_from_env)
     reasoning_effort: Optional[str] = None
     system_prompt: str = ""
 
@@ -238,6 +360,20 @@ class LLMClient:
                 pass
             self._client = None
 
+    async def __aenter__(self) -> "LLMClient":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        # 退出上下文时无论 client 是谁提供的都关掉：注入的 client 通常也是
+        # 调用方为「这一批请求」临时建的，留着会泄漏连接。
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+            self._client = None
+        self._own_client = True
+
     def _build_request(self, messages: list[dict], tools: Optional[list[dict]],
                        *, max_tokens: Optional[int] = None):
         s = self.s
@@ -297,14 +433,26 @@ class LLMClient:
         client = self._get_client()
 
         attempt = 0
+        budget_used = 0.0
+        # 「流里已经吐过内容」后失败：不再原样重试（会把同一段文字吐两遍），
+        # 而是降级成非流式再取一次完整结果（CC319 m0591:126373 retryWithoutStreaming）。
+        degraded = False
         while True:
             content = ""
             reasoning = ""
             tc_buf: dict = {}
             usage: Optional[dict] = None
             got_any = False
+            # 流式请求必须看到明确的收尾信号才算成功：[DONE] 或 finish_reason
+            # （responses 用 response.completed）。都看不到就是断流。
+            saw_done = False
+            saw_finish = False
+            stream = not degraded
+            wait_s = 0.0
+            fail_msg = ""
             try:
-                async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                async with client.stream("POST", url, headers=headers,
+                                          json={**payload, "stream": stream} if not stream else payload) as resp:
                     if resp.status_code >= 400:
                         body = (await resp.aread()).decode("utf-8", "replace")
                         msg = f"HTTP {resp.status_code}: {body[:500]}"
@@ -317,86 +465,154 @@ class LLMClient:
                                 f"reasoning_effort={self.s.reasoning_effort!r}；"
                                 "请在输入框下方的思考等级里换一档，或设为「不指定」。"
                             )
-                        retryable = resp.status_code in (408, 409, 425, 429, 500, 502, 503, 504, 529)
-                        if retryable and attempt < self.s.max_retries and not got_any:
-                            attempt += 1
-                            continue
-                        raise LLMError(msg)
-                    async for line in resp.aiter_lines():
-                        if stop_check and stop_check():
-                            break
-                        data = _sse_payload(line)
-                        if data is None:
-                            continue
-                        if data == "[DONE]":
-                            break
-                        try:
-                            evt = json.loads(data)
-                        except Exception:
-                            continue
-                        perr = _provider_error(evt)
-                        if perr:
-                            raise LLMError(f"provider error: {perr}")
-                        if self.s.api_mode == "responses":
-                            etype = evt.get("type", "")
-                            if etype == "response.output_text.delta":
-                                d = evt.get("delta", "")
-                                if d:
-                                    content += d; got_any = True
-                                    if on_delta: on_delta("text", d)
-                            elif etype == "response.reasoning_summary_text.delta":
-                                d = evt.get("delta", "")
-                                if d:
-                                    reasoning += d; got_any = True
-                                    if on_delta: on_delta("reasoning", d)
-                            elif etype == "response.output_item.added":
-                                item = evt.get("item", {})
-                                if item.get("type") == "function_call":
-                                    i2 = evt.get("output_index", 0)
-                                    tc_buf[i2] = {"id": item.get("call_id", item.get("id", "")), "name": item.get("name", ""), "args": ""}
-                            elif etype == "response.function_call_arguments.delta":
-                                i2 = evt.get("output_index", 0)
-                                if i2 in tc_buf:
-                                    tc_buf[i2]["args"] += evt.get("delta", "")
-                            elif etype in ("response.failed", "response.incomplete"):
-                                r = evt.get("response") or {}
-                                e = r.get("error") or {}
-                                emsg = (e.get("message") if isinstance(e, dict) else None) or (r.get("incomplete_details") or {}).get("reason") or etype
-                                raise LLMError(f"provider {etype}: {emsg}")
-                            elif etype == "response.completed":
-                                usage = _normalize_usage((evt.get("response") or {}).get("usage") or {}, "responses")
+                        if resp.status_code in NEVER_RETRY_STATUS:
+                            raise LLMError(msg)
+                        if resp.status_code in RETRYABLE_STATUS:
+                            fail_msg = msg
+                            wait_s = _backoff_s(attempt, _retry_after_s(resp))
                         else:
-                            ch = (evt.get("choices") or [{}])[0]
-                            delta = ch.get("delta") or {}
-                            dr = delta.get("reasoning_content") or delta.get("reasoning")
-                            if dr:
-                                reasoning += dr; got_any = True
-                                if on_delta: on_delta("reasoning", dr)
-                            if delta.get("content"):
-                                content += delta["content"]; got_any = True
-                                if on_delta: on_delta("text", delta["content"])
-                            for tc in (delta.get("tool_calls") or []):
-                                i2 = tc.get("index", 0)
-                                has_name = bool((tc.get("function") or {}).get("name"))
-                                if i2 not in tc_buf:
-                                    if has_name or not tc_buf:
-                                        tc_buf[i2] = {"id": tc.get("id") or "", "name": "", "args": ""}
-                                    else:
-                                        i2 = max(tc_buf)
-                                if has_name:
-                                    tc_buf[i2]["name"] = tc["function"]["name"]
-                                if (tc.get("function") or {}).get("arguments"):
-                                    tc_buf[i2]["args"] += tc["function"]["arguments"]
-                                if tc.get("id") and not tc_buf[i2]["id"]:
-                                    tc_buf[i2]["id"] = tc["id"]
-                            if evt.get("usage"):
-                                usage = _normalize_usage(evt["usage"], "chat_completions")
+                            raise LLMError(msg)
+                        if not wait_s:
+                            raise LLMError(fail_msg)
+                    else:
+                        if not stream:
+                            # 非流式：一次读完整个 body
+                            text = (await resp.aread()).decode("utf-8", "replace")
+                            evt = json.loads(text) if text.strip() else {}
+                            perr = _provider_error(evt)
+                            if perr:
+                                raise LLMError(f"provider error: {perr}")
+                            if self.s.api_mode == "responses":
+                                _collect_responses_body(evt, tc_buf)
+                                content = _responses_text(evt)
+                                usage = _normalize_usage((evt.get("response") or evt).get("usage") or {}, "responses")
+                            else:
+                                ch = (evt.get("choices") or [{}])[0]
+                                msg0 = ch.get("message") or {}
+                                content = msg0.get("content") or ""
+                                reasoning = msg0.get("reasoning_content") or msg0.get("reasoning") or ""
+                                _collect_chat_tool_calls(msg0.get("tool_calls") or [], tc_buf)
+                                usage = _normalize_usage(evt.get("usage") or {}, "chat_completions")
+                            got_any = bool(content or reasoning or tc_buf)
+                            # 整包 JSON 读到了就是完整结束，没有「断流」概念
+                            saw_done = saw_finish = True
+                            if on_delta:
+                                if reasoning:
+                                    on_delta("reasoning", reasoning)
+                                if content:
+                                    on_delta("text", content)
+                        else:
+                            async for line in resp.aiter_lines():
+                                if stop_check and stop_check():
+                                    saw_done = True  # 用户主动停，不算断流
+                                    break
+                                data = _sse_payload(line)
+                                if data is None:
+                                    continue
+                                if data == "[DONE]":
+                                    saw_done = True
+                                    break
+                                try:
+                                    evt = json.loads(data)
+                                except Exception:
+                                    continue
+                                perr = _provider_error(evt)
+                                if perr:
+                                    fail_msg = f"provider error: {perr}"
+                                    wait_s = _backoff_s(attempt)
+                                    break
+                                if self.s.api_mode == "responses":
+                                    etype = evt.get("type", "")
+                                    if etype == "response.output_text.delta":
+                                        d = evt.get("delta", "")
+                                        if d:
+                                            content += d; got_any = True
+                                            if on_delta: on_delta("text", d)
+                                    elif etype == "response.reasoning_summary_text.delta":
+                                        d = evt.get("delta", "")
+                                        if d:
+                                            reasoning += d; got_any = True
+                                            if on_delta: on_delta("reasoning", d)
+                                    elif etype == "response.output_item.added":
+                                        item = evt.get("item", {})
+                                        if item.get("type") == "function_call":
+                                            i2 = evt.get("output_index", 0)
+                                            tc_buf[i2] = {"id": item.get("call_id", item.get("id", "")), "name": item.get("name", ""), "args": ""}
+                                    elif etype == "response.function_call_arguments.delta":
+                                        i2 = evt.get("output_index", 0)
+                                        if i2 in tc_buf:
+                                            tc_buf[i2]["args"] += evt.get("delta", "")
+                                    elif etype in ("response.failed", "response.incomplete"):
+                                        r = evt.get("response") or {}
+                                        e = r.get("error") or {}
+                                        emsg = (e.get("message") if isinstance(e, dict) else None) or (r.get("incomplete_details") or {}).get("reason") or etype
+                                        fail_msg = f"provider {etype}: {emsg}"
+                                        wait_s = _backoff_s(attempt)
+                                        break
+                                    elif etype == "response.completed":
+                                        saw_finish = True
+                                        usage = _normalize_usage((evt.get("response") or {}).get("usage") or {}, "responses")
+                                else:
+                                    ch = (evt.get("choices") or [{}])[0]
+                                    delta = ch.get("delta") or {}
+                                    dr = delta.get("reasoning_content") or delta.get("reasoning")
+                                    if dr:
+                                        reasoning += dr; got_any = True
+                                        if on_delta: on_delta("reasoning", dr)
+                                    if delta.get("content"):
+                                        content += delta["content"]; got_any = True
+                                        if on_delta: on_delta("text", delta["content"])
+                                    _collect_chat_tool_calls_delta(delta.get("tool_calls") or [], tc_buf)
+                                    if ch.get("finish_reason"):
+                                        saw_finish = True
+                                    if evt.get("usage"):
+                                        usage = _normalize_usage(evt["usage"], "chat_completions")
+                        if fail_msg:
+                            # 流中途断掉/上游报错：下面统一决定重试方式
+                            pass
+                        elif not saw_done and not saw_finish:
+                            # 上游把连接关了但既没发 [DONE] 也没发 finish_reason：
+                            # 这是「断流」，不是「正常结束」。把它当成功会返回半截
+                            # 内容，agent_loop 会以为模型答完了从而结束整轮——
+                            # 真机 927s 僵死就是这种形态。降级非流式再取一次完整结果。
+                            fail_msg = "stream ended without terminator (truncated)"
+                            wait_s = 0.0
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError,
+                    httpx.RemoteProtocolError, json.JSONDecodeError) as e:
+                fail_msg = f"network error: {type(e).__name__}: {e}"
+                wait_s = _backoff_s(attempt)
+            except httpx.HTTPError as e:
+                fail_msg = f"network error: {type(e).__name__}: {e}"
+                wait_s = _backoff_s(attempt)
+
+            if not fail_msg:
                 break
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
-                if attempt < self.s.max_retries and not got_any:
-                    attempt += 1
-                    continue
-                raise LLMError(f"network error: {type(e).__name__}: {e}")
+
+            # ---- 失败后的重试决策 ----
+            # 1) 已经吐过内容：原样重试会重复内容 → 降级非流式取完整结果（只做一次）
+            if got_any and stream and not degraded and attempt < self.s.max_retries:
+                degraded = True
+                attempt += 1
+                logger.warning("LLM 流中断但有部分输出，降级为非流式重试（第 %s 次）：%s",
+                               attempt, fail_msg[:200])
+                _llm_retry_event("llm_retry_degraded", attempt, fail_msg, waited=0.0)
+                continue
+            # 2) 预算与等待闸
+            if attempt >= self.s.max_retries:
+                _llm_retry_event("llm_gave_up", attempt, fail_msg, waited=wait_s)
+                raise LLMError(fail_msg)
+            if budget_used + wait_s > RETRY_WAIT_BUDGET_S:
+                _llm_retry_event("llm_gave_up", attempt, fail_msg, waited=wait_s,
+                                 reason="retry_wait_budget_exhausted")
+                raise LLMError(f"{fail_msg}\n[重试预算耗尽] 累计等待已超过 {int(RETRY_WAIT_BUDGET_S)}s")
+            attempt += 1
+            logger.warning("LLM 请求失败，%.1fs 后重试（第 %s/%s 次）：%s",
+                           wait_s, attempt, self.s.max_retries, fail_msg[:200])
+            _llm_retry_event("llm_retry", attempt, fail_msg, waited=wait_s)
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+                budget_used += wait_s
+            continue
 
         tool_calls = []
         for i2 in sorted(tc_buf):

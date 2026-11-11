@@ -569,6 +569,26 @@ async def reclaim_task(scope: TeamScope, task_id: str, *, expected_version: int)
     return {"ok": True, "task": task}
 
 
+async def _agent_is_dead(conn, scope: TeamScope, agent_id: str) -> bool:
+    """这个 owner 是否已经处于无法再干活的终态。
+
+    只看 ``subagent_runs``：agent 结束时 host 会 ``finish_run`` 写入终态。
+    没有记录（或还在 running/idle）一律视为「活着」，宁可拒绝重绑也不误抢。
+    """
+    cur = await conn.execute(
+        "SELECT status FROM subagent_runs WHERE user_id=? AND session_id=? "
+        "AND generation_id=? AND team_id=? AND agent_id=? "
+        "ORDER BY started_at DESC LIMIT 1",
+        (*scope.key(), agent_id),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return False
+    # completed 说明它干完了（任务本应已置 completed），不算"死"；剩下的终态
+    # 才是真的没法继续了。
+    return str(row[0] or "") in ("errored", "stopped", "closed", "cancelled")
+
+
 async def bind_task_owner(scope: TeamScope, task_id: str, owner_agent_id: str, *,
                           expected_version: int) -> dict[str, Any]:
     """Assign a pending task to an agent, refusing one whose blockers are open.
@@ -585,13 +605,40 @@ async def bind_task_owner(scope: TeamScope, task_id: str, owner_agent_id: str, *
             team_event("task_bind_blocked", task_id=task_id, actor=owner_agent_id,
                        team_id=scope.team_id, reason="blocked_by_incomplete")
             return {"ok": False, "reason": "blocked"}
+        # 原 owner 已经死掉的任务可以直接接管。
+        # 团队韧性要求「一个 agent 出问题不能拖垮整个团队」：队友 errored/stopped
+        # 之后，它占着的任务会永远停在 in_progress。如果只能靠模型先记得手动
+        # reclaim，模型一旦没想到，任务板就烂在那里。这里让平台自己接管——
+        # 但只在原 owner 确实处于终态、且不是 completed（那说明它干完了）时才允许。
         cur = await conn.execute(
-            f"UPDATE team_tasks SET status='in_progress',owner_agent_id=?,version=version+1,updated_at=? "
-            f"WHERE task_id=? AND {where} AND status='pending' AND owner_agent_id='' AND version=?",
-            (owner_agent_id, now_ms(), task_id, *args, int(expected_version)),
+            f"SELECT status, owner_agent_id FROM team_tasks WHERE task_id=? AND {where}",
+            (task_id, *args),
         )
-        await conn.commit()
-        ok = (cur.rowcount or 0) == 1
+        row = await cur.fetchone()
+        stale_owner = False
+        if row is not None:
+            status, cur_owner = str(row[0] or ""), str(row[1] or "")
+            if status == "in_progress" and cur_owner and cur_owner != owner_agent_id:
+                stale_owner = await _agent_is_dead(conn, scope, cur_owner)
+        if stale_owner:
+            team_event("task_owner_stale_rebound", task_id=task_id,
+                       actor=owner_agent_id, team_id=scope.team_id,
+                       previous_owner=str(row[1] or ""))
+            cur = await conn.execute(
+                f"UPDATE team_tasks SET status='in_progress',owner_agent_id=?,"
+                f"version=version+1,updated_at=? WHERE task_id=? AND {where}",
+                (owner_agent_id, now_ms(), task_id, *args),
+            )
+            await conn.commit()
+            ok = (cur.rowcount or 0) == 1
+        else:
+            cur = await conn.execute(
+                f"UPDATE team_tasks SET status='in_progress',owner_agent_id=?,version=version+1,updated_at=? "
+                f"WHERE task_id=? AND {where} AND status='pending' AND owner_agent_id='' AND version=?",
+                (owner_agent_id, now_ms(), task_id, *args, int(expected_version)),
+            )
+            await conn.commit()
+            ok = (cur.rowcount or 0) == 1
     if not ok:
         task = await get_task(scope, task_id)
         return {"ok": False, "reason": "not_found" if task is None else "conflict"}

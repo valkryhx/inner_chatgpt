@@ -253,6 +253,29 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
             return injected
         return _drain()
 
+    def _team_gate() -> str:
+        """lead 想收工时问一句：团队还有没有没跑完的活？
+
+        返回空串 = 可以收工。返回非空 = 还有活，并说明是什么，循环据此续跑。
+
+        为什么必须有这道闸：模型很自然会在「等 reader」之后结束自己那一轮，
+        而队友的结论还没回来。没有闸的话，结果只能躺在收件箱里，任务板永远
+        停在 pending —— 真机 runId 111915-64a6 就是这样丢了整个结论。
+
+        为什么必须在有活时返回原因而不是布尔：同一句话要既给循环看、又注进
+        模型上下文当指令，写两遍容易漂移。
+        """
+        live = [n for n in host.registry.active_nodes() if not n.is_idle]
+        if live:
+            names = "、".join(n.name for n in live[:5])
+            return f"还有 {len(live)} 个队友正在运行（{names}），结果尚未返回。"
+        idle = [n for n in host.registry.active_nodes() if n.is_idle]
+        if idle:
+            names = "、".join(n.name for n in idle[:5])
+            return (f"{names} 仍在待命（空闲但未结束），你可以继续用它干活，"
+                    "或者用 close_agent 释放槽位。")
+        return ""
+
     loop = AgentLoop(
         base_runtime.model.client,
         merged,
@@ -262,6 +285,8 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
         user_id=team_ctx.user_id,
         # 子代理完成通知 + 团队收件箱：每轮模型调用前注入（fold 点）
         message_injector=_lead_injector,
+        # 收工前的团队闸：队友还在跑就别结束这一轮
+        team_gate=_team_gate,
     )
     return TurnRuntime(
         loop=loop,

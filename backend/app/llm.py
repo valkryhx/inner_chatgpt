@@ -36,8 +36,22 @@ def build_client_from_config(cfg: dict, *, max_tokens: int | None = None,
 
     cfg keys: wire_api / base_url / api_key / model / max_tokens / reasoning_effort / ...
     """
+    from .llm_client import max_retries_from_env
+
     wire = (cfg.get("wire_api") or "openai_chat").strip()
     tokens = max_tokens if max_tokens is not None else int(cfg.get("max_tokens", 8192) or 8192)
+    # 重试预算：用户配置 > 环境变量 > 默认。
+    # 用户配置表里根本没有 max_retries 字段（见 user_llm_configs），所以以前的
+    # 硬编码 2 会让 HLZ_LLM_MAX_RETRIES 完全失效——真机 502 时只重试 2 次就放弃，
+    # 而运维以为自己已经调到 4 了。
+    raw_retries = cfg.get("max_retries")
+    if raw_retries is None or str(raw_retries).strip() == "":
+        retries = max_retries_from_env()
+    else:
+        try:
+            retries = max(0, min(int(raw_retries), 8))
+        except (TypeError, ValueError):
+            retries = max_retries_from_env()
     return LLMClient(ClientSettings(
         model=cfg.get("model", ""),
         base_url=cfg.get("base_url", ""),
@@ -46,7 +60,7 @@ def build_client_from_config(cfg: dict, *, max_tokens: int | None = None,
         temperature=float(cfg.get("temperature", 1.0) or 1.0),
         max_tokens=tokens,
         timeout=int(cfg.get("timeout", 120) or 120),
-        max_retries=int(cfg.get("max_retries", 2) or 2),
+        max_retries=retries,
         reasoning_effort=(cfg.get("reasoning_effort") or None),
         system_prompt=system_prompt,
     ))

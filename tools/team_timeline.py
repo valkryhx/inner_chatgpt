@@ -41,6 +41,15 @@ FIELDS = {
     "task_completed": ("task_id", "actor", "version"),
     "task_complete_failed": ("task_id", "actor", "reason", "actual_owner"),
     "task_bind_blocked": ("task_id", "actor", "reason"),
+    "task_owner_stale_rebound": ("task_id", "actor", "previous_owner"),
+    # 韧性事件：API 中断后的自愈过程。排查「为什么这次慢/为什么还是失败了」
+    # 时先看这几条。
+    "llm_retry": ("attempt", "waited", "error"),
+    "llm_retry_degraded": ("attempt", "waited", "error"),
+    "llm_gave_up": ("attempt", "waited", "reason", "error"),
+    "agent_loop_continue": ("attempt", "error"),
+    "agent_loop_gave_up": ("attempt", "error"),
+    "lead_wait_team": ("attempt", "error"),
 }
 
 
@@ -112,7 +121,22 @@ def _diagnose(rows: list[dict]) -> None:
         print(f"⚠ {len(bad_end)} 个 agent 带错误结束：")
         for r in bad_end[:5]:
             print(f"    {r.get('agent')} {r.get('status')} {r.get('error')}")
-    if not stuck and not failed and not bad_end:
+    # 韧性：这次协作里断过几次、恢没恢复
+    gave_up = [r for r in rows if r["event"] in
+               ("llm_gave_up", "agent_loop_gave_up")]
+    retried = [r for r in rows if r["event"] in
+               ("llm_retry", "llm_retry_degraded", "agent_loop_continue")]
+    if retried or gave_up:
+        print(f"ℹ API 中断自愈：{len(retried)} 次重试，{len(gave_up)} 次放弃")
+        for r in gave_up[:3]:
+            print(f"    放弃于 {r.get('ts', '')[11:]} attempt={r.get('attempt')} "
+                  f"{(r.get('error') or '')[:120]}")
+        if retried and not gave_up:
+            print("    ✓ 全部自愈成功，没有中断泄漏到用户")
+    waited = [r for r in rows if r["event"] == "lead_wait_team"]
+    if waited:
+        print(f"ℹ lead 因队友未完成而续跑 {len(waited)} 次")
+    if not stuck and not failed and not bad_end and not gave_up:
         print("✓ 没有发现消息滞留或投递失败")
 
 
