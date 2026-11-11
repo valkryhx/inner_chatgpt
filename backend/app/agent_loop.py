@@ -43,6 +43,29 @@ def _llm_retry_limit_from_env(default: int = 2) -> int:
     return max(0, min(n, 3))
 
 
+def _friendly_llm_error(err: Exception) -> str:
+    """把上游的原始报错翻译成用户能理解的一句话。
+
+    上游 502 时原始错误是整段 nginx HTML（`<html><head><title>502 Bad
+    Gateway</title>...`），直接展示对用户毫无意义，也看不出「这是上游的问题、
+    不是你的操作有问题、已经自动重试过了」。
+    """
+    raw = str(err or "")
+    head = raw.splitlines()[0] if raw else ""
+    if "502" in head or "Bad Gateway" in raw:
+        return ("上游模型服务暂时不可用（502 Bad Gateway）。已自动重试并续跑多次仍失败，"
+                "这不是你的操作问题。稍后重发即可，已完成的工作都在上下文里。")
+    if "504" in head or "Gateway Timeout" in raw:
+        return ("上游模型服务响应超时（504 Gateway Timeout）。已自动重试仍失败，"
+                "通常是上游负载过高，稍后重发即可。")
+    if "429" in head or "rate limit" in raw.lower():
+        return ("上游模型服务限流（429）。已自动退避重试仍失败，请稍后再试。")
+    if "network error" in raw.lower():
+        return ("与模型服务的连接中断，已自动重试仍失败。请检查网络或稍后重发。")
+    # 其它情况保留原文，但截断，避免整段 HTML 砸到界面上
+    return head[:300] if head else "模型调用失败"
+
+
 def _team_grace_from_env(default: int = 3) -> int:
     """lead 想收工但团队还有活时，允许续跑的轮数。
 
@@ -319,7 +342,7 @@ class AgentLoop:
                     _llm_retry_notice("agent_loop_continue", llm_retries, e)
                     continue
                 _llm_retry_notice("agent_loop_gave_up", llm_retries, e)
-                yield {"type": "error", "error": str(e)}
+                yield {"type": "error", "error": _friendly_llm_error(e)}
                 return
             except asyncio.CancelledError:
                 # Cancelling the outer SSE task must also stop the inner LLM

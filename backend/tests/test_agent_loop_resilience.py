@@ -164,3 +164,30 @@ async def test_continue_injects_actionable_hint_not_raw_error(monkeypatch):
     joined = "\n".join(str(c) for c in seen_history.get("msgs", []))
     assert "接口中断" in joined, f"应注入可执行提示，实际 {joined[:300]}"
     assert "<html>" not in joined, "不该把原始上游 HTML 塞进上下文"
+
+# ---------------- 用户可见的错误信息 ----------------
+@pytest.mark.parametrize("raw,expect", [
+    ("HTTP 502: <html><head><title>502 Bad Gateway</title></head>", "502"),
+    ("HTTP 504: <html>Gateway Timeout</html>", "504"),
+    ("HTTP 429: rate limited", "429"),
+    ("network error: ReadError: connection reset", "连接中断"),
+])
+def test_llm_error_is_translated_for_users(raw, expect):
+    """上游报错不该照搬给用户：502 的原文是整段 nginx HTML。"""
+    from app.agent_loop import _friendly_llm_error
+
+    msg = _friendly_llm_error(Exception(raw))
+
+    assert expect in msg, f"应包含 {expect}，实际 {msg!r}"
+    assert "<html>" not in msg, f"不该把 HTML 塞给用户，实际 {msg!r}"
+    assert "重试" in msg or "重发" in msg, f"应告知已自动重试过，实际 {msg!r}"
+
+
+def test_unknown_error_does_not_leak_whole_html():
+    """未知错误也要截断，不能把整段 HTML 砸到界面上。"""
+    from app.agent_loop import _friendly_llm_error
+
+    big = "HTTP 418: " + "<div>" * 2000
+    msg = _friendly_llm_error(Exception(big))
+
+    assert len(msg) <= 320, f"应截断，实际长度 {len(msg)}"
