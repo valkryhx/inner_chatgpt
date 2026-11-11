@@ -56,6 +56,87 @@ async def test_multiple_idle_agents_wake_independently():
     assert "给 a" not in b.pending_messages[0]["content"], "不能串消息"
 
 
+# ---------- 边界 5：实时投递过的消息，下一轮补投不能重复注入 ----------
+@pytest.mark.asyncio
+async def test_live_delivered_message_is_not_refilled_next_round():
+    """真实缺陷：lead 给 idle 队友发消息时走实时投递，库里标成 delivered 就停住了。
+    队友下一轮 _refill_inbox 用 consume_inbox 把 state IN ('queued','delivered')
+    全取出来，于是同一件事被安排两遍。真机 steer 场景里 state 停在 delivered
+    就是这个缺陷的痕迹。
+    """
+    from app import db, team_store
+    from app.scope import TeamScope
+    from app.team_host import TeamHost
+
+    await db.init_db()
+    await team_store.init_tables()
+
+    host = _host()
+    uid, sid = host.ctx.user_id, host.ctx.session_id
+    node = host.registry.create_child(host.ctx, "writer", team_id="team_x")
+    node.status = "idle"
+    node.wake.clear()
+
+    # 子代理视角的收件箱（与 SubagentRuntime 里构造的一致）
+    child_scope = TeamScope(user_id=uid, session_id=sid, generation_id="g1",
+                            team_id="team_x", agent_id="sub:writer", role="teammate")
+    child_host = TeamHost(child_scope, deliver_sink=host.deliver_team_message)
+
+    row = await team_store.send_message(
+        child_scope, recipient="sub:writer", kind="request", content="再补一句西湖")
+
+    # 真实投递路径：推给活体 → 打 delivered 标记
+    out = host.deliver_team_message("sub:writer", row)
+    assert out["delivered"] is True
+    await team_store.mark_messages_delivered(child_scope, [row["message_id"]])
+    assert len(node.pending_messages) == 1
+    node.drain_pending()  # 这一轮已经把它注入模型了
+
+    # 下一轮开始前补投：这条已经交付过的消息不能再进来
+    runtime = type("_R", (), {"team_host": child_host})()
+    await host._refill_inbox(node, runtime)
+
+    assert len(node.pending_messages) == 0, (
+        "同一消息被重复注入："
+        f"{[m['content'][:30] for m in node.pending_messages]}")
+
+    await team_store.delete_session_data(uid, sid)
+
+
+# ---------- 边界 5b：lead 收件箱同样不能重复注入 ----------
+@pytest.mark.asyncio
+async def test_live_delivered_message_is_not_reinjected_into_lead_inbox():
+    """同一条缺陷在 lead 侧的表现：实时推过的消息，下一轮 turn 开始的
+    deliver_pending_inbox 不能再取一次。"""
+    from app import db, team_store
+    from app.scope import TeamScope
+    from app.team_host import TeamHost
+
+    await db.init_db()
+    await team_store.init_tables()
+
+    host = _host()
+    uid, sid = host.ctx.user_id, host.ctx.session_id
+    node = host.registry.create_child(host.ctx, "worker", team_id="team_x")
+    node.status = "running"
+
+    lead_scope = TeamScope(user_id=uid, session_id=sid, generation_id="g1",
+                           team_id="team_x", agent_id="root", role="lead")
+    lead_host = TeamHost(lead_scope, deliver_sink=host.push_team_message)
+
+    row = await team_store.send_message(
+        lead_scope, recipient="root", kind="result", content="第一轮结论 4242")
+    host.push_team_message(row)
+    await team_store.mark_messages_delivered(lead_scope, [row["message_id"]])
+    host.drain_notifications()
+
+    n = await host.deliver_pending_inbox(lead_host)
+
+    assert n == 0, f"已交付过的消息被再次注入 {n} 条"
+    assert host.drain_notifications() == []
+    await team_store.delete_session_data(uid, sid)
+
+
 # ---------- 边界 2：idle 队友被 stop 时，idle_wait 要立刻返回 ----------
 @pytest.mark.asyncio
 async def test_stop_breaks_idle_wait_immediately():

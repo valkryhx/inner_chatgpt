@@ -288,3 +288,72 @@ async def test_update_run_progress_persists_without_finishing():
     assert row["status"] == "completed"
     assert "最终" in (row["result_text"] or "")
     await team_store.delete_session_data(uid, sid)
+
+
+# ---------------- 漏洞 8：关闭「已干完活的空闲队友」不得记成 stopped ----------------
+@pytest.mark.asyncio
+async def test_close_idle_settled_worker_records_completed():
+    """真实用法：lead 收完结果后 close_agent 释放槽位。
+
+    它这一轮已经做完、结果也交回去了，被回收的只是槽位。记 stopped 会让前端
+    显示「已停止」，用户会以为自己打断了它。
+    """
+    host = _host(_ctx())
+    node = host.registry.create_child(host.ctx, "worker_c", team_id="team_x")
+    node.status = "idle"
+    node.rounds = 1
+    node.turns = 7
+    node.result = "任务3：总结完成"
+
+    out = await host.close("worker_c")
+
+    assert out["ok"] is True
+    assert node.status == "completed", f"应记 completed，实际 {node.status}"
+    assert node.error == ""
+
+
+@pytest.mark.asyncio
+async def test_close_idle_worker_with_pending_message_stays_stopped():
+    """反向确认：还有没处理的消息时关闭，是真的打断，不能被判成 completed。"""
+    host = _host(_ctx())
+    node = host.registry.create_child(host.ctx, "worker_d", team_id="team_x")
+    node.status = "idle"
+    node.rounds = 1
+    node.pending_messages.append({"content": "还没干的活", "message_id": "t1"})
+
+    await host._stop_node(node)
+
+    assert not node.is_terminal, "有待办消息时不能预判 completed"
+    assert node.status == "stopping", f"应停在 stopping 交给循环判定，实际 {node.status}"
+
+
+@pytest.mark.asyncio
+async def test_close_running_worker_stays_stopped():
+    """反向确认：正在跑的队友被关，不能被判成 completed。"""
+    host = _host(_ctx())
+    node = host.registry.create_child(host.ctx, "worker_e", team_id="team_x")
+    node.status = "running"
+    node.rounds = 1
+
+    await host._stop_node(node)
+
+    assert not node.is_terminal, "跑到一半时不能预判 completed"
+    assert node.status == "stopping", f"应停在 stopping 交给循环判定，实际 {node.status}"
+
+
+@pytest.mark.asyncio
+async def test_slot_eviction_of_settled_idle_worker_records_completed():
+    """槽位淘汰（max_active 打满）也不是「打断」，不该记 stopped。"""
+    host = _host(_ctx())
+    host.registry = SubagentRegistry(max_depth=2, max_active=1)
+    a = host.registry.create_child(host.ctx, "a", team_id="team_x")
+    a.status = "idle"
+    a.idle_since = 1.0
+    a.wake.clear()
+    a.rounds = 1
+    a.result = "已完成"
+
+    host.registry.create_child(host.ctx, "b", team_id="team_x")
+
+    assert a.stop.is_set(), "被淘汰的节点仍需 stop"
+    assert a.status == "completed", f"淘汰已干完活的 idle 节点应记 completed，实际 {a.status}"

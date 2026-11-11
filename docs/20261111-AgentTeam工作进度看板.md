@@ -7,11 +7,12 @@
 
 | 项 | 值 |
 |---|---|
-| 分支 / HEAD | `main` @ `9ec0ba3` |
-| 后端单测 | **541 passed** |
+| 分支 / HEAD | `main`（F1–F3 修复未提交） |
+| 后端单测 | **550 passed** |
 | 前端构建 | 通过 |
 | 持久化开关 | `TEAMMATE_IDLE_TIMEOUT_S`（**默认 0 = 关闭**，行为与历史一致） |
-| AGENTS.md 待更新 | 是（本文档写完后再补） |
+| 日志 | **默认开启**（`HLZ_LOG_LEVEL=INFO` + team JSONL），关：`HLZ_LOG_LEVEL=OFF` / `HLZ_TEAM_LOG=0` |
+| AGENTS.md 待更新 | 是（F1–F3 修完后补） |
 
 ## 2. 三份文档的分工（先看这个再决定读哪份）
 
@@ -22,6 +23,35 @@
 | `docs/20261111-AgentTeam持久化Worker分析与设计.md` | **设计与 P-A 实施记录** + §4.5 的 7 处漏洞复核 | 想改持久化 / 想知道坑在哪 |
 
 ## 3. 已完成（按时间倒序）
+
+### ✅ 真实使用观察（本轮，持久化开着跑真机）
+
+开着 `TEAMMATE_IDLE_TIMEOUT_S=45` + 默认日志，用真实湛卢跑三个贴近日常的场景
+（`iterative` 分两步追问 / `pipeline` 三任务依赖链 / `steer` 中途改需求），
+**抓到 3 个单测原理上测不到的链路缺陷**：
+
+| # | 缺陷 | 现象 | 根因 |
+|---|---|---|---|
+| F1 | **lead 关掉已干完活的空闲队友，被记成 `stopped`** | 前端 `SubagentCard` 显示「已停止」，用户以为自己打断了它；实际它这轮做完了、结果也交了 | `_stop_node` 只对 `reason="drain"` 补偿成 `completed`，`reason="close"` 直接落 `stopped`。`close()` 还会无条件盖成 `closed` |
+| F2 | **实时投递过的消息会被二次注入** | `send_message` 实时推给活体后库里只标 `delivered`，下一轮 `_refill_inbox` / `deliver_pending_inbox` 又把 `state IN ('queued','delivered')` 全取一次 | 状态机少推进一格：已进对方面前队列的消息，库里必须同步成 `consumed` |
+| F3 | **时间线工具误报「消息滞留」** | teammate→lead 的实时投递走内存通知队列，不记 `message_delivered`；实时投递成功也不记 `inbox_consumed` | 成功分支没有埋点，`team_timeline.py` 只能看到 `message_queued` |
+
+F2 是最值得记的：它不是投递逻辑写错，而是**「实时投递」与「补投」两条路径共用一张
+状态表却不同步推进**。真机 `steer` 场景里那条 `root → sub:writer` 停在 `delivered`
+就是它的痕迹 —— 当时看着只是"状态没更新"，实际是下一轮会把同一件事再安排一遍。
+
+**修法**：
+- `_stop_node` 增加 `settled = was_idle and not has_pending_work`，`close` 也走 completed 分支；
+  `close()` 改成 `if not node.is_terminal` 才盖 `closed`；
+- `registry._evict_one_idle` 淘汰空闲节点时同样先判 `completed`（槽位回收不是打断）；
+- `mark_messages_delivered` 直接把状态推到 `consumed`（改语义并重命名注释）;
+- `team_host._deliver` 成功分支补 `message_delivered`（带 `logged` 标志去重），
+  实时投递成功后补一条 `inbox_consumed`（标 `via=live_delivery`）。
+
+**验证**：单测 541 → **550**（新增 6 条：close idle / close 有 pending / close running /
+槽位淘汰 / 队友侧重复注入 / lead 侧重复注入），两组 stash 反向确认全 RED。
+真机复跑：`pipeline` 三个 worker 一致 `completed`（修复前 worker_c 是 `stopped`）、
+`steer` 的 root→writer 消息变 `consumed`、`iterative` 时间线每条消息只出现一次。
 
 ### ✅ 日志基础设施（本轮）
 
@@ -151,8 +181,9 @@ E1 是最值得记的：它不是"实现写错"，而是**持久化引入的新�
 | `_busy_probe_20261111_TR3.py` | `_idle_wait` 忙循环探测 |
 | `_rc*_20261111_TR*.py` | 各阶段反向确认 |
 
-单测：`tests/test_team_hard_contract.py`（17）、`tests/test_team_persistent_worker.py`（15）、
-`tests/test_team_persistent_loop.py`（4）、`tests/test_team_idle_edges.py`（11）。
+单测：`tests/test_team_hard_contract.py`（17）、`tests/test_team_persistent_worker.py`（19）、
+`tests/test_team_persistent_loop.py`（4）、`tests/test_team_idle_edges.py`（13）、
+`tests/test_logging_setup.py`（9）。
 
 ## 7. 下一步计划（本轮继续）
 
@@ -168,3 +199,5 @@ E1 是最值得记的：它不是"实现写错"，而是**持久化引入的新�
 - 2026-11-11（第二轮）：P-A 边界摸排完成，抓到 E1–E3 并修复；单测 524 → 535。
 - 2026-11-11（第三轮）：补日志基础设施（此前 29 处 logger 调用全部无效）；
   单测 535 → 541，真机验证协作事件流可复盘。
+- 2026-11-11（第四轮）：日志改为**默认开启**；开着持久化跑真实使用，
+  抓到 F1–F3（关闭语义 / 重复注入 / 时间线误报）并修复；单测 541 → 550。

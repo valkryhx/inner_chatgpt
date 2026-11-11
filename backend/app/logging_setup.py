@@ -6,11 +6,13 @@ uvicorn 只配置它自己的 logger，`app.*` 的日志全部被丢弃。结果
 
 设计要点：
 
-1. **一条命令能开**：`HLZ_LOG_LEVEL=INFO python run.py` 即可看到应用日志。
-   默认 `WARNING`，不改变现有运行噪音。
-2. **多智能体事件单独成文件**：`HLZ_TEAM_LOG=1` 时，所有 `hlaudz.team` 通道的
-   日志额外写到 `backend/data/logs/team-<日期>.jsonl`，每行一条 JSON。
+1. **默认开启**：应用日志默认 `INFO` 并落 `backend/data/logs/app.log`。
+   排查多智能体协作问题时，默认静默等于黑盒；要看干净输出用
+   `HLZ_LOG_LEVEL=WARNING`（或 `OFF` 完全关掉）。
+2. **多智能体事件单独成文件**（默认开启）：所有 `hlaudz.team` 通道的日志写到
+   `backend/data/logs/team-<日期>.jsonl`，每行一条 JSON。
    排查"消息为什么没到""状态为什么不一致"时直接 grep message_id / agent 名。
+   关闭：`HLZ_TEAM_LOG=0`。
 3. **不引入依赖**：只用标准库 logging + 一个自定义 Formatter。
 4. **可轮转**：按大小轮转，避免长期运行把磁盘写满。
 """
@@ -41,17 +43,30 @@ def _logs_dir() -> Path:
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
+    """读布尔开关；未设置时用 default。
+
+    显式关闭（0/false/no/off）必须能覆盖默认值，否则「默认开」就变成了
+    「无法关」，长期运行想看干净输出时会很麻烦。
+    """
     raw = os.environ.get(name)
     if raw is None:
         return default
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    text = str(raw).strip().lower()
+    if not text:
+        return default
+    if text in ("0", "false", "no", "off"):
+        return False
+    return text in ("1", "true", "yes", "on")
 
 
 def log_level() -> int:
     raw = (os.environ.get("HLZ_LOG_LEVEL") or "").strip().upper()
     if not raw:
-        return logging.WARNING
-    return getattr(logging, raw, logging.WARNING)
+        # 默认 INFO：排查多智能体协作问题时没有应用日志基本等于黑盒。
+        return logging.INFO
+    if raw in ("0", "OFF", "NONE"):
+        return logging.CRITICAL
+    return getattr(logging, raw, logging.INFO)
 
 
 class JsonLineFormatter(logging.Formatter):
@@ -113,8 +128,10 @@ def setup_logging() -> dict[str, Any]:
         root.addHandler(console)
 
         # 可选：应用日志单独落文件（不跟 uvicorn 的 access log 混）
-        app_log = (os.environ.get("HLZ_APP_LOG") or "").strip()
-        if app_log:
+        # 默认开：排查问题时最常见的情况是「事情已经发生了才去看」，
+        # 只写到 stdout 的话日志会随终端滚走。
+        app_log = (os.environ.get("HLZ_APP_LOG") or "").strip() or "app.log"
+        if _env_flag("HLZ_APP_LOG_ON", default=True) and app_log:
             path = Path(app_log) if os.path.isabs(app_log) else _logs_dir() / app_log
             path.parent.mkdir(parents=True, exist_ok=True)
             file_handler = logging.handlers.RotatingFileHandler(
@@ -124,14 +141,14 @@ def setup_logging() -> dict[str, Any]:
             file_handler.setLevel(level)
             root.addHandler(file_handler)
 
-        # 团队事件：独立 JSONL，便于 grep
-        if _env_flag("HLZ_TEAM_LOG"):
+        # 团队事件：独立 JSONL，便于 grep。默认开。
+        if _env_flag("HLZ_TEAM_LOG", default=True):
             team_path = _logs_dir() / f"team-{time.strftime('%Y%m%d')}.jsonl"
             team_path.parent.mkdir(parents=True, exist_ok=True)
             team_handler = logging.handlers.RotatingFileHandler(
                 team_path, maxBytes=50 * 1024 * 1024, backupCount=10, encoding="utf-8")
             team_handler.setFormatter(JsonLineFormatter())
-            # 团队日志恒为 INFO：它是可观测性的核心，不该被全局 WARNING 压掉
+            # 团队日志恒为 INFO：它是可观测性的核心，不该被全局级别压掉
             team_handler.setLevel(logging.INFO)
             team_logger = logging.getLogger(TEAM_LOGGER_NAME)
             team_logger.addHandler(team_handler)
@@ -147,6 +164,6 @@ def setup_logging() -> dict[str, Any]:
 
     return {
         "level": logging.getLevelName(level),
-        "team_log": str(team_path) if _env_flag("HLZ_TEAM_LOG") and team_path else "",
+        "team_log": str(team_path) if team_path else "",
         "logs_dir": str(_logs_dir()),
     }

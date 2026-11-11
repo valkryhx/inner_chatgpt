@@ -240,6 +240,11 @@ class SubagentRegistry:
         if idle:
             victim = idle[0]
             # 唤醒并停掉被淘汰的节点，否则它的 idle 循环还挂在事件循环上。
+            # 先判成 completed：淘汰只回收槽位，不是打断它的工作。记 stopped 会让
+            # 前端显示「已停止」，用户会以为自己中止了一个其实已经干完活的队友。
+            # 还有没处理的消息时不改状态——那才是真的被打断。
+            if not victim.has_pending_work and not victim.error:
+                victim.status = "completed"
             victim.stop.set()
             victim.wake.set()
             self._nodes.pop(victim.name, None)

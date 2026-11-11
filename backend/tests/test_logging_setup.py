@@ -48,18 +48,38 @@ def test_app_logger_gets_a_handler(fresh_logging, monkeypatch, capfd):
     assert "协作问题排查信息" in (out.out + out.err)
 
 
-def test_default_level_is_warning(fresh_logging, monkeypatch):
-    """不设环境变量时保持安静，不改变现有运行噪音。"""
+def test_default_level_is_info(fresh_logging, monkeypatch):
+    """默认 INFO：排查协作问题时默认静默等于黑盒。"""
     monkeypatch.delenv("HLZ_LOG_LEVEL", raising=False)
     cfg = logging_setup.setup_logging()
-    assert cfg["level"] == "WARNING"
+    assert cfg["level"] == "INFO"
+
+
+def test_level_can_be_quietened_explicitly(fresh_logging, monkeypatch):
+    """默认开不等于无法关：显式 WARNING / OFF 必须生效。"""
+    monkeypatch.setenv("HLZ_LOG_LEVEL", "WARNING")
+    assert logging_setup.setup_logging()["level"] == "WARNING"
+    logging_setup._configured = False
+    monkeypatch.setenv("HLZ_LOG_LEVEL", "OFF")
+    assert logging_setup.setup_logging()["level"] == "CRITICAL"
+
+
+def test_team_log_is_on_by_default(fresh_logging, monkeypatch):
+    monkeypatch.delenv("HLZ_TEAM_LOG", raising=False)
+    cfg = logging_setup.setup_logging()
+    assert cfg["team_log"], "团队事件日志默认应开启"
+
+
+def test_team_log_can_be_disabled(fresh_logging, monkeypatch):
+    monkeypatch.setenv("HLZ_TEAM_LOG", "0")
+    cfg = logging_setup.setup_logging()
+    assert cfg["team_log"] == ""
 
 
 def test_team_event_writes_jsonl(fresh_logging, monkeypatch):
     monkeypatch.setenv("HLZ_LOG_LEVEL", "WARNING")
-    monkeypatch.setenv("HLZ_TEAM_LOG", "1")
     cfg = logging_setup.setup_logging()
-    assert cfg["team_log"], "开启 HLZ_TEAM_LOG 后应给出文件路径"
+    assert cfg["team_log"], "团队日志默认开启应有文件路径"
 
     logging_setup.team_event("message_delivered", agent="alpha",
                              message_id="tmsg_1", was_idle=True)

@@ -443,7 +443,8 @@ class SubagentHost:
                    sender=sender_label, was_idle=node.is_idle,
                    pending=len(node.pending_messages))
         return {"delivered": True, "name": name, "agent_id": node.agent_id,
-                "idle": node.is_idle}
+                "idle": node.is_idle, "logged": True,
+                "pending": len(node.pending_messages)}
 
     def push_team_message(self, message: dict[str, Any]) -> None:
         """Queue a teammate->lead message for the lead's next turn.
@@ -789,15 +790,19 @@ class SubagentHost:
                     closed.append(child.name)
         await self._stop_node(node)
         closed.append(node.name)
-        node.status = "closed"
+        # 不要无条件盖成 closed：_stop_node 可能已经把这个 agent 判成 completed
+        # （空闲且干完活才被关）。盖掉会让「它成功干完一轮」这个事实消失。
+        if not node.is_terminal:
+            node.status = "closed"
         node.notify_waiters()
         self.registry.remove(node.name)
         self._touch()
-        return {"ok": True, "closed": closed, "status": "closed"}
+        return {"ok": True, "closed": closed, "status": node.status}
 
     async def _stop_node(self, node: AgentNode, *, reason: str = "close") -> None:
         # 关闭是有成本的（最多等 2s 优雅退出）。先把状态广播出去，
         # 否则面板在这段时间里仍显示「运行中」，用户会以为关不掉。
+        was_idle = node.is_idle
         if not node.is_terminal and node.status != "stopping":
             node.status = "stopping"
             self._publish({
@@ -806,17 +811,20 @@ class SubagentHost:
                 "name": node.name,
                 "status": "stopping",
             })
-        if reason == "drain" and node.rounds > 0 and not node.error:
-            # 本轮结束时的整体回收：这个 agent 已经干完活、只是还挂在 idle 等后续。
-            # 记 stopped 会让「它完成过一轮」这个事实在库里消失。
+        # 记 completed 而不是 stopped 的两种情形：这个 agent 其实已经干完活了，
+        # 被回收的只是它的槽位。记 stopped 会让前端显示「已停止」——用户会以为
+        # 自己打断了它，而事实是它的任务已经完成、结果也交回去了。
+        #   1. drain：本轮结束时的整体回收（所有节点统一处理）；
+        #   2. close：lead 明确关闭一个**空闲且没有待办**的队友（典型是收完结果
+        #      释放并发槽位）。此时若它正跑到一半、或还有没处理的消息，那就是
+        #      真的被打断，必须保留 stopped。
+        settled = was_idle and not node.has_pending_work
+        if (reason == "drain" or settled) and node.rounds > 0 and not node.error:
             # 状态先置 completed，再等它真的退出（finally 里会持久化这个值）；
             # 循环看到 stop 时会保留已有的终态，不会覆盖回 stopped。
             node.status = "completed"
-            node.stop.set()
-            node.wake.set()
-            await self._join_task(node, grace_s=2.0)
-            return
         node.stop.set()
+        node.wake.set()
         await self._join_task(node, grace_s=2.0)
 
     @staticmethod

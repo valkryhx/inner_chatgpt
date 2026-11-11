@@ -718,17 +718,29 @@ async def consume_inbox(scope: TeamScope, *, limit: int = 20) -> list[dict[str, 
 
 
 async def mark_messages_delivered(scope: TeamScope, message_ids: list[str]) -> int:
-    """Best-effort 'delivered' marker for rows that were pushed into a live agent."""
+    """把「已推给活着的 agent」的消息直接标成 consumed。
+
+    这里用的是 consumed 而不是 delivered：这条消息已经进了那个 agent 自己的
+    待注入队列，下一次模型调用前必然被看到，它剩下的生命周期只有「被注入」。
+
+    只标 delivered 会留下一个真实缺陷：``consume_inbox`` 把 ``queued`` 和
+    ``delivered`` 都当成可投递，于是下一轮补投（``_refill_inbox`` /
+    ``deliver_pending_inbox``）会把同一条消息再取一次 —— 队友被安排同一件事
+    两遍，lead 的收件箱也会重复注入。真机 steer 场景里 state 停在 delivered
+    就是这个问题的痕迹。
+    """
     ids = [str(x) for x in (message_ids or []) if str(x)]
     if not ids:
         return 0
     where, args = _scope_where(scope)
     placeholders = ",".join("?" for _ in ids)
+    ts = now_ms()
     async with aiosqlite.connect(DB_PATH) as conn:
         cur = await conn.execute(
-            f"UPDATE team_messages SET delivered_at=?, state='delivered' "
-            f"WHERE message_id IN ({placeholders}) AND {where} AND state='queued'",
-            (now_ms(), *ids, *args),
+            f"UPDATE team_messages SET read_at=?, delivered_at=?, state='consumed' "
+            f"WHERE message_id IN ({placeholders}) AND {where} "
+            "AND state IN ('queued','delivered')",
+            (ts, ts, *ids, *args),
         )
         await conn.commit()
         return cur.rowcount or 0

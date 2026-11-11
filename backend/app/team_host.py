@@ -380,9 +380,18 @@ class TeamHost:
         delivered = self._deliver(message)
         message["live"] = bool(delivered.get("delivered"))
         if delivered.get("delivered"):
+            # 实时投递成功 = 消息已进对方待注入队列，库里同步成 consumed。
+            # 只标 delivered 会让下一轮补投把同一条消息再取一次（重复注入）。
             await team_store.mark_messages_delivered(
                 self.scope, [message["message_id"]])
-            message["state"] = "delivered"
+            message["state"] = "consumed"
+            # 补一条消费事件：实时投递不走 consume_inbox，不记的话时间线只看到
+            # message_delivered、没有 inbox_consumed，会误判成「收了但没消费」。
+            team_event("inbox_consumed",
+                       agent=str(message.get("recipient_agent_id") or ""),
+                       team_id=self.scope.team_id, count=1,
+                       message_ids=[message["message_id"]],
+                       via="live_delivery")
         if not message["live"]:
             message["delivery_note"] = (
                 "当前没有活着的 agent 占用这个名字；消息已入库，"
@@ -419,6 +428,16 @@ class TeamHost:
             team_event("delivery_failed", message_id=message.get("message_id", ""),
                        recipient=message.get("recipient_agent_id", ""),
                        team_id=self.scope.team_id, reason=str(out.get("reason") or ""))
+        elif not out.get("logged"):
+            # 成功也要记，否则 team_timeline 会把 teammate→lead 的消息（走内存
+            # 通知队列、由 sink 回收）误判成「只入队、没投递」。
+            # sink 自己已经记过（``logged=True``）时不再重复：同一个动作两条
+            # message_delivered 会让时间线看起来像投递了两次。
+            team_event("message_delivered", message_id=message.get("message_id", ""),
+                       agent=str(out.get("name") or message.get("recipient_agent_id", "")),
+                       team_id=self.scope.team_id,
+                       sender=str(message.get("sender_agent_id") or ""),
+                       pending=out.get("pending", 0))
         return out
 
     async def consume_inbox(self, *, limit: int = 20) -> list[dict[str, Any]]:
