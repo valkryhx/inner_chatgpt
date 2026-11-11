@@ -194,6 +194,7 @@ return fmt.Errorf("sandbox: no SANDBOX_BASE_URL configured")
 
 - 2026-11-11：首版。基于 `u_attacker` 身份的真实探针实测（可读出其他用户的
   api_key / 密码哈希 / 全部消息），与 `file_read` 的对照结果。
+- 2026-11-11：补 §9 对标 LibreChat（`D:/git_codes/LibreChat`）。
 
 ## 8. 实施记录（已完成）
 
@@ -257,3 +258,190 @@ return fmt.Errorf("sandbox: no SANDBOX_BASE_URL configured")
 不退回宿主机 —— 这是与 Hlaudz 当前实现的本质差别。
 
 建议把「code_run 换成容器隔离」列为独立阶段（P1），不在本次范围。
+
+## 9. 对标 LibreChat：把「执行」彻底移出平台进程
+
+> 调研对象：`D:/git_codes/LibreChat`（更工程化的一套，已产品化多租户代码执行）。
+> 结论先放在这里：**LibreChat 根本不执行用户代码**。它连「进程内跑一段脚本」这条
+> 路都没有，所以 §2 那类逃逸在它的架构里不存在。
+
+### 9.1 它把代码执行整体外置了
+
+`packages/api/src/code/` 有 24 个非测试源文件（另有 24 个 `.spec.ts`）、`workspace.ts`
+单独 60 KB，看起来是做代码执行的。
+实际上这一层是**控制平面**，只做四件事：协商能力、校验路径、转发请求、映射错误。
+真正的执行发生在平台进程之外。
+
+证据链：
+
+| 位置 | 说明 |
+|---|---|
+| `vendor/code/package.json` | `"librechatUpstream": { "repository": "https://github.com/LibreChat-AI/code-interpreter" }` —— worker 是独立仓库，vendor 里只放了浏览器登记协议 |
+| `CONTEXT.md:5` | "the worker's local sandbox and capability flags remain **the final execution ceiling**" —— 隔离由 worker 负责，不由平台负责 |
+| `bridge.ts` | 全部是 HTTP 调用：`/bridge/workers/<id>/status`、pairing、lifecycle，`Authorization: Bearer <token>` |
+| `grep child_process packages/`（排除测试） | 只有 `agents/hooks/executor.ts` + `reaper.ts`（跑 hooks 声明的命令）、`app/build.ts`、`files/documents/libreoffice.ts` —— **没有一条执行用户提交代码的路径** |
+| `librechat.example.yaml` | `environments`: `type: managed`（运维自建 Code API）或 `type: attached`（`remote-bridge` 把活租给外发的 `@librechat/code` worker） |
+
+`attached` 的模型值得注意：worker 是**外发连接**的。用户的机器上跑
+`librechat-code pair <endpoint> <code>`，主动连到平台；平台从不主动连用户的机器，
+也从不把用户代码拉回自己的进程里跑。
+
+### 9.2 三种隔离路线的工程代价
+
+| 路线 | 代表 | 隔离边界 | 平台进程里有没有用户代码 |
+|---|---|---|---|
+| 进程内 + 审计钩子 | **Hlaudz（当前）** | 同进程的 Python 审计 | **有** |
+| 进程内 + 容器 | Aivory | Docker 容器 | 有（但容器内） |
+| 执行整体外置 | **LibreChat** | 外部 worker 自己的沙箱 | **没有** |
+
+LibreChat 这条路线的好处是：**平台进程里根本没有用户代码**，所以「读到平台的
+`app.db`」在物理上不成立 —— 和 Aivory 用容器达到同样的效果，但不需要平台自己
+管镜像、管 Docker、管跨平台。
+
+### 9.3 最值得抄的一条：能力协商 + fail closed
+
+LibreChat 不假定 worker 有什么能力，**让 worker 自报**（`CodeBridgeWorkerStatus`）：
+
+```ts
+export type CodeBridgeWorkerStatus = {
+  status: 'offline' | 'starting' | 'ready';
+  sandboxProfile?: string;          // 例如 'anthropic-srt'
+  runtimes?: string[];              // ['bash']
+  operations?: CodeWorkspaceOperation[];   // read_file / write_file / execute_command ...
+  maxCommandTimeoutMs?: number;
+};
+```
+
+平台只根据**自报**的能力决定注入哪些工具（`capabilities.ts`）：
+
+```ts
+if (status.status !== 'ready') throw new CodeWorkspaceSelectionError('worker_unavailable');
+if (!status.workspaces || !status.operations) throw new CodeWorkspaceSelectionError('unsupported');
+```
+
+`supportsProgrammaticCodeExecution()` 更是直接要求：
+
+```ts
+status.status === 'ready' &&
+status.runtimes?.includes('bash') === true
+```
+
+否则返回 `false` —— 对应的 spec 名字就叫 **"fails closed without native workspace
+capabilities"**。**没有能力就不注册工具**，不存在「降级到平台进程里跑」。
+
+### 9.4 第二条：路径是「白名单形状」，不是「解析后校验」
+
+`workspace.ts` 的 `isSafePath()` 不从「绝对路径 + 越界判断」入手，而是**先规定合法形状**：
+
+```ts
+!value.includes('\') &&          // 反斜杠一律不许（Windows 路径直接出局）
+!value.startsWith('/') &&          // 不许绝对路径
+!/^[A-Za-z]:/.test(value) &&       // 不许盘符
+value.split('/').every((s) => s !== '' && s !== '.' && s !== '..')   // 不许 . / .. / 空段
+value.length <= 4096 &&
+!value.includes('\0') && !value.includes('\r') && !value.includes('\n')
+```
+
+对比 Hlaudz 现在的做法（`resolve()` 之后判断是否在根内）：**LibreChat 的写法
+在语义上更安全** —— 它对「什么样的路径算合法」有唯一答案，不需要考虑
+`resolve()` 的符号链接语义、大小写、UNC、`\?\` 前缀这些平台差异。
+`\?\` 和 UNC 正是绕过 `resolve()` 比较的常见手法，而它们连形状校验都过不去。
+
+### 9.5 第三条：能力上限写死在代码里，不是配置项
+
+`workspace.ts` 顶部全是常量，不经过任何配置：
+
+```ts
+const MAX_PATH_LENGTH = 4096;
+const MAX_READ_BYTES = 1024 * 1024;
+export const WORKSPACE_WRITE_MAX_BYTES = 1024 * 1024;
+const MAX_COMMAND_BYTES = 32 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
+export const WORKSPACE_COMMAND_MAX_TIMEOUT_MS = 5 * 60_000;
+const WORKSPACE_EDIT_MAX_COUNT = 100;
+const MAX_SEARCH_RESULTS = 200;
+const MAX_LIST_RESULTS = 500;
+const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+```
+
+配置只能**往下压**（`maxCommandTimeoutMs: 120000` 注释写着 "Hard cap: 300000"，
+且有 `fitWorkspaceCommandTimeoutToBudget()` 做二次夹取）—— 配置读错了，
+天花板还在代码里。
+
+### 9.6 第四条：审批是可枚举的三档，默认最严
+
+`packages/data-provider/src/code/approval.ts`：
+
+```ts
+export const CODE_APPROVAL_MODES = ['ask', 'acceptEdits', 'fullAccess'] as const;
+const MODE_PERMISSIONS = {
+  ask:         { fileWrite: 'ask',   commandExecution: 'ask'   },
+  acceptEdits: { fileWrite: 'allow', commandExecution: 'ask'   },
+  fullAccess:  { fileWrite: 'allow', commandExecution: 'allow' },
+};
+```
+
+关键在于这个默认值：
+
+```ts
+const permitted = new Set(allowedModes ?? ['ask']);   // ← 没配置就是 ask
+```
+
+注释写着 **"Omitted deployment configuration never grants unattended execution."**
+—— 不配就是「每次问」，不是「每次放行」。这一点和 Hlaudz 的 `tool_policy`（三档
+`full` / `read_only` / `chat_only`，建 token 时定死）思路一致，但 LibreChat 的默认
+更保守。
+
+### 9.7 第五条：沙箱能力用「提示词披露」，而不是假装统一
+
+LibreChat 不假设所有 worker 都有沙箱。它把差异写进 **工具描述**：
+
+```ts
+/** Native SRT workers make the host filesystem read-only outside the workspace and a private `$TMPDIR`. */
+const ATTACHED_WORKSPACE_NATIVE_SANDBOX_SCRATCH =
+  '- / and /tmp are read-only; write scratch files to $TMPDIR or the workspace. Programs that hardcode /tmp fail.';
+```
+
+有沙箱 → 给模型这段说明；没沙箱 → 给不带这段的版本。模型因此知道
+「`/tmp` 能不能写」，不会写出注定失败的脚本。
+
+这比「所有环境假装一样」更诚实，也更容易排障 —— 模型的行为差异有据可查。
+
+### 9.8 三套方案横向对比
+
+| 维度 | Aivory | LibreChat | Hlaudz（本次修复后） |
+|---|---|---|---|
+| 用户代码在哪跑 | 平台起的 Docker 容器 | **平台进程之外**（外部 worker） | **平台进程内** |
+| 隔离手段 | 容器 namespace / cgroup | worker 自己的沙箱（native SRT / WSL2 / Docker / NsJail） | Python 审计钩子 |
+| 无沙箱时 | 拒绝执行 | **不注册工具**（fail closed） | 照常执行，靠钩子 |
+| 平台能否读到用户数据 | 用户进程读不到平台 | 用户进程与平台进程物理分离 | **同进程，靠钩子拦** |
+| shell 分支 | 容器内 | worker 内 | **绕过钩子，靠静态检查** |
+| 路径校验 | 容器挂载 | **形状白名单**（禁 `\` / 绝对 / `..`） | `resolve()` 后比根 |
+| 能力上限 | 容器资源限制 | **代码内常量 + 配置只能下压** | 部分有 |
+| 审批默认 | — | **`ask`（不配就是问）** | `full`（建 token 时定） |
+| 跨平台 | 只需容器 | 同一套协议 | 需同时管 Windows / POSIX 两套路径语义 |
+
+### 9.9 对 Hlaudz 的具体建议
+
+本次（§8）已经堵住「模型顺手写脚本读数据库」这条真实路径，但**架构位置没变**：
+用户代码仍在平台进程内。按代价从低到高：
+
+| # | 建议 | 代价 | 收益 |
+|---|---|---|---|
+| 1 | **路径形状校验**（抄 §9.4）：`file_*` 与 `code_run` 统一改成「先验形状，再解析」 | 半天 | 干掉 `\?\`、UNC、盘符这些 `resolve()` 边角 |
+| 2 | **能力自报 + fail closed**（抄 §9.3）：`code_run` 启动前探一次沙箱能力，探不到就不注册 | 1 天 | 「没有隔离就不执行」变成默认，不再是靠人记得配 |
+| 3 | **上限常量写进代码**（抄 §9.5）：`MAX_COMMAND_BYTES` / `MAX_OUTPUT_BYTES` 等，配置只能下压 | 半天 | 配置读错不再意味着无上限 |
+| 4 | **shell 分支的诚实披露**（抄 §9.7）：把「shell 只能操作 workspace 相对路径」写进工具描述 | 2 小时 | 模型不会写出注定被拦的命令，减少无效轮次 |
+| 5 | **执行外置**（抄 §9.1）：`code_run` 改成可选的外部 runner（子进程 + 容器 / 独立服务），未配置时拒绝 | 架构级，独立阶段 | 平台进程里不再有用户代码，§8.4 的四条绕过路径全部消失 |
+
+**建议的推进顺序**：先做 1–4（都是局部改动，不改变架构，能立刻降低风险），
+第 5 条作为独立阶段（P1），和 Aivory 式的容器隔离是同一个决策点 ——
+**要么把执行移出进程，要么把执行关进容器，两者选一，不能停在审计钩子**。
+
+### 9.10 一条不能含糊的结论
+
+LibreChat 的工程化程度体现在一个选择上：**它把绝大部分工程量放在「协议 + 校验 +
+上限 + 审批」上，而不是放在「更聪明的审计钩子」上。**
+
+审计钩子这条路的上限是明确的（§8.4 那几条绕过），继续加固的收益会越来越小；
+而把执行边界前移到进程外，一次改动就能一次性解决整类问题。
