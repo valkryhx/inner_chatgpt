@@ -663,6 +663,18 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                 blocks.append({"type": "injected_message", "text": text_in})
                 await _persist("streaming")
                 yield frame("message_injected", {"text": text_in})
+            elif et == "llm_retry":
+                # 模型调用失败后正在自动续跑（韧性 L2）。必须让用户看到，
+                # 否则一次几十秒的重试在界面上就是「莫名其妙卡住」。
+                await _persist("streaming")
+                yield frame("llm_retry", {"attempt": ev.get("attempt", 0),
+                                          "limit": ev.get("limit", 0),
+                                          "error": ev.get("error", "")})
+            elif et == "team_wait":
+                # lead 想收工但队友还在跑，被平台拦回去继续等（韧性 L3）。
+                await _persist("streaming")
+                yield frame("team_wait", {"reason": ev.get("reason", ""),
+                                          "grace_left": ev.get("grace_left", 0)})
             elif et == "error":
                 terminal_status = "error"
                 yield frame("error", {"error": ev.get("error", "unknown error")})

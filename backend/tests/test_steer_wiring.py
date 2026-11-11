@@ -316,3 +316,34 @@ def test_send_message_route_calls_queue_path():
     assert 0 <= call_at < acquire_at, (
         "排队判定必须在抢租约**之前**：抢了租约就等于开了新回合，"
         "那正是用户要避免的")
+
+
+# ---------------- 韧性事件的转发（README 写了就必须真的有） ----------------
+def test_event_stream_forwards_resilience_events():
+    """llm_retry / team_wait 必须经 _event_stream 转发出去。
+
+    README 把这两个事件列为前端可见契约；如果 _event_stream 没有对应分支，
+    它们只会停在 agent_loop 里，用户看不到「正在自愈」。
+    """
+    import inspect
+
+    from app.routers import chat
+
+    src = inspect.getsource(chat._event_stream)
+    assert 'et == "llm_retry"' in src, "必须转发 llm_retry"
+    assert 'frame("llm_retry"' in src, "必须真的构造 SSE 帧"
+    assert 'et == "team_wait"' in src, "必须转发 team_wait"
+    assert 'frame("team_wait"' in src
+
+
+def test_frontend_types_declare_resilience_events():
+    """前端类型也要有：事件到了但类型里没有，TypeScript 会静默忽略。"""
+    import os
+
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), "frontend", "src", "types.ts")
+    if not os.path.exists(path):
+        pytest.skip("frontend not present")
+    text = open(path, encoding="utf-8").read()
+    assert "type: 'llm_retry'" in text
+    assert "type: 'team_wait'" in text

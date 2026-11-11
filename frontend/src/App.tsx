@@ -648,6 +648,12 @@ export default function App() {
         const finishedAt = Date.now()
         runTimesRef.current.set(assistantMsg.id, { started: runStartedAt, finished: finishedAt })
         patch(withSummaries({ ...assistantMsg, status, run_finished_at: finishedAt }))
+      } else if (ev.type === 'llm_retry') {
+        // 韧性 L2：模型调用失败后正在自动续跑。不告诉用户的话，
+        // 一次几十秒的重试在界面上就是「莫名其妙卡住」。
+        setNotice(`上游连接中断，正在自动重试（${ev.attempt}/${ev.limit}）…`)
+      } else if (ev.type === 'team_wait') {
+        setNotice(`等待队友完成：${ev.reason}`)
       } else if (ev.type === 'error') {
         const finishedAt = Date.now()
         runTimesRef.current.set(assistantMsg.id, { started: runStartedAt, finished: finishedAt })

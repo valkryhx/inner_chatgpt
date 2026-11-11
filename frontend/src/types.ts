@@ -255,6 +255,8 @@ export type StreamEvent =
   | { type: 'reasoning_effort'; effective: string; source: 'session' | 'model_config' | string; model: string }
   | { type: 'team_event'; event: TeamEvent }
   | { type: 'message_injected'; text: string }
+  | { type: 'llm_retry'; attempt: number; limit: number; error: string }
+  | { type: 'team_wait'; reason: string; grace_left: number }
   | { type: 'done'; message_id: string; status: 'complete' | 'stopped' | 'error' }
   | { type: 'error'; error: string }
 

@@ -20,12 +20,15 @@
 | Skill | 三层可见性：内置 `skills_builtin/`、公用 `skills_shared/`、用户私有 `data/skills/<user_id>/`；zip 目录包安全导入；system prompt 只放 L1 清单，正文由 `load_skill` 按需加载 |
 | 内置工具 | `file_read / file_write / file_patch / list_files / code_run / load_skill`，读写限制在个人 workspace |
 | 子代理 Subagent | 进程内 asyncio 运行时：`spawn_agent / wait_agent / read_agent_result / list_agents / close_agent`；子代理继承全部业务工具与 MCP，但不能派生子代理；事件并入主对话 SSE |
+| **中途插话（steering）** | **生成过程中可以继续输入**：按发送不会另起一轮，而是插进正在执行的那个回合，模型在下一次模型调用前读到。后端 `POST /messages` 的 `mode:"queue"` 返回 `202 {"queued":true,"queue_depth":n}`；前端显示「已插入当前任务」角标。队列按 generation 存活（跨 fold 点不丢），单条上限 4000 字符、队列深度 20。详见 `docs/20261111-用户中途插话steering实施方案.md` |
 | Agent Team | 持久任务板 + 依赖 `blocked_by` + CAS 版本 + 团队消息 + lead/teammate 角色；右侧 `TeamPanel` 实时展示任务、消息与动态；lead 8 个编排工具，teammate 5 个 |
 | 外部 GenericAgent（ACP） | 以 ACP 拉起本机 GenericAgent 子进程作为外部编码代理：`ga_spawn / ga_wait / ga_result / ga_send / ga_stop` 五个 root-only 工具，事件并入主对话 SSE（`subagent_*`）。**manager 级真 GA E2E 已通过**：预检 + 工具注入、哨兵写文件、多步（读 → 改 → 跑，3 个工具步骤）、长任务停止与停止后立刻继续；预检用 `importlib.util.find_spec` 解析路径、不 import bridge（避开其 import 期 stdout 重定向），真机返回 site-packages 路径与 SHA256。Web UI E2E 未跑，DB blocks / 卡片渲染与 chat 层「停止后立即发送」未在该层验证；详见 `docs/20261109-ACP-client驱动GenericAgent实施记录.md` |
 | A2A 接入 | 每用户独立 `agent_id` / URL / Bearer token；JSON-RPC `SendMessage` / `SendStreamingMessage` (SSE) / `GetTask` / `ListTasks` / `CancelTask` / `SubscribeToTask`；默认关闭（`INNER_A2A_ENABLED=true` 才暴露，实例级硬闸）；用户级开关默认关、可在设置页热切换；token 级能力档位 `full` / `read_only` / `chat_only`（建 token 时定死，运行期不弹审批）；并发配额 + 审计表；管理入口「设置 → A2A 接入」；详见 `docs/20261110-A2A-MVP实施记录.md` |
 | 图片输入 | 选图/粘贴/拖拽上传，图片落在 `<workspace>/uploads/`，DB 只存引用；送模型时转 `image_url` / `input_image` 数据块（`openai_chat` 与 `openai_responses` 两种线格式都支持）；最近 3 轮图片在多轮对话中保留 |
 | 文件产物 | 任意格式下载：单文件、目录浏览、多选打包 zip；Markdown 本地文件胶囊、工具步骤行下载、右侧工作区面板三入口；Office 文档生成依赖已内置 |
 | 停止可靠性 | 协作停止旗 + `task.cancel` + 子代理/`code_run` 级联三层；陈旧 generation 租约自动收敛，停止后已生成内容保留 |
+| **韧性（API 中断自愈）** | 上游 502/504/429/断流自动恢复，三层兜底：**L1 调用层**（退避重试 + 尊重 `Retry-After` + 断流检测 + 降级非流式重取）、**L2 循环层**（模型调用彻底失败后有限续跑，只重发模型调用、不重跑工具）、**L3 团队层**（lead 想收工时队友还在跑则不许结束；队友异常结束自动释放它占的任务；`reclaim` 幂等、`create_task` 同名去重）。上游彻底不可用时追加一段「已完成工作」摘要收尾（纯读库生成，不调模型）。详见 `docs/20261111-AgentTeam韧性设计与实施.md` |
+| **可观测性** | **默认开启**：应用日志 `INFO` 落 `backend/data/logs/app.log`；团队协作事件单独写 `team-<日期>.jsonl`（每行一条 JSON，可直接 grep `message_id` / `agent`）；`tools/team_timeline.py` 把散落事件还原成人读时间线并自动诊断消息滞留/投递失败/中断自愈情况 |
 | 前端 | React 18 + Vite + TypeScript；暖纸 + 陶土设计系统；Markdown/GFM、图片鉴权渲染、ECharts 图表、子代理卡片、团队面板、文件面板 |
 
 > 界面示意：同一会话内 Agent 先查数（工具步骤）再画图（ECharts，可下载 PNG），
@@ -201,7 +204,38 @@ npm run build        # 生成 frontend/dist
 | `WORKSPACE_MAX_ZIP_FILES` | 一次打包的文件数量上限 | 100 |
 | `WORKSPACE_MAX_ZIP_MB` | 一次打包的总大小上限（MB） | 500 |
 
+### 韧性（API 中断自愈）
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `HLZ_LLM_MAX_RETRIES` | 单次模型调用的重试次数，**硬上限 8** | 4 |
+| `HLZ_AGENT_LLM_RETRIES` | 模型调用彻底失败后，agent 循环的续跑次数，**上限 3** | 2 |
+| `HLZ_LEAD_TEAM_GRACE_TURNS` | lead 想收工但队友仍在跑时，允许续跑的轮数，**上限 10** | 3 |
+
+> 重试预算取值的优先级是「用户模型配置 > 环境变量 > 默认」。
+> 用户模型配置表（`user_llm_configs`）没有这个字段，所以通常走环境变量或默认。
+
+### 日志与可观测性
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `HLZ_LOG_LEVEL` | 应用日志级别；显式 `OFF` / `0` 可完全关掉 | `INFO` |
+| `HLZ_TEAM_LOG` | 团队事件 JSONL；`0` 关闭 | 开启 |
+| `HLZ_APP_LOG` | 应用日志文件名（相对 `backend/data/logs/`） | `app.log` |
+| `HLZ_APP_LOG_ON` | 应用日志落文件开关 | 开启 |
+
 示例：`AGENT_SOFT_LIMIT=200 python run.py`（可快速演示自动压缩）。
+
+排查协作问题时：
+
+```bash
+python tools/team_timeline.py --list                  # 日志里出现过的团队
+python tools/team_timeline.py --team team_xxxxxxxx    # 按时间线复盘一次协作
+python tools/team_timeline.py --message tmsg_xxxx     # 追一条消息的完整生命周期
+```
+
+时间线末尾会自动诊断：消息滞留、投递失败、带错误结束的 agent、
+以及「API 中断自愈」情况（重试几次、是否放弃、lead 因等队友续跑几次）。
 
 ---
 
@@ -234,8 +268,153 @@ task_get  task_list  task_update  send_message  list_messages
 - **前端**：右侧 `TeamPanel` 展示任务 / 消息 / 动态；SSE 增量更新，刷新后走 REST 恢复，展开偏好按用户持久化。
 - **停止**：主 Agent 停止 → teammate / 子代理 / `code_run` 级联停止；陈旧 generation 租约自动收敛。
 
+**韧性（一个 agent 出问题不拖垮团队）**：
+
+- **lead 收工闸**：模型想结束这一轮、但队友还在跑时，平台把它拦回去继续等（`HLZ_LEAD_TEAM_GRACE_TURNS`，默认 3 轮上限）。否则 lead 说「等 reader」就收工，reader 的结论永远没人接。
+- **失主接管**：owner 处于 `errored / stopped / closed` 终态时，任务可被重新绑定给别的队友；`completed` 不算死。
+- **异常自动释放**：队友以 `errored / stopped` 结束时，平台自动把它占的 `in_progress` 任务放回 `pending`，任务板不会烂在死 agent 手里。
+- **幂等**：`reclaim` 对「已经释放过」的任务返回成功（以前返回 `conflict`，模型据此以为失败并重建任务）；`create_task` 在同团队内按 subject 去重（同名且未完成时复用）。
+
+**观测**：团队事件默认写 `backend/data/logs/team-<日期>.jsonl`，用
+`python tools/team_timeline.py --team <team_id>` 还原时间线。
+
 > Team 与 Subagent 的关系：Subagent 是「派一个通用工作代理」；Team 是在子代理之上加任务板、
 > 消息与所有权语义。二者共用同一个 `SubagentHost` 与侧链存储。
+
+---
+
+## 7bis. 中途插话（steering）
+
+**生成过程中可以继续输入。** 按发送不会另起一轮，而是把这句话插进正在执行的那个回合，
+模型在下一次模型调用前读到它。
+
+### 用法
+
+直接在输入框里打字回车即可。生成中发送的消息会带「已插入当前任务」角标，
+不是新的一轮对话。
+
+### 行为
+
+| 情形 | 结果 |
+|---|---|
+| 回合正在跑 | 入队，返回 `202 {"queued":true,"queue_depth":n}`；下一次 fold 点注入 |
+| 回合刚好结束（竞态） | **降级为普通发送**，不会把消息塞进一个没人消费的队列 |
+| 带图片 | P0 不支持，返回 `400` 并说明原因（不静默丢弃） |
+| 队列满 / 内容为空 | `429 steer_queue_full` |
+
+注入时的包装文案（避免模型把补充要求当成新问题重答一遍）：
+
+```text
+[用户在你执行过程中补充的消息]
+<原文>
+
+这是用户在上一轮执行过程中补充的要求，请在本回合内一并处理，
+不要当成一个新的对话回合，也不要重新回答最开始的问题。
+```
+
+### 注入顺序
+
+用户插话 **优先于** 系统通知：
+
+```
+用户插话  →  团队收件箱  →  子代理完成通知
+```
+
+用户的补充是本回合要处理的新要求，系统通知是已经发生的事实。
+
+### 实现要点
+
+- 队列**按 generation 存活**（挂在进程内注册表上，不挂 `TurnRuntime`）：最后一条消息可能
+  晚于最后一个 fold 点到达，挂在回合对象上会随回合一起消失。
+- `drain` 是**原子**的（整体替换列表）：HTTP handler 与 SSE 生成器同时操作，读-清两步会丢消息。
+- 单条上限 4000 字符、队列深度 20。
+- 注入点复用已有的 `AgentLoop.message_injector`；team 路径与普通对话路径都接（靠 `_steer_aware`
+  标记避免重复注入）。
+
+### 协议
+
+```http
+POST /api/sessions/{sid}/messages
+{ "text": "再补一句西湖的内容", "mode": "queue" }
+
+→ 202 { "queued": true, "generation_id": "g_xxx", "queue_depth": 1 }
+```
+
+> 未实现（P1，见方案文档）：`priority:"now"` 立即中止当前回合、队列可编辑、
+> Esc 清队列、队列持久化到 DB。
+
+详见 `docs/20261111-用户中途插话steering实施方案.md`。
+
+---
+
+## 7ter. 韧性（API 中断自愈）
+
+上游模型服务不稳定时（502 / 504 / 429 / 连接中断 / 流被截断），平台自动恢复，
+而不是让整轮对话死掉。
+
+### 三层兜底
+
+| 层 | 机制 | 解决的问题 |
+|---|---|---|
+| **L1 调用层**（`llm_client`） | 指数退避 + 抖动、尊重 `Retry-After`、**断流检测**（没有 `[DONE]` 也没有 `finish_reason` 判定为截断）、**降级非流式**重取完整结果、总等待封顶 180s | 旧实现「流里出过 delta 就不再重试」，一次断流就放弃 |
+| **L2 循环层**（`agent_loop`） | 模型调用彻底失败后**有限续跑**：注入可执行提示并重发模型调用 | 一次 API 抖动就结束整轮 |
+| **L3 团队层** | lead 收工闸 + 失主接管 + 异常自动释放 + 幂等 | 一个 agent 出事拖垮整个团队 |
+
+**L2 的幂等性**：续跑只重发**模型调用**，history 一律不动 —— 工具结果已经在 history 里，
+因此工具绝不可能执行第二遍。
+
+**不可重试的错误**：`400 / 401 / 402 / 403 / 404 / 405 / 413 / 422` 一律不重试
+（配置、权限、参数问题重试无益，只会白烧额度）。
+
+### 收尾摘要
+
+上游**彻底**不可用时，用户不会只看到一句半截话。平台会追加一段「已完成什么」的收尾：
+
+```text
+> **执行中断说明**
+> 你的请求「…」在收尾阶段被上游模型服务中断打断。
+
+**中断前已完成**
+- ✅ 统计 backend/app 下 .py 文件数（counter）
+
+**尚未完成**
+- ⏳ 写一句话总结（未开始）
+
+**执行失败的队友**：worker_c
+
+**接下来可以怎么做**
+- 直接重发一次即可：上面的进度都在任务板和上下文里，不会丢。
+```
+
+这段**绝不调用模型**（此刻模型正不可用），全部是数据库读取 + 模板拼装。
+本轮没有成果时会回退到本会话最近一次有产出的一代 —— 用户说「再总结一下刚才的结果」
+时，成果往往属于上一代。
+
+### 用户看到的错误信息
+
+上游报错会被翻译成人话，不再把整段 nginx HTML 甩到界面上：
+
+| 上游 | 用户看到 |
+|---|---|
+| 502 | 上游模型服务暂时不可用（502 Bad Gateway）。已自动重试并续跑多次仍失败，这不是你的操作问题。稍后重发即可，已完成的工作都在上下文里。 |
+| 504 | 上游模型服务响应超时（504 Gateway Timeout）。已自动重试仍失败，通常是上游负载过高。 |
+| 429 | 上游模型服务限流（429）。已自动退避重试仍失败，请稍后再试。 |
+| 连接中断 | 与模型服务的连接中断，已自动重试仍失败。请检查网络或稍后重发。 |
+
+### 判断「是不是代码缺陷」的准则
+
+上游不稳定期（时不时 502/504）容易把抖动误判成 bug。判据：
+
+**不算缺陷**：总耗时变长、单次 e2e 失败、某 agent turns 偏高、模型输出质量下降。
+
+**算缺陷**：脱离上游可稳定复现（假 client 必红）、结构性不变量被破坏
+（owner 指向不存在的 agent / 消息永久 `queued` / `done` 不是末帧）、
+**自愈机制本身没生效**（有 502 但日志里没有 `llm_retry`，或重试次数与配置不符）。
+
+排查动作：任何「像 bug」的现象，先查 `team-<date>.jsonl` 里有没有
+`llm_retry` / `llm_gave_up`；有就是上游，没有才继续查代码。
+
+详见 `docs/20261111-AgentTeam韧性设计与实施.md`。
 
 ---
 
@@ -400,7 +579,7 @@ frontend/
 | PATCH | `/api/sessions/{id}` | 改标题 / 置顶 / 切换模型 |
 | DELETE | `/api/sessions/{id}` | 删除会话（连带删历史、子代理、Team 数据） |
 | GET | `/api/sessions/{id}/messages` | 历史消息 |
-| POST | `/api/sessions/{id}/messages` | 发送消息（SSE 流式） |
+| POST | `/api/sessions/{id}/messages` | 发送消息（SSE 流式）。`mode:"queue"` 时改为插进正在跑的回合，返回 `202 {"queued":true,"queue_depth":n}` |
 | POST | `/api/sessions/{id}/stop` | 停止生成（返回已持久化消息快照） |
 | POST | `/api/sessions/{id}/compact` | 手动压缩上下文 |
 | GET | `/api/sessions/{id}/team` | 团队快照（team / tasks / events / messages） |
@@ -438,6 +617,9 @@ frontend/
 | `subagent_event` | `agent_id, event` | 子代理内部增量（文本/思考/工具） |
 | `subagent_end` | `agent_id, status, result, turns, error` | 子代理结束 |
 | `team_event` | `event` | Team 任务/消息/事件（`team_start / task_created / task_updated / team_message / team_end / team_resumed / team_unavailable`） |
+| `message_injected` | `text` | 平台注入到上下文的内容（团队消息 / 子代理通知 / **用户中途插话**），前端渲染成可折叠块并持久化 |
+| `llm_retry` | `attempt, limit, error` | 模型调用失败后循环层续跑（韧性 L2） |
+| `team_wait` | `reason, grace_left` | lead 想收工但队友还在跑，被拦回去继续等（韧性 L3） |
 | `done` | `message_id, status, model` | 终态（`complete / stopped / error`） |
 | `error` | `error, hint?` | 错误提示与错误状态 |
 
