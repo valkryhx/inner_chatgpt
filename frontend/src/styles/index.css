@@ -798,14 +798,25 @@ textarea, input { caret-color: var(--clay); }
 }
 .team-panel.is-open { width: 330px; }
 .team-panel-rail {
-  width: 40px; flex: 0 0 40px; padding: 14px 0;
+  width: 40px; flex: 0 0 40px;
+  /* 顶部留白对齐面板标题区的 .team-head padding-top(18px)：
+     展开时图标与右侧「Agent Team」标题落在同一条水平线上，
+     看起来像一条连续的头部，而不是错开的两块。 */
+  padding: 18px 0 14px;
   display: flex; flex-direction: column; align-items: center; gap: 10px;
   background: transparent; border: none; color: var(--muted);
 }
-.team-rail-mark {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: var(--clay); box-shadow: 0 0 0 4px var(--clay-soft);
+/* 轨道入口的图标（原本是个橙色圆点）。
+   源图是 1254x1254 的正方形画布、内容只占中间一块横向区域，
+   所以给等宽等高盒子 + contain，实际渲染约为 20x14，接近标题字高。
+   alt 已置空，这是纯装饰性图形。 */
+.team-rail-icon {
+  width: 20px; height: 20px;
+  object-fit: contain;
+  opacity: .9;
+  transition: opacity 120ms var(--ease);
 }
+.team-panel-rail:hover .team-rail-icon { opacity: 1; }
 .team-rail-label {
   writing-mode: horizontal-tb; text-orientation: mixed;
   padding: 2px 4px; border-radius: 999px;
@@ -841,9 +852,10 @@ textarea, input { caret-color: var(--clay); }
   white-space: nowrap;
 }
 /* 「怎么触发」提示：小字、次要、默认收起。
-   作用是让用户知道该说什么词才会建 Team，而不是去猜。 */
+   作用是让用户知道该说什么词才会建 Team，而不是去猜。
+   紧跟在标题后面（不用 margin-left:auto 推到最右），因为它是标题的注解。 */
 .team-hint-toggle {
-  flex-shrink: 0; margin-left: auto;
+  flex-shrink: 0;
   border: none; background: transparent; padding: 0;
   color: var(--muted); opacity: .72;
   font-size: 9.5px; font-weight: 500; letter-spacing: .01em;

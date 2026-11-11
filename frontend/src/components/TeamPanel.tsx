@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import type { TeamEvent, TeamSnapshot, TeamTask, TeamTaskStatus } from '../types'
 import { capList } from '../subagentView'
+import brandIcon from '../assets/brand/hlauz-icon.png'
 
 interface Props {
   snapshot: TeamSnapshot | null
@@ -146,7 +147,9 @@ export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop 
   return (
     <aside className={'team-panel' + (open ? ' is-open' : '') + (team ? '' : ' is-empty')} aria-label="Agent Team 任务板">
       <button type="button" className="team-panel-rail" onClick={onToggle} title={open ? '收起任务板' : '展开任务板'}>
-        <span className="team-rail-mark" />
+        {/* 原来这里是一个橙色小圆点（纯色块）。换成 Hlaudz 图标：
+            轨道是常驻入口，品牌图标比一个无含义的点更能说明"这是哪儿"。 */}
+        <img className="team-rail-icon" src={brandIcon} alt="" aria-hidden="true" />
         <span className="team-rail-label">Team</span>
         {team && <span className="team-rail-count">{counts.in_progress + counts.pending}</span>}
         <span className="team-rail-caret">{open ? '›' : '‹'}</span>
