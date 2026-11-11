@@ -43,6 +43,14 @@ ROOT_AGENT_HINT = """
   `[来自 X 的团队消息]` 的形式自动出现在你的上下文里，看到就按它行动。
 - teammate 只能更新绑定给自己的任务，只能通过 `send_message` 向 lead/root 汇报；
   不要让 teammate 互相广播或自由对话。
+- **队友跑完一轮不会立刻消失**（同一轮对话内）：它会进入 `idle` 待命，
+  你用 `send_message` 追问时，它**带着之前的上下文**接着干，不需要重新 spawn。
+  `wait_agent` 返回 `state=ready` 说明"这轮做完了、人还在"，此时用
+  `read_agent_result` 取本轮结论（会标 `partial: true`），需要 continuation 就用
+  `send_message`；只想要结果不要它了，用 `close_agent` 释放槽位。
+- 反过来：**已经 `idle` 的队友不要重新 spawn**。重新 spawn 是一个全新的空白 agent，
+  `spawn_teammate` 会给它加后缀（`worker` -> `worker_2`），你既丢掉了之前积累的上下文，
+  又白占一个槽位。
 - 任何 team_id / user_id / session_id / generation_id / agent_id 都由服务端注入。
   模型不得在工具参数里伪造、传递或猜测这些身份字段。
 - 任务状态更新必须带读取到的 `expected_version`；CAS 失败时重新
@@ -71,6 +79,9 @@ SUBAGENT_HINT = """
 - **收到 `[来自 X 的团队消息]` 时**，那是 lead（或其他成员）通过平台投递过来的指令，
   不是用户新开的对话。按它调整当前工作，并在最终答复里说明你怎么处理了这条消息。
   你不需要为了收消息去轮询 `list_messages`——平台会在你每一轮开始前把新消息放进上下文。
+- **你可能会被多次唤醒**：做完一轮后你进入空闲待命，lead 再发消息给你时会带着
+  之前的完整上下文继续（同一个你，不是新的 agent）。所以不要清空或推翻自己之前的结论，
+  需要改口径就明说是"修正上一轮"。
 - 汇报用 `send_message(recipient="lead", kind="result")`：平台会把它直接投递给 lead，
   lead 下一轮就能看到。不要把结论只写在自己的最终答复里等 lead 来问。
 - 产出图片时写到自己的工作目录，最终答复用标准 Markdown `![说明](文件名.png)` 引用；严禁把产物复制到 `frontend/dist`、仓库源码、系统目录，也禁止用 `127.0.0.1` 绝对 URL。

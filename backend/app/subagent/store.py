@@ -72,7 +72,9 @@ async def init_tables() -> None:
         await conn.executescript(_BASE_TABLES)
         for table, cols in (
             ("subagent_runs", (("generation_id", "TEXT NOT NULL DEFAULT ''"),
-                               ("team_id", "TEXT NOT NULL DEFAULT ''"))),
+                               ("team_id", "TEXT NOT NULL DEFAULT ''"),
+                               # 持久 worker 一个 run_id 跑多轮，需要记轮数
+                               ("rounds", "INTEGER NOT NULL DEFAULT 0"))),
             ("subagent_messages", (("user_id", "TEXT NOT NULL DEFAULT ''"),
                                    ("session_id", "TEXT NOT NULL DEFAULT ''"),
                                    ("generation_id", "TEXT NOT NULL DEFAULT ''"),
@@ -151,6 +153,31 @@ async def finish_run(run_id: str, *, status: str, result_text: str = "", turns: 
     vals[:0] = [status, result_text, int(turns), error, now_ms()]
     async with aiosqlite.connect(DB_PATH) as conn:
         cur = await conn.execute(sql, vals)
+        await conn.commit()
+        return (cur.rowcount or 0) == 1
+
+
+async def update_run_progress(run_id: str, *, turns: int = 0, result_text: str = "",
+                              rounds: int = 0, user_id: str = "", session_id: str = "",
+                              generation_id: str = "", team_id: str = "") -> bool:
+    """Snapshot an in-flight run **without** finishing it.
+
+    A persistent teammate completes several rounds under one ``run_id``.  If the
+    only write were ``finish_run``, everything a refreshed page shows between
+    rounds would be the state of the *first* round -- the DB would disagree with
+    the live agent.  This keeps ``status`` untouched (still ``running``) so a
+    crash mid-round is still recognisable as unfinished.
+    """
+    sets = ["result_text=?", "turns=?"]
+    vals: list[Any] = [result_text, int(turns)]
+    if rounds:
+        sets.append("rounds=?")
+        vals.append(int(rounds))
+    sql, scope_vals = _scope_sql(
+        f"UPDATE subagent_runs SET {', '.join(sets)} WHERE run_id=?", run_id,
+        user_id, session_id, generation_id, team_id)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(sql, vals + scope_vals)
         await conn.commit()
         return (cur.rowcount or 0) == 1
 

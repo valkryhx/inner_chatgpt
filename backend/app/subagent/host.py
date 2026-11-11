@@ -63,6 +63,11 @@ class SubagentHost:
             max_active=_env_int("SUBAGENT_MAX_ACTIVE", 4),
         )
         self.timeout_s = _env_float("SUBAGENT_TIMEOUT_S", 1800.0)
+        # 持久 worker：跑完一轮后进入 idle 等后续任务的秒数。
+        # 0 = 关闭（跑完即结束，与历史行为一致）。这是刻意的默认值：
+        # 持久化改变的是「队友跑完还在不在」，属于产品语义变化，必须显式开启，
+        # 否则 refresh 后看到的状态、通知文案、SSE 关闭时机全部跟着变。
+        self.idle_timeout_s = _env_float("TEAMMATE_IDLE_TIMEOUT_S", 0.0)
         self._change = asyncio.Event()
         # 全局事件游标：wait_agent 的 since_event_seq 用它做增量游标。
         # 不能用 node.event_seq —— 那是每个节点各自从 0 开始的计数器，
@@ -151,18 +156,6 @@ class SubagentHost:
             runtime.lead_delivery_sink = self.push_team_message
             # steer：每轮模型调用前取出父代理追加的指令
             runtime.loop.message_injector = node.drain_pending
-            # 本轮开始前先把库里积压的收件箱消息取出来（发送时对方恰好不在
-            # 活体队列里，只能靠这一步补投）。
-            if getattr(runtime, "team_host", None) is not None:
-                try:
-                    for row in await runtime.team_host.consume_inbox(limit=20):
-                        node.pending_messages.append({
-                            "role": "user",
-                            "content": f"[来自 {self._sender_label(row)} 的团队消息] "
-                                       f"{row.get('content', '')}",
-                        })
-                except Exception:  # noqa: BLE001 - 补投失败不能拖垮子代理
-                    pass
             node.turns = 0
 
             async def _drive():
@@ -198,23 +191,101 @@ class SubagentHost:
                         pass
 
             effective = float(timeout_s or self.timeout_s)
-            await asyncio.wait_for(_drive(), timeout=effective)
-            node.status = "stopped" if node.stop.is_set() else "completed"
-            node.turns = _count_turns(runtime.history)
-            node.result = _final_text(runtime.history)
+            deadline = started + effective
+            # 持久 worker：一轮结束不等于 agent 结束。跑完一轮先进 idle 等后续，
+            # 只有 idle 超时 / stop / 关闭才进终态。
+            while True:
+                if node.stop.is_set():
+                    # 尊重外部已经判定好的终态（drain 回收会把「干过活」记成 completed）
+                    if not node.is_terminal:
+                        node.status = "stopped"
+                    break
+                if time.monotonic() >= deadline:
+                    node.status = "stopped"
+                    node.error = f"timeout: 超过 {int(effective)}s"
+                    break
+                # 每轮开始前补投库里积压的收件箱（发送时对方恰好不在活体队列）
+                await self._refill_inbox(node, runtime)
+                round_budget = min(effective, max(0.1, deadline - time.monotonic()))
+                try:
+                    await asyncio.wait_for(_drive(), timeout=round_budget)
+                except asyncio.TimeoutError:
+                    node.status = "stopped"
+                    node.error = f"timeout: 超过 {int(effective)}s"
+                    break
+                # 一轮结束。被 stop/close 打断时必须记 stopped 而不是 completed，
+                # 否则「关闭一个正在跑的队友」会在库里留下成功记录。
+                if node.stop.is_set():
+                    if not node.is_terminal:
+                        node.status = "stopped"
+                    node.rounds += 1
+                    node.turns = _count_turns(runtime.history)
+                    node.result = _final_text(runtime.history)
+                    await self._snapshot_run(node, runtime, last_seq)
+                    break
+                node.status = "running"
+                node.rounds += 1
+                node.turns = _count_turns(runtime.history)
+                node.result = _final_text(runtime.history)
+                await self._snapshot_run(node, runtime, last_seq)
+                if self.idle_timeout_s <= 0:
+                    # 持久化关闭：跑完这一轮就结束，保持历史语义。
+                    node.status = "completed"
+                    break
+                # 这一轮干完了：进 idle 等后续任务
+                node.status = "idle"
+                node.idle_since = time.monotonic()
+                node.idle_reason = "available"
+                node.wake.clear()
+                self._touch()
+                self._publish({
+                    "type": "subagent_status",
+                    "agent_id": node.agent_id,
+                    "name": node.name,
+                    "status": "idle",
+                })
+                # 本轮已经 send_message 给 lead 的话，不再重复推 idle 帧（CC m1448）
+                if not node.sent_to_lead_this_round:
+                    self.push_idle_notification(node, idle_reason="available")
+                node.sent_to_lead_this_round = False
+                reason = await self._idle_wait(
+                    node,
+                    timeout_s=min(self.idle_timeout_s,
+                                  max(0.0, deadline - time.monotonic())),
+                )
+                if reason == "stopped":
+                    if not node.is_terminal:
+                        node.status = "stopped" if node.stop.is_set() else "completed"
+                    break
+                if reason == "timeout":
+                    # 空闲到期：没有新活就正常结束（这是持久 worker 的退出条件）
+                    node.status = "completed"
+                    break
+                # 被唤醒：有新消息或新任务，回到 running 继续下一轮
+                node.status = "running"
+                self._publish({
+                    "type": "subagent_status",
+                    "agent_id": node.agent_id,
+                    "name": node.name,
+                    "status": "running",
+                })
         except asyncio.TimeoutError:
             node.status = "stopped"
             node.error = f"timeout: 超过 {int(timeout_s or self.timeout_s)}s"
             node.result = _final_text(runtime.history) if runtime is not None else ""
         except asyncio.CancelledError:
-            node.status = "stopped"
+            # 取消可能来自两条路：用户停止（应记 stopped），或本轮结束时的整体
+            # 回收（drain）。后者已经把这个 agent 判成 completed —— 覆盖成 stopped
+            # 会让「它明明干完过几轮」这个事实在库里消失。
+            if not node.is_terminal:
+                node.status = "stopped"
             node.turns = _count_turns(runtime.history) if runtime is not None else 0
             node.result = _final_text(runtime.history)
             raise
         except Exception as e:  # noqa: BLE001
             node.status = "errored"
             node.error = f"{type(e).__name__}: {e}"
-            node.result = _final_text(runtime.history)
+            node.result = _final_text(runtime.history) if runtime is not None else ""
         finally:
             lease = getattr(node, "quota_lease", None)
             if lease is not None:
@@ -254,6 +325,51 @@ class SubagentHost:
         sender = str(row.get("sender_agent_id") or row.get("sender") or "lead")
         return sender[4:] if sender.startswith("sub:") else sender
 
+    async def _refill_inbox(self, node: AgentNode, runtime) -> int:
+        """把库里积压的团队消息补进待注入队列。
+
+        发送时对方恰好不在活体队列（例如刚进 idle、或消息在它上一轮结束后才发）时
+        只能靠这一步补投，否则那条消息会一直停在 ``queued``。
+        """
+        team_host = getattr(runtime, "team_host", None)
+        if team_host is None:
+            return 0
+        try:
+            rows = await team_host.consume_inbox(limit=20)
+        except Exception:  # noqa: BLE001 - 补投失败不能拖垮子代理
+            return 0
+        for row in rows:
+            node.pending_messages.append({
+                "role": "user",
+                "content": f"[来自 {self._sender_label(row)} 的团队消息] "
+                           f"{row.get('content', '')}",
+            })
+        return len(rows)
+
+    async def _snapshot_run(self, node: AgentNode, runtime, last_seq: int) -> None:
+        """把本轮进度写进 DB，但**不**把 run 标成终态。
+
+        持久 worker 一个 run_id 跑多轮；只有 finish_run 会写终态，中间快照用
+        update_run_progress，这样刷新页面看到的是最新一轮而不是第一轮。
+        """
+        try:
+            await sub_store.append_sidechain(
+                node.run_id, runtime.history, start_seq=last_seq,
+                user_id=self.ctx.user_id, session_id=self.ctx.session_id,
+                generation_id=self.ctx.generation_id, team_id=self.ctx.team_id,
+            )
+        except Exception:
+            pass
+        try:
+            await sub_store.update_run_progress(
+                node.run_id, turns=node.turns, result_text=node.result or "",
+                rounds=node.rounds,
+                user_id=self.ctx.user_id, session_id=self.ctx.session_id,
+                generation_id=self.ctx.generation_id, team_id=self.ctx.team_id,
+            )
+        except Exception:
+            pass
+
     # ---------------- team message delivery ----------------
     def deliver_team_message(self, target: str, message: dict[str, Any]) -> dict[str, Any]:
         """Push one team message into a live agent's pre-turn queue.
@@ -289,8 +405,11 @@ class SubagentHost:
             "role": "user",
             "content": f"[来自 {sender_label} 的团队消息] {content}",
         })
+        # 唤醒 idle 的队友：否则它睡到超时才发现有新消息。
+        node.wake.set()
         self._touch()
-        return {"delivered": True, "name": name, "agent_id": node.agent_id}
+        return {"delivered": True, "name": name, "agent_id": node.agent_id,
+                "idle": node.is_idle}
 
     def push_team_message(self, message: dict[str, Any]) -> None:
         """Queue a teammate->lead message for the lead's next turn.
@@ -312,6 +431,10 @@ class SubagentHost:
             "is_message": True,
         }
         self._notifications.append(item)
+        # 标记「本轮已主动汇报过」，让后面的 idle 帧去重（CC m1448 zo）。
+        node = self.registry.get(sender_label)
+        if node is not None:
+            node.sent_to_lead_this_round = True
         self._touch()
 
     async def deliver_pending_inbox(self, team_host) -> int:
@@ -385,7 +508,12 @@ class SubagentHost:
         self._notifications = [n for n in self._notifications if n["id"] not in drop]
 
     def drain_notifications(self, limit: int = 5) -> list[dict]:
-        """取一批通知并 ack，返回一条可直接 append 的 user 消息。"""
+        """取一批通知并 ack，返回一条可直接 append 的 user 消息。
+
+        Idle notifications and end notifications are batched under different
+        headers: an idle teammate has *not* ended, and telling the model
+        "已结束" would make it re-spawn a worker that is still standing by.
+        """
         items = self.peek_notifications(limit)
         if not items:
             return []
@@ -395,20 +523,37 @@ class SubagentHost:
             asyncio.get_running_loop().create_task(sub_store.ack_notifications_db(ids))
         except Exception:  # noqa: BLE001
             pass
-        lines = [f"- {n['agent']} 已{n['status']}：{n['preview']}" for n in items]
+        idle_items = [n for n in items if n.get("is_idle")]
+        done_items = [n for n in items if not n.get("is_idle")]
         extra = len(self._notifications)
-        body = "\n".join(lines)
+
+        chunks: list[str] = []
+        if done_items:
+            lines = [f"- {n['agent']} 已{n['status']}：{n['preview']}" for n in done_items]
+            chunks.append("[任务通知] 以下子代理已经结束，结果可直接使用；"
+                          "需要全文请 read_agent_result。\n" + "\n".join(lines))
+        if idle_items:
+            lines = []
+            for n in idle_items:
+                reason = n.get("idle_reason") or "available"
+                lines.append(f"- {n['agent']} 已完成本轮、当前空闲（{reason}）：{n['preview']}")
+            chunks.append("[空闲通知] 以下队友**没有结束**，只是在等下一步；"
+                          "给它新任务请用 send_message，不要重新 spawn。\n"
+                          + "\n".join(lines))
         if extra:
-            body += f"\n（另有 {extra} 个子代理已完成，可用 list_agents 查看）"
-        return [{
-            "role": "user",
-            "content": "[任务通知] 以下子代理已经结束，结果可直接使用；"
-                       "需要全文请 read_agent_result。\n" + body,
-        }]
+            chunks.append(f"（另有 {extra} 条通知待处理，可用 list_agents 查看）")
+        return [{"role": "user", "content": "\n\n".join(chunks)}]
 
     # ---------------- steer ----------------
     async def followup(self, target: str, message: str, max_per_agent: int = 5) -> dict:
-        """向运行中的子代理追加一条指令；在下一次模型调用前注入。"""
+        """向运行中的子代理追加一条指令；在下一次模型调用前注入。
+
+        The limit is on **unedelivered** messages, not on the lifetime total: a
+        persistent teammate can legitimately receive more than five instructions
+        across its lifetime, and refusing the sixth would strand a worker that is
+        still willing to work.  The de-dup hash stays -- it prevents re-sending
+        the same sentence twice, which is a different problem from flooding.
+        """
         import hashlib
 
         node = self.registry.get(target)
@@ -421,17 +566,19 @@ class SubagentHost:
         text = (message or "").strip()
         if not text:
             return {"ok": False, "error": "message 不能为空"}
+        if len(node.pending_messages) >= max_per_agent:
+            return {"ok": False,
+                    "error": f"该子代理还有 {len(node.pending_messages)} 条未处理的追加指令"
+                             f"（上限 {max_per_agent} 条），等它消化后再发"}
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         if digest in node.followup_hashes:
             return {"ok": True, "deduped": True, "note": "同内容已投递过，未重复注入"}
-        if len(node.followup_hashes) >= max_per_agent:
-            return {"ok": False,
-                    "error": f"该子代理的追加指令已达上限（{max_per_agent} 条）"}
-        node.followup_hashes.add(digest)
+        node.followup_hashes.add(digest) if len(node.followup_hashes) < 200 else None
         node.pending_messages.append({
             "role": "user",
             "content": f"[来自父代理的追加指令] {text}",
         })
+        node.wake.set()
         return {"ok": True, "delivered": True,
                 "note": "将在子代理下一次模型调用前注入"}
 
@@ -469,8 +616,10 @@ class SubagentHost:
         return self._wait_result(nodes, condition, timed_out, since_event_seq)
 
     def _condition_met(self, nodes: list[AgentNode], condition: str) -> bool:
-        # any_event / event 由 _has_new_event 判定，这里只管「全部终态」
-        return all(n.is_terminal for n in nodes)
+        # any_event / event 由 _has_new_event 判定，这里只管「全部了结」。
+        # 了结 = 终态 或 idle（本轮做完在等后续）。持久 worker 永远不终态，
+        # 若这里只认 is_terminal，lead 的 all_terminal 会白等到超时。
+        return all(n.is_settled for n in nodes)
 
     def _has_new_event(self, nodes: list[AgentNode], since_event_seq: int = 0) -> bool:
         """是否已有游标之后的实质进展（工具调用 / 注入指令）。"""
@@ -483,8 +632,9 @@ class SubagentHost:
 
     def _wait_result(self, nodes: list[AgentNode], condition: str, timed_out: bool,
                      since_event_seq: int = 0) -> dict:
-        remaining = [n.name for n in nodes if not n.is_terminal]
-        refs = {n.name: n.run_id for n in nodes if n.is_terminal}
+        remaining = [n.name for n in nodes if not n.is_settled]
+        idle = [n.name for n in nodes if n.is_idle]
+        refs = {n.name: n.run_id for n in nodes if n.is_settled}
         # since_event_seq > 0 时，只返回该游标之后的新事件（增量观察，避免重复灌上下文）
         incremental: list[dict] = []
         max_seq = int(since_event_seq or 0)
@@ -498,7 +648,9 @@ class SubagentHost:
             for n in nodes:
                 max_seq = max(max_seq, n.event_seq)
         if not remaining:
-            state = "all_terminal"
+            # 全都了结了。如果有 idle 的，说明「这轮干完了」但还活着 —— 与全部
+            # 终态区分开，否则 lead 会以为该关掉它了。
+            state = "ready" if idle else "all_terminal"
         elif timed_out:
             state = "timeout"
         else:
@@ -509,18 +661,24 @@ class SubagentHost:
             action = "wait_agent"
         else:
             action = "read_agent_result" if refs else "wait_agent"
+        note = ""
+        if timed_out:
+            note = "等待超时不是失败：子代理仍在运行，继续 wait_agent 即可"
+        elif state == "ready":
+            note = ("子代理已完成这一轮并在等待后续任务（status=idle），"
+                    "可用 read_agent_result 取本轮结论；给它新任务用 send_message")
         return {
             "state": state,
             "timed_out": timed_out,
             "condition": condition,
             "changed_agents": [n.to_dict() for n in nodes],
             "remaining_targets": remaining,
+            "idle_targets": idle,
             "result_refs": refs,
             "recommended_next_action": action,
             "event_seq": max_seq,
             "events": incremental,
-            "note": ("等待超时不是失败：子代理仍在运行，继续 wait_agent 即可"
-                     if timed_out else ""),
+            "note": note,
         }
 
     # ---------------- read result ----------------
@@ -543,7 +701,7 @@ class SubagentHost:
                     "note": "该子代理属于上一轮，结果来自持久化记录",
                 }
             return {"ok": False, "error": f"未知子代理: {target}"}
-        if not node.is_terminal:
+        if not node.is_settled:
             return {"ok": False,
                     "error": f"子代理 {node.name} 仍在运行（{node.status}），请先 wait_agent",
                     "status": node.status}
@@ -556,7 +714,7 @@ class SubagentHost:
             text = (row or {}).get("result_text", "") or ""
         limit = max(100, min(int(max_chars or MAX_READ_CHARS), MAX_READ_CHARS * 5))
         truncated = len(text) > limit
-        return {
+        out = {
             "ok": True,
             "agent_id": node.agent_id,
             "name": node.name,
@@ -568,6 +726,12 @@ class SubagentHost:
             "truncated": truncated,
             "chars": len(text),
         }
+        if node.is_idle:
+            # idle 的 agent 仍可能被唤醒继续干，所以这只是一轮结论，不是最终答复。
+            out["partial"] = True
+            out["note"] = ("该 agent 已完成本轮并在等待后续任务，这是它最近一轮的结论；"
+                           "需要它继续工作请用 send_message")
+        return out
 
     # ---------------- list ----------------
     def list_agents(self, include_closed: bool = False) -> list[dict]:
@@ -597,7 +761,7 @@ class SubagentHost:
         self._touch()
         return {"ok": True, "closed": closed, "status": "closed"}
 
-    async def _stop_node(self, node: AgentNode) -> None:
+    async def _stop_node(self, node: AgentNode, *, reason: str = "close") -> None:
         # 关闭是有成本的（最多等 2s 优雅退出）。先把状态广播出去，
         # 否则面板在这段时间里仍显示「运行中」，用户会以为关不掉。
         if not node.is_terminal and node.status != "stopping":
@@ -608,24 +772,112 @@ class SubagentHost:
                 "name": node.name,
                 "status": "stopping",
             })
+        if reason == "drain" and node.rounds > 0 and not node.error:
+            # 本轮结束时的整体回收：这个 agent 已经干完活、只是还挂在 idle 等后续。
+            # 记 stopped 会让「它完成过一轮」这个事实在库里消失。
+            # 状态先置 completed，再等它真的退出（finally 里会持久化这个值）；
+            # 循环看到 stop 时会保留已有的终态，不会覆盖回 stopped。
+            node.status = "completed"
+            node.stop.set()
+            node.wake.set()
+            await self._join_task(node, grace_s=2.0)
+            return
         node.stop.set()
+        await self._join_task(node, grace_s=2.0)
+
+    @staticmethod
+    async def _join_task(node: AgentNode, *, grace_s: float) -> None:
+        """Bounded join so the child's ``finally`` (lease, sidechain, finish_run) runs."""
         task = node.task
-        if task is not None and not task.done():
-            for _ in range(20):  # 最多 2s 优雅等待
-                if task.done():
-                    break
-                await asyncio.sleep(0.1)
-            if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except BaseException:
-                    pass
+        if task is None or task.done():
+            return
+        for _ in range(max(1, int(grace_s * 10))):
+            if task.done():
+                return
+            await asyncio.sleep(0.1)
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
 
     # ---------------- lifecycle ----------------
     def has_active(self) -> bool:
-        """Whether any child still needs a join before the SSE can close."""
+        """Whether any child still needs a join before the SSE can close.
+
+        An idle teammate has finished its work for now; keeping the SSE open for
+        it would park the stream until ``TEAM_DRAIN_TIMEOUT_S`` (300 s) for no
+        reason.  Use :meth:`has_live_nodes` for stop/close decisions, which must
+        still see idle agents.
+        """
+        return any(not n.is_terminal and not n.is_idle
+                   for n in self.registry.all_nodes())
+
+    def has_live_nodes(self) -> bool:
+        """Whether any child is still alive (idle included) and can be stopped."""
         return bool(self.registry.active_nodes())
+
+    # ---------------- persistent worker: idle loop ----------------
+    async def _idle_wait(self, node: AgentNode, *, timeout_s: float,
+                         poll_s: float = 2.0) -> str:
+        """Wait for work while idle; returns the reason it stopped waiting.
+
+        Event-driven with a bounded poll as the safety net: a missed trigger
+        costs one poll interval (≤ ``poll_s``) instead of leaving the teammate
+        parked forever.  CC's 500 ms poll loop is the same fallback, just coarser
+        here because Hlaudz has no per-teammate process to poll from.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            if node.stop.is_set() or node.is_terminal:
+                return "stopped"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "timeout"
+            try:
+                await asyncio.wait_for(node.wake.wait(),
+                                       timeout=min(poll_s, remaining))
+                node.wake.clear()
+                # 被唤醒后重新判定：可能是关闭，也可能是新消息/新任务
+                if node.stop.is_set() or node.is_terminal:
+                    return "stopped"
+                return "wake"
+            except asyncio.TimeoutError:
+                if node.stop.is_set() or node.is_terminal:
+                    return "stopped"
+                if time.monotonic() >= deadline:
+                    return "timeout"
+                # 兜底：主动查一次是否真的有活，避免漏唤醒导致永久空闲
+                if node.pending_messages:
+                    return "wake"
+
+    def push_idle_notification(self, node: AgentNode, *, idle_reason: str = "available",
+                               completed_task_id: str = "") -> None:
+        """Tell the lead this teammate finished a round and is standing by.
+
+        Deliberately distinct from ``subagent_end``: an idle teammate has not
+        ended, and telling the lead "completed" would make it re-spawn a worker
+        that is still there.
+        """
+        item = {
+            "id": uuid.uuid4().hex[:16],
+            "agent": node.name,
+            "status": "空闲",
+            "result_chars": len(node.result or ""),
+            "preview": (node.result or "")[:400],
+            "is_idle": True,
+            "idle_reason": idle_reason,
+            "completed_task_id": completed_task_id,
+        }
+        self._notifications.append(item)
+        self._touch()
+
+    def wake_idle_agents(self) -> None:
+        """Wake every idle child: new work may have appeared on the board."""
+        for n in self.registry.all_nodes():
+            if n.is_idle:
+                n.wake.set()
 
     def stop_all_now(self) -> None:
         """Synchronously signal/cancel every child task.
@@ -635,7 +887,12 @@ class SubagentHost:
         The actual unwind/lease release happens in each child's own finally.
         """
         for n in self.registry.active_nodes():
+            # 已经干完至少一轮的节点：这是本轮结束时的整体回收，不是用户停止。
+            # 先判成 completed，子任务取消时就不会把自己覆盖成 stopped。
+            if n.rounds > 0 and not n.error:
+                n.status = "completed"
             n.stop.set()
+            n.wake.set()
             if n.task is not None and not n.task.done():
                 n.task.cancel()
         self._touch()
@@ -662,7 +919,7 @@ class SubagentHost:
         self._closed = True
         for n in list(self.registry.all_nodes()):
             if not n.is_terminal:
-                await self._stop_node(n)
+                await self._stop_node(n, reason="drain")
         self.registry._nodes.clear()
 
     # ---------------- helpers ----------------

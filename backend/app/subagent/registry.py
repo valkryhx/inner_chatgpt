@@ -42,7 +42,7 @@ class AgentNode:
     name: str
     ctx: AgentContext
     role: str
-    status: str = "starting"      # starting|running|completed|errored|stopped|closed
+    status: str = "starting"      # starting|running|idle|completed|errored|stopped|closed
     run_id: str = ""
     task: Optional[asyncio.Task] = None
     stop: StopSignal = field(default_factory=StopSignal)
@@ -57,10 +57,42 @@ class AgentNode:
     # steer：父代理在子代理运行期间追加的指令（下一次模型调用前注入）
     pending_messages: list[dict] = field(default_factory=list)
     followup_hashes: set[str] = field(default_factory=set)
+    # ---- 持久 worker 状态（P-A）----
+    # 唤醒源：消息到达 / 任务可认领 / 关闭。idle 循环等它，避免忙轮询。
+    wake: asyncio.Event = field(default_factory=asyncio.Event)
+    # 进入空闲的时刻（monotonic），用于 idle 超时
+    idle_since: float = 0.0
+    # 跑完多少轮（与 turns 不同：turns 是模型调用次数）
+    rounds: int = 0
+    # 为什么空闲：available（在等活）/ done（明确做完）/ blocked（被依赖挡住）
+    idle_reason: str = ""
+    # 本轮是否已经主动 send_message 给 lead。已发过就抑制 idle 帧，
+    # 避免 lead 收到「结果」+「空闲」两条重复通知（CC m1448 zo 的做法）。
+    sent_to_lead_this_round: bool = False
 
     @property
     def is_terminal(self) -> bool:
+        """生命周期是否已结束。
+
+        只表示「这个 agent 不会再有下一轮」：关闭/停止/出错/自然结束。
+        持久 worker 在 idle（等后续消息）时 **不是终态** —— 用 :attr:`is_idle`。
+        """
         return self.status in TERMINAL_STATUSES
+
+    @property
+    def is_idle(self) -> bool:
+        """本轮工作已完成、正在等后续任务（仍活着，可被唤醒）。
+
+        这个区分是持久化的核心：``wait_agent(condition="all_terminal")`` 与
+        ``read_agent_result`` 关心的是「它这轮干完了没」，而槽位回收、SSE 关闭
+        关心的是「它还会不会有下一轮」。两件事不能共用一个判定。
+        """
+        return self.status == "idle"
+
+    @property
+    def is_settled(self) -> bool:
+        """这轮工作已了结：终态或空闲。等待/读取判定用这个。"""
+        return self.is_terminal or self.is_idle
 
     def drain_pending(self) -> list[dict]:
         """取出待注入的追加指令（同步，供 AgentLoop 的 fold 点调用）。"""
@@ -74,6 +106,8 @@ class AgentNode:
         for ev in self.waiters:
             ev.set()
         self.waiters.clear()
+        # 唤醒 idle 循环：状态变化（如被关闭）要立刻让它退出等待
+        self.wake.set()
 
     def to_dict(self) -> dict:
         return {
@@ -168,7 +202,25 @@ class SubagentRegistry:
         return node
 
     def _evict_one_idle(self) -> None:
-        """回收最早完成的节点（只从内存移除，DB 记录保留）。"""
+        """腾一个槽位：先淘汰最久空闲的活着的节点，再淘汰终态节点。
+
+        A persistent teammate sits in ``idle`` instead of reaching a terminal
+        state, so the old "only finished nodes are reclaimable" rule would let
+        four idle workers permanently block the fifth spawn (``max_active``).
+        Idle-first is also the fair order: an agent that has been waiting longest
+        is the one least likely to be needed next.
+        """
+        idle = sorted(
+            (n for n in self._nodes.values() if n.is_idle),
+            key=lambda n: (n.idle_since or 0.0, self._nodes_order(n)),
+        )
+        if idle:
+            victim = idle[0]
+            # 唤醒并停掉被淘汰的节点，否则它的 idle 循环还挂在事件循环上。
+            victim.stop.set()
+            victim.wake.set()
+            self._nodes.pop(victim.name, None)
+            return
         finished = sorted(
             (n for n in self._nodes.values() if n.is_terminal),
             key=lambda n: self._nodes_order(n),
