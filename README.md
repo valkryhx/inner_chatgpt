@@ -162,11 +162,12 @@ profiles:
 
 ### 后端启动（日常）
 
-**推荐用 `.env`**（配一次，之后重启都不用手动设）：
+**推荐用 `.env`**（配一次，之后重启都不用手动设）。
+
+首配一次：
 
 ```bash
-cp .env.example .env      # 首次
-python backend/run.py
+cp .env.example .env      # PowerShell: Copy-Item .env.example .env
 ```
 
 `.env` 示例（只列常用的，完整清单见 `.env.example`）：
@@ -176,6 +177,12 @@ INNER_A2A_ENABLED=true
 INNER_A2A_PUBLIC_BASE_URL=http://127.0.0.1:8000
 INNER_ACP_GA_PYTHON=C:/anaconda3/python.exe
 INNER_ACP_MODE=full_access
+```
+
+之后每次启动只要一行（`.env` 会被自动加载）：
+
+```powershell
+cd D:\git_codes\inner_chatgpt\backend; python run.py
 ```
 
 **仍然可以临时覆盖**（真实环境变量优先于 `.env`）：
@@ -747,4 +754,3 @@ curl -s -X POST http://127.0.0.1:8000/api/auth/login \
   **不是 OS 级沙箱**；文件读写与下载限制在个人 workspace；MCP 可连接任意用户配置的远程服务。
 - **密钥存储**：用户 APIKey 存在 SQLite 明文列（MVP）；仓库不携带任何 key，`llm.yaml` 与 `backend/data/` 不入库。
 - **依赖边界**：不引入 LangChain / LangGraph；MCP 由 `fastmcp.Client` 直接接入并封装为自研 `Tool`。
-
