@@ -155,7 +155,10 @@ export default function TeamPanel({ snapshot, open, streaming, onToggle, onStop 
         <div className="team-panel-body">
           <header className="team-head">
             <div className="team-heading">
-              <div className="team-kicker">Agent Team</div>
+              {/* 这里原本还有一行 .team-kicker 小字「Agent Team」，
+                  而当团队没有自定义名时 <h2> 也回退成「Agent Team」，
+                  于是同样两个词上下挨着出现两次。kicker 是纯装饰，
+                  <h2> 才是承载团队名的那行，所以去掉 kicker。 */}
               <div className="team-title-row">
                 <h2>{team?.name || 'Agent Team'}</h2>
                 {starting && (

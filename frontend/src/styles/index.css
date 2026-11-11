@@ -829,15 +829,12 @@ textarea, input { caret-color: var(--clay); }
   padding: 18px 16px 12px;
   border-bottom: 1px solid var(--line);
 }
-.team-kicker {
-  font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase;
-  color: var(--muted); font-weight: 700;
-}
 /* 标题列占满剩余宽度（原 min-width:0 会让它在 flex 里被右侧 status 挤得很窄，
    展开提示时文字只能排成一窄条）。 */
 .team-heading { flex: 1 1 auto; min-width: 0; }
 .team-title-row { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
-.team-head h2 { margin: 3px 0 0; font-size: 16px; line-height: 1.3; font-weight: 650; }
+/* 去掉 kicker 之后 h2 就是标题区的第一行，不需要再为它留上边距。 */
+.team-head h2 { margin: 0; font-size: 16px; line-height: 1.3; font-weight: 650; }
 .team-starting-tail {
   flex-shrink: 0; color: var(--muted); opacity: .78;
   font-size: 9.5px; font-weight: 450; letter-spacing: .01em;
