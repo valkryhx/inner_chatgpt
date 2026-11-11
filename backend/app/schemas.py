@@ -1,7 +1,7 @@
 """Pydantic 请求/响应模型（字段命名对齐 Aivory 风格，snake_case）。"""
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -86,6 +86,11 @@ class SendMessageIn(BaseModel):
     attachments: list[AttachmentIn] = []
     # 可选：本次消息临时覆盖思考等级（不改会话设置）。空=不覆盖。
     reasoning_effort: Optional[str] = None
+    # 发送方式：
+    #   "send"  —— 常规发送，开一个新回合（默认，历史行为）
+    #   "queue" —— 当前有回合在跑时，把这条消息插进那个回合（steering）
+    # 语义见 docs/20261111-用户中途插话steering实施方案.md
+    mode: Literal["send", "queue"] = "send"
 
 
 class StopIn(BaseModel):

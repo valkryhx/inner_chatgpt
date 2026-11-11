@@ -97,8 +97,15 @@ export default function Composer({
   }
 
   const submit = () => {
-    if (streaming || uploading) return
+    if (uploading) return
     const t = text.trim()
+    // 生成中：纯文本允许提交（作为插话），带附件仍不允许。
+    if (streaming) {
+      if (!t) return
+      onSend(t, [])
+      clear()
+      return
+    }
     if (!t && pending.length === 0) return
     if (!t) {
       // 纯图片消息：给模型一个明确的事由，避免只发一张图没有指令。
@@ -189,13 +196,32 @@ export default function Composer({
           onChange={autoGrow}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
-          placeholder={pending.length ? '图片已就绪，直接发送或补充一句说明…' : '输入消息…'}
+          placeholder={
+            pending.length
+              ? '图片已就绪，直接发送或补充一句说明…'
+              : streaming
+                ? '补充一句要求…（会插入当前任务，不会另起一轮）'
+                : '输入消息…'
+          }
           rows={1}
-          disabled={streaming}
+          // 生成中也能输入：按发送会把这句话插进正在跑的回合（steering）。
+          // 以前这里 disabled，用户以为程序卡死。
+          disabled={uploading}
         />
         <div className="composer-right">
           {streaming ? (
-            <button className="send-icon stop" onClick={onStop} title="停止生成">■</button>
+            <>
+              {!!text.trim() && (
+                <button
+                  className="send-icon"
+                  onClick={submit}
+                  title="插入当前任务（不另起一轮）"
+                >
+                  <SendIcon />
+                </button>
+              )}
+              <button className="send-icon stop" onClick={onStop} title="停止生成">■</button>
+            </>
           ) : canSend ? (
             <button className="send-icon" onClick={submit} title="发送（Enter）"><SendIcon /></button>
           ) : (

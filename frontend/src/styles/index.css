@@ -177,6 +177,13 @@ textarea, input { caret-color: var(--clay); }
 .msg.user .bubble-col { align-items: flex-end; max-width: min(80%, 560px); }
 .msg.assistant .bubble-col { align-items: stretch; }
 
+/* 生成中投递的插话角标：明确「已插入当前任务」，而不是另起一轮 */
+.steer-badge {
+  font-size: 11px; line-height: 1; padding: 3px 8px;
+  border-radius: var(--r-sm); color: var(--muted);
+  background: var(--surface-2); border: 1px dashed var(--border);
+}
+
 /* L1：用户输入保留「输入容器」感（浅暖底、圆角、无边框、无尾巴） */
 .msg .bubble {
   max-width: 100%; padding: 9px 14px; border-radius: var(--r-lg);

@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import db
 from ..agent import with_effort
@@ -25,6 +25,8 @@ from ..sse import run_agent_stream, sse_frame
 from .. import uploads
 from ..subagent.context import AgentContext
 from ..subagent.session import build_turn_runtime, prepare_turn_team
+from ..logging_setup import team_event
+from ..steer_queue import get_queue
 
 _SUBAGENT_EVENT_ID = "__subagent__"
 
@@ -155,6 +157,9 @@ class _TurnUR:
         self.store = turn.store
         self.model = turn.model
         self.user_id = getattr(turn, "user_id", "")
+        # 插话队列按 generation 定位；team 路径的注入器已经会 drain，
+        # 这里带上是为了「没有 team 时的普通路径」能用同一个键。
+        self.generation_id = getattr(turn, "generation_id", "")
 
 logger = logging.getLogger(__name__)
 
@@ -565,6 +570,11 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                                     turn.buffer, turn.host, stop_event,
                                     extra=getattr(turn, "acp", None))
         else:
+            # 普通路径（没有 team）：插话注入器需要 generation_id 才能定位队列。
+            try:
+                ur.generation_id = generation_id
+            except Exception:
+                pass
             events = run_agent_stream(ur, session_id, text, stop_event, attachments=attachments)
 
         async for ev in events:
@@ -726,7 +736,44 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
             logger.warning("release generation lease failed", exc_info=True)
 
 
-@router.post("/sessions/{session_id}/messages")
+async def _try_queue_steer(user: dict, session_id: str,
+                           body: SendMessageIn) -> JSONResponse | None:
+    """把一条消息插进正在跑的回合；没有活着的回合时返回 None（走普通发送）。
+
+    判定权威只有一个：进程内的 generation 注册表。DB 租约可能是陈旧的
+    （客户端断连、代理超时都会留下），拿它来决定「要不要排队」会让消息
+    卡进一个再也等不到 fold 点的队列。
+    """
+    active = await team_store.get_active_generation(user["id"], session_id)
+    if not active or not is_generation_live(user["id"], session_id, active):
+        # 竞态：回合刚好结束。降级为普通发送（GA 的同一处理），
+        # 而不是塞进一个没人消费的队列。
+        return None
+    if body.attachments:
+        # 图片插话要重新走上传校验与 wire 展开，P0 先不支持，避免半截实现。
+        raise HTTPException(status_code=400, detail={
+            "error": "attachments_not_supported_in_queue_mode",
+            "hint": "生成过程中暂不支持带图片插话；请等当前任务结束后再发。",
+        })
+    q = get_queue(user["id"], session_id, active)
+    depth = q.push(body.text, source="user", priority="next")
+    if depth == 0:
+        raise HTTPException(status_code=429, detail={
+            "error": "steer_queue_full",
+            "queue_depth": len(q),
+            "hint": "插话队列已满（或内容为空）；等本轮处理完再补。",
+        })
+    team_event("steer_queued", agent="root", team_id="", session_id=session_id,
+               generation_id=active, queue_depth=depth,
+               text_chars=len(body.text))
+    return JSONResponse(status_code=202, content={
+        "queued": True,
+        "generation_id": active,
+        "queue_depth": depth,
+    })
+
+
+@router.post("/sessions/{session_id}/messages", response_model=None)
 async def send_message(session_id: str, body: SendMessageIn, user: dict = Depends(get_current_user)):
     sess = await db.get_session(session_id, user["id"])
     if not sess:
@@ -734,6 +781,14 @@ async def send_message(session_id: str, body: SendMessageIn, user: dict = Depend
     attachments = await _validate_attachments(user["id"], body.attachments)
     if not body.text.strip() and not attachments:
         raise HTTPException(status_code=400, detail="empty text")
+
+    # ---- steering：当前有活着的回合时，把这条消息插进去而不是另开一轮 ----
+    # 这一步刻意在抢租约之前：抢了租约就等于开了新回合，那正是用户要避免的。
+    if body.mode == "queue":
+        queued = await _try_queue_steer(user, session_id, body)
+        if queued is not None:
+            return queued
+
     generation_id = body.generation_id or db.new_id("g")
     # One active generation per (user, session). Without this lease two tabs
     # can interleave writes into the same checkpoint, and stop becomes ambiguous.

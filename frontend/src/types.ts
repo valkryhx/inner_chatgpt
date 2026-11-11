@@ -205,7 +205,7 @@ export interface Message {
   content: string
   reasoning: string
   blocks: MessageBlock[]
-  status: 'streaming' | 'complete' | 'error' | 'stopped'
+  status: 'streaming' | 'complete' | 'error' | 'stopped' | 'queued'
   created_at: number
   /** 本轮开始时间（前端本地计时，仅当前页面生命周期有效）。 */
   run_started_at?: number
