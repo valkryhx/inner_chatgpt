@@ -71,3 +71,7 @@ tutorials/*.visual-check.json
 
 # GitHub Pages 构建产物
 _site/
+
+# 本地 skills 留存：技能包可能含业务数据或体积较大，不随仓库分发（2026-11-11 决定）。
+# 注意这只影响「今后」不再跟踪新文件；此前已提交的内容仍留在历史里。
+skill_assets/
