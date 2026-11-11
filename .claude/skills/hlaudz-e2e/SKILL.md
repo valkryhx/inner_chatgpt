@@ -114,6 +114,7 @@ backend/tests/e2e/runs/<runId>/messages.json  # 持久化后的消息列表
 | S9 | 并发槽位 | 「同一轮一次性派 6 个（每个先 sleep 8 秒）」 | 前 4 个成功；第 5/6 个返回「已达上限 4」；模型 close 后补派；最终 6 个 completed |
 | S10 | 长任务 | 「派一个 sleep 660 秒的子代理」 | 跨多轮 wait 后拿到结果；无重复 spawn；事件缓冲不丢 |
 | S12 | 跨回合通知 | 两轮对话：第一轮派活后结束，第二轮问结果 | 第二轮不重新 spawn；`read_agent_result` 能取到上一代结果（source=db）；history 含「[任务通知]」 |
+| S15 | **外部 GA（ACP）** | 「用外部 GenericAgent（ga_spawn，不是 spawn_agent）算 23×17 并复述 SENTINEL」 | 出现 `ga_spawn → ga_wait → ga_result`；**不出现** `spawn_agent`；哨兵由 GA 原样复述。前置：后端启动时配了 `INNER_ACP_GA_PYTHON`/`INNER_ACP_GA_COMMAND` 且预检通过（否则 `ga_*` 不注册，场景必红） |
 | S11（计划） | 大输出 | 「跑 pytest 并列出失败详情」 | 出现落盘路径且模型能读回 |
 | S0 | 负对照 | 「今天几号」 | 无 spawn / 无搜索工具 |
 

@@ -17,8 +17,25 @@ def cases() -> dict[str, dict]:
         "S0": {
             "name": "negative-control",
             "prompt": "今天几号？直接回答，不要调用任何搜索或派发工具。",
-            "forbid_tools": ["spawn_agent", "spawn_teammate", "file_grep", "file_glob"],
+            "forbid_tools": ["spawn_agent", "spawn_teammate", "file_grep", "file_glob",
+                             "ga_spawn"],
             "timeout_s": 150,
+        },
+        # S15：外部 GenericAgent（ACP）。必须显式点名 GA，否则模型会
+        # 优先用内部 spawn_agent —— 那测的是 P2 子代理，不是 ACP 链路。
+        # 前置：后端启动时配了 INNER_ACP_GA_PYTHON 或 INNER_ACP_GA_COMMAND，
+        # 且预检通过（否则 5 个 ga_* 工具根本不注册，本场景会因 expect_tools 失败）。
+        "S15": {
+            "name": "acp-genericagent",
+            "prompt": (f"请使用**外部 GenericAgent**（ga_spawn 工具，不是 spawn_agent）"
+                       f"完成一件小事：让它计算 23*17 并在答复里原样复述这个字符串：{SENTINEL}。"
+                       "派完活之后用 ga_wait 等它完成，再用 ga_result 取回它的答复，"
+                       "把 GA 的原始答复和计算结果告诉我。"
+                       "如果你没有 ga_spawn 工具，请直接说明「没有 ga_spawn 工具」。"),
+            "expect_tools": ["ga_spawn"],
+            "forbid_tools": ["spawn_agent"],
+            "sentinel": SENTINEL,
+            "timeout_s": 420,
         },
         "S8": {
             "name": "tool-preference",
