@@ -1,6 +1,11 @@
 # secrets
 llm.yaml
 llm.yaml.example.local
+# 环境变量文件：.env 含密钥（APP_JWT_SECRET / API key 等），绝不入库；
+# .env.example 是模板（只有键名和注释），需要入库供他人复制。
+.env
+.env.*
+!.env.example
 
 # python
 __pycache__/

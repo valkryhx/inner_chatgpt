@@ -87,15 +87,28 @@
 cd backend
 pip install -r requirements.txt
 
-# 2) 前端构建（产物由后端单端口托管）
-cd ../frontend
+# 2) 配置环境变量（推荐用 .env，不再靠每次启动前手动设）
+cd ..
+cp .env.example .env          # PowerShell: Copy-Item .env.example .env
+# 按需编辑 .env：APP_JWT_SECRET / INNER_A2A_* / INNER_ACP_* 等
+
+# 3) 前端构建（产物由后端单端口托管）
+cd frontend
 npm install
 npm run build
 
-# 3) 启动后端（带 A2A，PowerShell 版见下方「后端启动（日常）」）
+# 4) 启动后端
 cd ../backend
-INNER_A2A_ENABLED=true INNER_A2A_PUBLIC_BASE_URL=http://127.0.0.1:8000 python run.py
+python run.py
 ```
+
+**环境变量优先级：真实环境变量 > `.env` > 代码内默认值。**
+临时覆盖仍然有效（`$env:FOO="x"; python run.py` 会盖过 `.env`），CI 不受影响。
+
+`.env` 在仓库根目录，由 `backend/app/__init__.py` 在**任何子模块导入前**加载——
+这不是随手放的位置：`app.quota.Limits`、`app.auth.SECRET`、`app.acp.config` 都在
+**导入时**读取环境变量求值，加载晚一步就会出现「配了不生效」。
+`.env` 已被 `.gitignore` 排除（含密钥），`.env.example` 只放键名和说明、需要入库。
 
 首次启动会自动创建空的 `backend/data/app.db`（无任何用户/会话）。
 
@@ -110,7 +123,23 @@ INNER_A2A_ENABLED=true INNER_A2A_PUBLIC_BASE_URL=http://127.0.0.1:8000 python ru
 
 ### 后端启动（日常）
 
-**推荐带 A2A 启动**（Windows PowerShell）：
+**推荐用 `.env`**（配一次，之后重启都不用手动设）：
+
+```bash
+cp .env.example .env      # 首次
+python backend/run.py
+```
+
+`.env` 示例（只列常用的，完整清单见 `.env.example`）：
+
+```ini
+INNER_A2A_ENABLED=true
+INNER_A2A_PUBLIC_BASE_URL=http://127.0.0.1:8000
+INNER_ACP_GA_PYTHON=C:/anaconda3/python.exe
+INNER_ACP_MODE=full_access
+```
+
+**仍然可以临时覆盖**（真实环境变量优先于 `.env`）：
 
 ```powershell
 cd D:\git_codes\inner_chatgpt\backend

@@ -22,6 +22,8 @@ mcp==1.26.0
 pyyaml==6.0.3
 aiosqlite==0.22.0
 pydantic==2.14.1
+# 从仓库根 .env 加载环境变量（backend/app/__init__.py 里最先执行）
+python-dotenv==1.2.2
 
 # Office document generation (file download itself supports any format;
 # these libraries let code_run produce .docx / .xlsx / .pptx artifacts)
