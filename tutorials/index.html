@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hlaudz 教程</title>
+<style>
+  :root {
+    --bg: #faf7f2; --fg: #2b2521; --muted: #7a6f66;
+    --card: #ffffff; --line: #e5ded4; --accent: #c4633f;
+    --accent-soft: #f6ede6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16130f; --fg: #ece5dc; --muted: #9b8f83;
+      --card: #1f1b16; --line: #332c25; --accent: #e08a63;
+      --accent-soft: #2a2119;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 56px 20px 72px; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif;
+    line-height: 1.65;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 27px; margin: 0 0 6px; letter-spacing: -0.012em; }
+  .sub { color: var(--muted); font-size: 14px; margin-bottom: 34px; }
+  .grp { font-size: 11.5px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase;
+         color: var(--muted); margin: 30px 0 12px; }
+  a.card {
+    display: block; padding: 19px 22px; margin-bottom: 12px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    color: inherit; text-decoration: none;
+    transition: border-color .15s, transform .15s;
+  }
+  a.card:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .card h2 { font-size: 15.5px; margin: 0 0 6px; color: var(--accent); }
+  .card p { margin: 0; font-size: 13.5px; color: var(--muted); }
+  .tag {
+    display: inline-block; margin-top: 10px; padding: 2px 9px;
+    font-size: 11.5px; border-radius: 20px;
+    background: var(--accent-soft); color: var(--accent);
+  }
+  footer { margin-top: 42px; padding-top: 18px; border-top: 1px solid var(--line);
+           font-size: 12.5px; color: var(--muted); }
+  footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Hlaudz 教程</h1>
+    <p class="sub">多用户 Web Agent 平台的内部机制图解与说明</p>
+
+    <div class="grp">协作机制</div>
+
+    <a class="card" href="./hlaudz-subagent-diagram.html">
+      <h2>子代理机制图解</h2>
+      <p>可交互架构图：root 如何派生子代理、子代理为何看不到父对话、结果如何经侧链回到主对话。点工具栏「动态」看信号持续流动，点节点可聚焦并追问上下游。</p>
+      <span class="tag">架构图</span>
+    </a>
+
+    <a class="card" href="./hlaudz-subagent-mechanism.html">
+      <h2>子代理机制说明</h2>
+      <p>配套文字说明：为什么用进程内 asyncio、四个容易误解的点（wait 默认不等完、看不到父对话、编排工具缺席、侧链不进主历史），以及逐条代码位置。</p>
+      <span class="tag">文档</span>
+    </a>
+
+    <a class="card" href="./hlaudz-agent-team-diagram.html">
+      <h2>Agent Team 机制图解</h2>
+      <p>在子代理之上加一块持久任务板：lead 建任务、绑定即认领、teammate 交回、消息平台注入。含三个视角（派单 / 汇报 / 刷新恢复）。</p>
+      <span class="tag">架构图</span>
+    </a>
+
+    <a class="card" href="./hlaudz-agent-team-mechanism.html">
+      <h2>Agent Team 机制说明</h2>
+      <p>配套文字说明：和 subagent 的唯一区别、怎么说话才会触发 Team、三件容易误解的事（绑定即认领、blocked_by 不能绕、刷新只恢复任务板）。</p>
+      <span class="tag">文档</span>
+    </a>
+
+    <footer>
+      源码：<a href="https://github.com/valkryhx/inner_chatgpt">valkryhx/inner_chatgpt</a>
+      · 图由 <a href="https://github.com/tt-a1i/archify">archify</a> 生成
+    </footer>
+  </div>
+</body>
+</html>

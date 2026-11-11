@@ -1,0 +1,55 @@
+name: Deploy tutorials to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tutorials/**'
+      - '.github/scripts/build-tutorials.py'
+      - '.github/workflows/pages-tutorials.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-tutorials
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 不用 Jekyll：交互图是自包含 HTML（内含全部 JS/CSS/字体），
+      # 经 Jekyll 处理只会引入 Liquid 冲突风险。这个脚本只做 Jekyll
+      # 本来该做的事——把 Markdown 渲染成带样式的独立 HTML。
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install markdown
+        run: python -m pip install --quiet markdown
+
+      - name: Build static site
+        run: python .github/scripts/build-tutorials.py tutorials _site
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -60,3 +60,14 @@ temp/
 claude_html/
 # e2e 运行现场（含会话数据，不入库）
 backend/tests/e2e/runs/
+
+# tutorials：archify 的校验回执是本地构建证据，不入库也不发布
+# （HTML 本身是自包含的单文件，需要入库以便 GitHub Pages 直接托管）
+tutorials/*.finalize.json
+tutorials/*.finalize-summary.json
+tutorials/*.delivery.json
+tutorials/*.browser-check.json
+tutorials/*.visual-check.json
+
+# GitHub Pages 构建产物
+_site/
