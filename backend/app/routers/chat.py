@@ -331,6 +331,27 @@ async def _cleanup_turn(turn, hub, user_id: str, session_id: str, generation_id:
 router = APIRouter(prefix="/api", tags=["chat"])
 
 
+async def _partial_summary_blocks(user_id: str, session_id: str, generation_id: str,
+                                  turn, user_text: str) -> list[str]:
+    """上游挂掉时，读库拼一段「已完成什么」的收尾。
+
+    返回为空表示没有可汇报的东西（那就什么都不加，保持原有的报错行为）。
+    这里刻意只读数据库，不碰模型和网络。
+    """
+    try:
+        from ..partial_summary import build_partial_summary
+        team_id = str(getattr(turn, "team_id", "") or "") if turn is not None else ""
+        body = await build_partial_summary(
+            user_id=user_id, session_id=session_id, generation_id=generation_id,
+            team_id=team_id, user_text=user_text)
+    except Exception:  # noqa: BLE001 - 收尾失败不能让错误本身也变成错误
+        logger.warning("partial summary failed", exc_info=True)
+        return []
+    if not body:
+        return []
+    return ["\n\n", body, "\n"]
+
+
 async def _event_stream(user_id: str, session_id: str, text: str, generation_id: str, message_id: str,
                         model_id: str = "", stop_event: asyncio.Event | None = None,
                         tool_policy: str = "full",
@@ -635,6 +656,20 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
             elif et == "error":
                 terminal_status = "error"
                 yield frame("error", {"error": ev.get("error", "unknown error")})
+                # 上游彻底不可用时，别让用户只看到半截话：把「已经做完了什么」
+                # 读出来告诉他。这一段绝不调模型 —— 现在正是模型不可用的时刻。
+                tail = await _partial_summary_blocks(user_id, session_id,
+                                                     generation_id, turn, text)
+                if tail:
+                    for piece in tail:
+                        # 必须同时写 buffer 和 blocks：_persist 的 content 取自
+                        # buffer，只写 blocks 会让这段收尾在刷新后消失（真机
+                        # 第一次验证就是这样 —— 流里看得到，库里没有）。
+                        buffer.append(piece)
+                        _append_text(piece)
+                        for line in piece.splitlines(keepends=True):
+                            yield frame("text_delta", {"text": line})
+                    await _persist("streaming", force=True)
             elif et == "done":
                 upstream_status = ev.get("status")
                 if upstream_status in ("complete", "stopped"):

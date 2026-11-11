@@ -337,15 +337,50 @@ errored，任务永远停在 `in_progress`，第三个任务永远等不到依�
 **结论按 §6.5 判定**：`125016-824c` 满足全部结构性不变量（owner 正确、消息
 `consumed`、无滞留、`done` 为末帧），因此判为通过；耗时不作为判据。
 
+### 8.6b 上游彻底放弃时的收尾摘要（单测 597 → 604）
+
+上面 §6.5 说「耗时长不算缺陷」，但真机 `131321-558a` 暴露了一个**真正的 UX 缺口**：
+三条任务全部 completed、三个 worker 都正常结束，lead 却在收尾阶段撞上持续 502，
+用户最后看到的只有一句半截话 —— 劳动成果都在任务板和数据库里，却没有任何东西告诉用户。
+
+新增 `backend/app/partial_summary.py`，在 SSE 的 `error` 分支追加一段收尾：
+
+```
+> **执行中断说明**
+> 你的请求「…」在收尾阶段被上游模型服务中断打断。
+
+**中断前已完成**
+- ✅ 任务1：统计 backend/app 目录下的 .py 文件数量（worker_a）
+- ✅ 任务2：计算 backend/app 目录下 .py 文件平均行数（worker_b）
+
+**尚未完成**
+- ⏳ 任务3：用一句话总结前两步结论（未开始）
+
+**执行失败的队友**：worker_c
+
+**接下来可以怎么做**
+- 直接重发一次即可：上面的进度都在任务板和上下文里，不会丢。
+```
+
+**核心约束：这段绝不调用模型。** 它存在的场景就是模型服务已经不可用 ——
+任何依赖 LLM 的兜底都会跟着一起失败。所以全部是数据库读取 + 模板拼装，
+并用 `test_summary_does_not_call_llm` 把这条钉死（monkeypatch 让 `LLMClient.run`
+和 `build_client_from_config` 直接抛异常，摘要仍要能生成）。
+
+**实施中发现的缺陷**：第一版只写 `blocks` 没写 `buffer`，导致摘要**流里看得到、
+刷新后消失**（`_persist` 的 `content` 取自 `buffer`）。真机 `134210-0e77` 复现，
+已修复并补了 `test_summary_text_reaches_persisted_content` 固定「两处必须同步」。
+
 ### 8.7 测试总账
 
 | 层 | 文件 | 条数 |
 |---|---|---|
 | L1 | `tests/test_llm_resilience.py` | 12 |
-| L2 | `tests/test_agent_loop_resilience.py` | 6 |
+| L2 | `tests/test_agent_loop_resilience.py` | 11 |
 | L3-a | `tests/test_lead_team_gate.py` | 7 |
 | L3-b | `tests/test_team_failover.py` | 4 |
 | L3-b | `tests/test_team_task_release.py` | 5 |
 | 幂等 | `tests/test_team_idempotency.py` | 6 |
+| 收尾 | `tests/test_partial_summary.py` | 7 |
 
-后端全量 **552 → 592**。七组变异反向确认全部 RED。
+后端全量 **552 → 604**。九组变异反向确认全部 RED。
