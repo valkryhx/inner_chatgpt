@@ -73,9 +73,11 @@
 - Node.js 20+（已验证 v24 / v25）
 - 依赖见 `backend/requirements.txt`（版本已固定）与 `frontend/package.json`
 
-> **数据库与 `llm.yaml` 均为 Hlaudz 运行时数据，不入库。**
+> **数据库、`.env` 与 `llm.yaml` 均为 Hlaudz 运行时数据，不入库。**
 > - 干净 clone 后首次启动会自动创建空的 `backend/data/app.db`（无用户/会话）。
-> - `llm.yaml` 是**可选**的 Hlaudz 兜底模型配置（含真实 key），缺失时用户各自在页面配置模型即可。
+> - `.env` 放运行期环境变量（JWT 密钥、A2A/ACP 开关、模型 key 等），模板见 `.env.example`。
+> - `llm.yaml` 是**可选**的 Hlaudz 兜底模型配置，模板见 `llm.yaml.example`。
+>   缺失也能正常用——每个用户在「设置 → 我的模型」里各自配即可。
 > - 模型 key 由每个用户在页面里自行填写；仓库不携带任何 key。
 
 ---
@@ -91,6 +93,10 @@ pip install -r requirements.txt
 cd ..
 cp .env.example .env          # PowerShell: Copy-Item .env.example .env
 # 按需编辑 .env：APP_JWT_SECRET / INNER_A2A_* / INNER_ACP_* 等
+
+# 2b) 可选：配置兜底模型（没有也能用，用户在页面自己配）
+cp llm.yaml.example llm.yaml  # PowerShell: Copy-Item llm.yaml.example llm.yaml
+# 填 api_key，或把 ZhanLu_API_KEY 写进 .env 让它插值
 
 # 3) 前端构建（产物由后端单端口托管）
 cd frontend
@@ -117,9 +123,42 @@ python run.py
 3. 回到会话页，新建会话即可对话。
 4. 需要工具能力时，在「设置 → 我的 MCP」粘贴 `mcp.json`；需要技能时在「设置 → 我的 Skills」导入 zip 或新建。
 
-- 健康检查：`GET http://127.0.0.1:8000/api/health`（`model` 为空表示 Hlaudz 没有可选的 `llm.yaml` 兜底，属正常）
+- 健康检查：`GET http://127.0.0.1:8000/api/health`（`model` 为空表示没配 `llm.yaml` 兜底，属正常——用户在页面配了就能用）
 - 若 `frontend/dist` 存在，后端会自动在 `/` 托管前端（单端口访问）。
 - A2A 需要实例级开关：按下方「后端启动（日常）」带环境变量启动，再登录到「设置 → A2A 接入」打开你自己的开关并创建 token。
+
+### 模型兜底 `llm.yaml`（可选）
+
+**优先级：用户在「设置 → 我的模型」里配的 > `llm.yaml` 兜底。**
+没配这个文件也能正常用，只是新用户必须自己填 key。
+
+结构是 `providers → models → profiles → active_profile` 四层：
+
+```yaml
+active_profile: default
+
+providers:
+  zhanlu:
+    base_url: https://ecloud.10086.cn/api/query/aigateway/v1
+    api_key: ${ZhanLu_API_KEY}      # 从 .env 插值，避免明文落盘
+    wire_api: openai_chat           # 或 openai_responses
+
+models:
+  deepseek-flash:
+    provider: zhanlu
+    api_model: moma/deepseek-latest-flash
+    context_window: 400000          # 决定压缩软线/硬线
+    max_tokens: 15920
+    temperature: 1.0
+    read_timeout: 120
+
+profiles:
+  default:
+    model: deepseek-flash
+```
+
+`api_key` 支持 `${ENV_VAR}` 插值（见 `backend/app/config.py` 的 `_interp()`），
+所以推荐把真实 key 写进 `.env`，`llm.yaml` 里只留 `${ZhanLu_API_KEY}`。
 
 ### 后端启动（日常）
 

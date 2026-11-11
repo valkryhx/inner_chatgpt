@@ -1,0 +1,52 @@
+# Hlaudz 模型兜底配置模板
+#
+# 复制为 llm.yaml 后使用：cp llm.yaml.example llm.yaml
+# 填好 api_key（或改用 ${ENV_VAR} 从 .env 读）即可。
+# llm.yaml 已在 .gitignore 里排除（含密钥），本模板只放结构说明、需要入库。
+#
+# 结构说明：
+#   providers  —— 怎么连（base_url / api_key / wire_api）
+#   models     —— 用哪个模型（api_model / context_window / max_tokens）
+#   profiles   —— 预设组合，一个 profile 指向一个 model
+#   active_profile —— 默认用哪个 profile
+#
+# 优先级：用户自己的「设置 → 我的模型」配置 > 本文件兜底。
+# 密钥建议写成 ${ENV_VAR}，在 .env 里给真实值，避免明文落盘。
+
+active_profile: default
+
+providers:
+  zhanlu:
+    # 湛卢（中国移动云）OpenAI 兼容网关
+    base_url: https://ecloud.10086.cn/api/query/aigateway/v1
+    # 方式 A（推荐）：从 .env 读，.env 里写 ZhanLu_API_KEY=sk-xxxx
+    api_key: ${ZhanLu_API_KEY}
+    # 方式 B：直接写明文（不推荐，文件一旦外泄即泄露）
+    # api_key: sk-replace-me
+    #
+    # wire_api 取值：
+    #   openai_chat      → POST /chat/completions（多数 OpenAI 兼容网关用这个）
+    #   openai_responses → POST /responses（OpenAI 官方新接口）
+    wire_api: openai_chat
+
+models:
+  deepseek-flash:
+    provider: zhanlu
+    # 实际发给模型的名字
+    api_model: moma/deepseek-latest-flash
+    # 上下文窗口：决定自动压缩的软线/硬线
+    context_window: 400000
+    # 单次回复上限
+    max_tokens: 15920
+    temperature: 1.0
+    # 可选：显式指定压缩阈值；留空按 context_window * 0.90 / 0.95 派生
+    # auto_compact_tokens: 360000
+    # hard_limit_tokens: 380000
+    # 可选：LLM 调用重试预算（0..8），留空走 HLZ_LLM_MAX_RETRIES 或默认 4
+    # max_retries: 4
+    # 单次请求读超时（秒）
+    read_timeout: 120
+
+profiles:
+  default:
+    model: deepseek-flash
