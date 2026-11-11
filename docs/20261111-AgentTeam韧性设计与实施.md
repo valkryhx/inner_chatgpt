@@ -337,7 +337,7 @@ errored，任务永远停在 `in_progress`，第三个任务永远等不到依�
 **结论按 §6.5 判定**：`125016-824c` 满足全部结构性不变量（owner 正确、消息
 `consumed`、无滞留、`done` 为末帧），因此判为通过；耗时不作为判据。
 
-### 8.6b 上游彻底放弃时的收尾摘要（单测 597 → 604）
+### 8.6b 上游彻底放弃时的收尾摘要（单测 597 → 606）
 
 上面 §6.5 说「耗时长不算缺陷」，但真机 `131321-558a` 暴露了一个**真正的 UX 缺口**：
 三条任务全部 completed、三个 worker 都正常结束，lead 却在收尾阶段撞上持续 502，
@@ -381,6 +381,6 @@ errored，任务永远停在 `in_progress`，第三个任务永远等不到依�
 | L3-b | `tests/test_team_failover.py` | 4 |
 | L3-b | `tests/test_team_task_release.py` | 5 |
 | 幂等 | `tests/test_team_idempotency.py` | 6 |
-| 收尾 | `tests/test_partial_summary.py` | 7 |
+| 收尾 | `tests/test_partial_summary.py` | 9 |
 
-后端全量 **552 → 604**。九组变异反向确认全部 RED。
+后端全量 **552 → 606**。十一组变异反向确认全部 RED。

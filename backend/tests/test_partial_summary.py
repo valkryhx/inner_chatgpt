@@ -183,3 +183,131 @@ async def test_summary_text_reaches_persisted_content(monkeypatch):
     seg = src[seg_start:seg_start + 900]
     assert "buffer.append" in seg, "收尾文本必须写进 buffer，否则 _persist 的 content 里没有"
     assert "_append_text" in seg, "收尾文本必须写进 blocks，否则刷新后结构块里没有"
+
+
+# ---------------- 端到端：error 事件触发摘要并落盘 ----------------
+def _collect_frames(gen):
+    import asyncio
+
+    async def _run():
+        out = []
+        async for frame in gen:
+            out.append(frame)
+        return out
+    return asyncio.run(_run())
+
+
+def test_error_event_appends_summary_and_persists(monkeypatch):
+    """端到端：模型调用彻底失败时，收尾摘要要进 SSE 流，也要进持久化内容。"""
+    import asyncio
+    import json as _json
+
+    from app import db
+    from app.routers import chat
+
+    ids = _ids()
+    captured: dict = {}
+
+    async def fake_add_message(*a, **k):
+        return {"id": k.get("message_id", "m")}
+
+    async def fake_update_message(message_id, **fields):
+        captured["content"] = fields.get("content")
+        captured["blocks"] = fields.get("blocks")
+        captured["status"] = fields.get("status")
+
+    async def fake_run_agent_stream(ur, session_id, text, stop_event=None, attachments=None):
+        yield {"type": "text_delta", "text": "我先看看"}
+        yield {"type": "error", "error": "上游模型服务暂时不可用（502 Bad Gateway）"}
+
+    class FakeModel:
+        model_name = "fake"
+
+    class FakeUR:
+        model = FakeModel()
+
+        async def sanitize_pending_tool_calls(self, sid):
+            return False
+
+    class FakeHub:
+        async def get_user_runtime(self, uid, mid=""):
+            return FakeUR()
+
+    async def fake_summary(user_id, session_id, generation_id, turn, user_text):
+        return ["\n\n", "> **执行中断说明**\n> 已完成 2 个任务。", "\n"]
+
+    monkeypatch.setattr(chat, "get_hub", lambda: FakeHub())
+    monkeypatch.setattr(chat, "run_agent_stream", fake_run_agent_stream)
+    monkeypatch.setattr(chat, "_partial_summary_blocks", fake_summary)
+    monkeypatch.setattr(db, "add_message", fake_add_message)
+    monkeypatch.setattr(db, "update_message", fake_update_message)
+
+    import app.compaction as compaction
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(compaction, "enforce_soft_limit", _noop, raising=False)
+    monkeypatch.setattr(compaction, "enforce_hard_limit", _noop, raising=False)
+
+    frames = _collect_frames(
+        chat._event_stream(ids["user_id"], ids["session_id"], "干活", "g1", "m1"))
+
+    assert "执行中断说明" in (captured.get("content") or ""), \
+        f"收尾必须在持久化内容里，实际 {captured.get('content')!r}"
+    text_blocks = [b for b in (captured.get("blocks") or []) if b.get("type") == "text"]
+    assert any("执行中断说明" in b.get("text", "") for b in text_blocks), \
+        "收尾也必须进 blocks，否则刷新后结构里没有"
+    assert any("执行中断说明" in f for f in frames), "收尾也要流式发给用户"
+    assert captured.get("status") == "error", "状态仍是 error，不能假装成功"
+
+
+def test_complete_path_has_no_summary(monkeypatch):
+    """正向对照：正常完成时绝不能塞中断说明。"""
+    import asyncio
+
+    from app import db
+    from app.routers import chat
+
+    captured: dict = {}
+
+    async def fake_add_message(*a, **k):
+        return {"id": "m"}
+
+    async def fake_update_message(message_id, **fields):
+        captured["content"] = fields.get("content")
+
+    async def fake_run_agent_stream(ur, session_id, text, stop_event=None, attachments=None):
+        yield {"type": "text_delta", "text": "全部搞定"}
+        yield {"type": "done", "status": "complete"}
+
+    class FakeModel:
+        model_name = "fake"
+
+    class FakeUR:
+        model = FakeModel()
+
+        async def sanitize_pending_tool_calls(self, sid):
+            return False
+
+    class FakeHub:
+        async def get_user_runtime(self, uid, mid=""):
+            return FakeUR()
+
+    monkeypatch.setattr(chat, "get_hub", lambda: FakeHub())
+    monkeypatch.setattr(chat, "run_agent_stream", fake_run_agent_stream)
+    monkeypatch.setattr(db, "add_message", fake_add_message)
+    monkeypatch.setattr(db, "update_message", fake_update_message)
+
+    import app.compaction as compaction
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(compaction, "enforce_soft_limit", _noop, raising=False)
+    monkeypatch.setattr(compaction, "enforce_hard_limit", _noop, raising=False)
+
+    _collect_frames(chat._event_stream("u1", "s1", "hi", "g1", "m1"))
+
+    assert "执行中断说明" not in (captured.get("content") or "")
+    assert (captured.get("content") or "").strip() == "全部搞定"
