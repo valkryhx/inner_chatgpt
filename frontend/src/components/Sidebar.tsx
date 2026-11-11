@@ -1,10 +1,14 @@
 import { useState } from 'react'
-import type { Session, User } from '../types'
+import type { McpServerStatus, Session, User } from '../types'
 
 interface Props {
   sessions: Session[]
   activeId: string | null
-  health: { model: string; mcp_tools: number } | null
+  /**
+   * 健康状态。`servers` 由 App 从 /api/me/mcp-effective 合并进来，
+   * 不在 /api/health 的返回里——所以这里必须显式声明，否则取不到类型。
+   */
+  health: { model: string; mcp_tools: number; servers: McpServerStatus[] } | null
   user: User
   activeModel?: string | null
   onSelect: (id: string) => void
