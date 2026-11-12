@@ -336,11 +336,14 @@ def _prepare_tools(tools: Optional[list[dict]], api_mode: str) -> Optional[list[
 
 
 def _max_connections_from_env(default: int = 32) -> int:
-    """连接池上限。默认 32 而不是 8。
+    """连接池初始上限。默认 32 而不是 8。
 
     8 是个危险的数字：`USER_MAX_ACTIVE_SUBAGENTS` 默认也是 8，主轮 + 8 个
     teammate 同时调模型时必然排队。排队本身不致命，但配合下面那个 pool
     超时缺陷就会变成「每次都要等 2 分钟」。
+
+    注意这只是**起点**：真正在跑的时候会按需自动上调，见
+    :meth:`LLMClient._grow_pool`。
     """
     raw = (os.environ.get("HLZ_LLM_MAX_CONNECTIONS") or "").strip()
     if not raw:
@@ -351,6 +354,35 @@ def _max_connections_from_env(default: int = 32) -> int:
         return default
 
 
+def _pool_ceiling_from_env(default: int = 128) -> int:
+    """自动扩容的硬上限。池可以涨，但不能无限涨。
+
+    为什么必须有上限：连接不是免费的。每条 TCP/TLS 连接都占内核缓冲区与端口，
+    上游网关通常也有每 key 的连接数限制。无限扩容的结果是把自己和上游一起打死。
+    128 的依据：单用户最坏并发 = user_teams(4) 个 lead + user_subagents(8)
+    + 重试余量，理论上个位数；128 留了一个数量级的安全余量，
+    同时又远低于「一个进程打开上千连接」这种会引发真正的资源问题的量级。
+    """
+    raw = (os.environ.get("HLZ_LLM_POOL_CEILING") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(2, min(int(raw), 1024))
+    except (TypeError, ValueError):
+        return default
+
+
+def _pool_idle_shrink_s() -> float:
+    """池在多久没有池满信号之后回落到初始值。0 = 不回落。"""
+    raw = (os.environ.get("HLZ_LLM_POOL_SHRINK_S") or "").strip()
+    if not raw:
+        return 600.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 600.0
+
+
 class LLMClient:
     """One endpoint. Use chat_stream(); it yields text/reasoning deltas and
     returns a ChatResult with accumulated tool_calls + usage."""
@@ -359,6 +391,13 @@ class LLMClient:
         self.s = s
         self._client = client
         self._own_client = client is None
+        # 连接池自适应扩容的当前上限。初值来自环境变量，池满时按需上调。
+        # 只对「自己拥有的池」生效 —— 注入的 client（子代理复用父的、
+        # clone_client_with_effort 派生视图）共享同一个池，由所有者负责扩容，
+        # 否则多个 LLMClient 各自改同一个池的上限会互相打架。
+        self._pool_limit = _max_connections_from_env()
+        self._pool_ceiling = _pool_ceiling_from_env()
+        self._pool_grew_at = 0.0
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -374,11 +413,72 @@ class LLMClient:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.s.timeout, connect=15.0, pool=10.0),
                 limits=httpx.Limits(
-                    max_connections=_max_connections_from_env(),
+                    max_connections=self._pool_limit,
                     max_keepalive_connections=8,
                 ),
             )
         return self._client
+
+    def _grow_pool(self, *, reason: str = "") -> int:
+        """连接池满了：把上限翻倍，直到 ceiling。返回新的上限。
+
+        **为什么是「按需扩容」而不是「一开始就设很大」**：
+        连接真的会占资源（内核端口、TLS 握手、上游网关的每 key 限制）。
+        多数用户的并发只有 1-3，给每个池都开 128 条纯属浪费。
+
+        **为什么在 PoolTimeout 之后才扩**：这是唯一可靠的饱和信号。
+        想看 `pool._requests` 排队数也行，但那是 httpcore 的私有字段，
+        版本升级会变；而 PoolTimeout 是公开异常，语义稳定。
+
+        **为什么翻倍而不是 +1**：池满通常意味着并发量级变了（比如突然派了
+        一队 teammate），线性加 1 会连续撞墙好几次。翻倍 amortize 掉这些碰撞。
+
+        实现上用 httpcore 的私有属性 `_max_connections`（httpx 没有公开 API）。
+        这个属性在 httpcore 1.x 稳定，且改完立刻生效（已在 2026-11-12 实测：
+        上限 3→9 后排队请求立刻被新一轮连接消化，9 个并发从 3 批变 1 批）。
+        拿不到时静默放弃 —— 扩容是优化，绝不能因为改不了而让请求失败。
+        """
+        # 只有池的所有者能扩容；注入方（子代理 / effort 视图）共享同一个池。
+        if not self._own_client or self._client is None:
+            return self._pool_limit
+        if self._pool_limit >= self._pool_ceiling:
+            return self._pool_limit
+        new_limit = min(self._pool_limit * 2, self._pool_ceiling)
+        try:
+            pool = self._client._transport._pool  # type: ignore[attr-defined]
+            pool._max_connections = new_limit       # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - 改不了就算了，不能影响请求
+            logger.debug("连接池扩容失败（私有属性不可用），维持 %s", self._pool_limit)
+            return self._pool_limit
+        old = self._pool_limit
+        self._pool_limit = new_limit
+        self._pool_grew_at = time.monotonic()
+        logger.warning("连接池已满，自动扩容 %s → %s（上限 %s）%s",
+                       old, new_limit, self._pool_ceiling, f"：{reason}" if reason else "")
+        _llm_retry_event("llm_pool_grow", 0, f"{old} -> {new_limit}", reason=reason)
+        return new_limit
+
+    def _maybe_shrink_pool(self) -> None:
+        """长时间没有饱和就把上限收回去，避免一次高峰永久抬高水位。
+
+        只改上限，不动已建连接 —— 空闲连接由 httpcore 自己的 keepalive
+        过期逻辑回收，我们不需要插手。
+        """
+        idle_s = _pool_idle_shrink_s()
+        if idle_s <= 0 or not self._own_client or self._client is None:
+            return
+        if self._pool_limit <= _max_connections_from_env():
+            return
+        if time.monotonic() - self._pool_grew_at < idle_s:
+            return
+        initial = _max_connections_from_env()
+        try:
+            pool = self._client._transport._pool  # type: ignore[attr-defined]
+            pool._max_connections = initial         # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            return
+        logger.info("连接池空闲回落 %s → %s", self._pool_limit, initial)
+        self._pool_limit = initial
 
     async def aclose(self) -> None:
         if self._own_client and self._client is not None:
@@ -609,6 +709,11 @@ class LLMClient:
                     httpx.RemoteProtocolError, json.JSONDecodeError) as e:
                 fail_msg = f"network error: {type(e).__name__}: {e}"
                 wait_s = _backoff_s(attempt)
+                # PoolTimeout 是唯一可靠的「池不够用」信号：说明请求在池里
+                # 排到超时都没拿到连接。此时扩容，让这次重试就能用上新连接
+                # （httpcore 立刻读 _max_connections，2026-11-12 实测）。
+                if isinstance(e, httpx.PoolTimeout):
+                    self._grow_pool(reason=f"pool timeout at attempt {attempt}")
             except httpx.HTTPError as e:
                 fail_msg = f"network error: {type(e).__name__}: {e}"
                 wait_s = _backoff_s(attempt)
@@ -652,4 +757,8 @@ class LLMClient:
                     cid = f"{cid}_{k}"
                 tool_calls.append({"id": cid, "type": "function",
                                    "function": {"name": tc["name"], "arguments": json.dumps(args, ensure_ascii=False)}})
+        # 成功返回时顺便看一眼是不是该把抬高过的上限收回去。
+        # 放在这里而不是加定时器：调用成功就是天然的「一次检查机会」，
+        # 不需要额外后台任务，也不会在完全空闲的进程里空转。
+        self._maybe_shrink_pool()
         return ChatResult(content=content, reasoning=reasoning, tool_calls=tool_calls, usage=usage)

@@ -289,3 +289,158 @@ def test_connection_limit_env_override(monkeypatch):
     assert _max_connections_from_env() == 32
     monkeypatch.setenv("HLZ_LLM_MAX_CONNECTIONS", "0")
     assert _max_connections_from_env() >= 2, "0 会被 clamp 到下限，不能真的关掉连接"
+
+
+# ---------------- 连接池自适应扩容 ----------------
+
+def _client_with_pool(limit: int = 4, ceiling: int = 16) -> LLMClient:
+    c = LLMClient(_settings())
+    c._pool_limit = limit
+    c._pool_ceiling = ceiling
+    pool = c._get_client()._transport._pool
+    pool._max_connections = limit
+    return c
+
+
+def test_grow_pool_doubles_until_ceiling():
+    c = _client_with_pool(limit=4, ceiling=16)
+    try:
+        pool = c._get_client()._transport._pool
+        assert c._grow_pool() == 8
+        assert pool._max_connections == 8
+        assert c._grow_pool() == 16
+        assert pool._max_connections == 16
+        # 到顶后不再涨
+        assert c._grow_pool() == 16
+        assert pool._max_connections == 16
+    finally:
+        asyncio.run(c.aclose())
+
+
+def test_grow_pool_skips_when_not_owner():
+    """注入的 client 共享父池，不能各自改上限（会互相打架）。"""
+    owner = LLMClient(_settings())
+    try:
+        pool = owner._get_client()
+        view = LLMClient(_settings(), client=pool)   # 非所有者
+        before = pool._transport._pool._max_connections
+        assert view._grow_pool() == view._pool_limit  # 返回原值，不扩容
+        assert pool._transport._pool._max_connections == before
+    finally:
+        asyncio.run(owner.aclose())
+
+
+def test_grow_pool_survives_private_api_breakage():
+    """拿不到私有属性时静默放弃，绝不能让请求失败。"""
+    c = _client_with_pool()
+
+    class Broken:
+        @property
+        def _pool(self):
+            raise AttributeError("httpcore 改了内部结构")
+    try:
+        c._client._transport = Broken()   # type: ignore[assignment]
+        assert c._grow_pool() == c._pool_limit
+    finally:
+        c._client = None
+        asyncio.run(c.aclose())
+
+
+def test_pool_ceiling_is_bounded(monkeypatch):
+    from app.llm_client import _pool_ceiling_from_env
+
+    monkeypatch.setenv("HLZ_LLM_POOL_CEILING", "256")
+    assert _pool_ceiling_from_env() == 256
+    monkeypatch.setenv("HLZ_LLM_POOL_CEILING", "99999")
+    assert _pool_ceiling_from_env() == 1024, "必须硬性 clamp，不能无限涨"
+    monkeypatch.setenv("HLZ_LLM_POOL_CEILING", "0")
+    assert _pool_ceiling_from_env() >= 2
+
+
+def test_shrink_restores_initial_after_idle(monkeypatch):
+    from app import llm_client as lc
+
+    monkeypatch.setenv("HLZ_LLM_MAX_CONNECTIONS", "8")
+    monkeypatch.setenv("HLZ_LLM_POOL_SHRINK_S", "60")
+    c = LLMClient(_settings())
+    try:
+        pool = c._get_client()._transport._pool
+        c._pool_limit = 8
+        pool._max_connections = 8
+        c._grow_pool()
+        assert pool._max_connections == 16
+        # 刚扩容不该立刻回落
+        c._maybe_shrink_pool()
+        assert pool._max_connections == 16
+        # 假装已经空闲很久
+        c._pool_grew_at = 0.0
+        monkeypatch.setattr(lc.time, "monotonic", lambda: 10_000.0)
+        c._maybe_shrink_pool()
+        assert pool._max_connections == 8, "空闲后应回落到初始值"
+    finally:
+        asyncio.run(c.aclose())
+
+
+def test_shrink_disabled_when_zero(monkeypatch):
+    monkeypatch.setenv("HLZ_LLM_POOL_SHRINK_S", "0")
+    from app.llm_client import _pool_idle_shrink_s
+    assert _pool_idle_shrink_s() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_pool_timeout_triggers_growth(monkeypatch, _no_sleep):
+    """PoolTimeout 必须真的触发扩容 —— 这是唯一的饱和信号。
+
+    反向确认时发现：只断言「并发请求最终成功」抓不住这个回归，
+    因为客户端会重试，没有扩容也能成功（只是慢）。必须直接断言上调。
+    """
+    # max_retries=0：只发一次，断言才能精确到「一次 PoolTimeout 涨一档」。
+    # 用 1 会让重试再撞一次池，连涨两档（4→8→16），断言就锁不住翻倍语义。
+    c = LLMClient(_settings(max_retries=0))
+    try:
+        pool = c._get_client()._transport._pool
+        c._pool_limit = 4
+        c._pool_ceiling = 16
+        pool._max_connections = 4
+        grown: list[int] = []
+        real = c._grow_pool
+
+        def spy(**kw):
+            new = real(**kw)
+            grown.append(new)
+            return new
+
+        monkeypatch.setattr(c, "_grow_pool", spy)
+
+        def boom(*a, **k):
+            raise httpx.PoolTimeout("pool exhausted")
+
+        monkeypatch.setattr(httpx.AsyncClient, "stream", boom)
+        with pytest.raises(LLMError):
+            await c.run([{"role": "user", "content": "hi"}])
+        assert grown, "PoolTimeout 必须触发扩容"
+        assert grown[0] == 8, f"应翻倍到 8，实际 {grown}"
+        assert pool._max_connections == 8
+    finally:
+        await c.aclose()
+
+
+@pytest.mark.asyncio
+async def test_non_pool_timeout_does_not_grow(monkeypatch, _no_sleep):
+    """普通读超时（不是池满）不该扩容 —— 那是上游慢，不是池不够。"""
+    c = LLMClient(_settings(max_retries=1))
+    try:
+        c._pool_limit = 4
+        c._pool_ceiling = 16
+        grown: list[int] = []
+        monkeypatch.setattr(c, "_grow_pool", lambda **kw: grown.append(1) or 4)
+
+        def boom(*a, **k):
+            raise httpx.ReadTimeout("upstream slow")
+
+        monkeypatch.setattr(httpx.AsyncClient, "stream", boom)
+        with pytest.raises(LLMError):
+            await c.run([{"role": "user", "content": "hi"}])
+        assert not grown, "读超时不该触发扩容"
+    finally:
+        await c.aclose()
