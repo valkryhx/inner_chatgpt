@@ -252,3 +252,40 @@ def test_retries_from_config_path(monkeypatch):
     assert _retries_from({"max_retries": 99}) == 8, "上限 8"
     monkeypatch.setenv("HLZ_LLM_MAX_RETRIES", "6")
     assert _retries_from({}) == 6
+
+# ---------------- 连接池配置 ----------------
+
+def test_pool_timeout_is_bounded_not_read_timeout():
+    """池满时不能等满 read_timeout。
+
+    缺陷形态（2026-11-12 实测 + 真机日志）：httpx.Timeout(read, connect=…)
+    没给 pool 时，**pool 等待沿用 read 超时**，于是连接池占满后第 N+1 个请求
+    干等 120s 才抛 PoolTimeout。真机日志里连续十几条 PoolTimeout，相邻重试
+    间隔正好 2 分钟。
+    """
+    c = LLMClient(_settings(timeout=120))
+    try:
+        t = c._get_client().timeout
+        assert t.read == 120, t
+        assert t.pool is not None, "pool 必须显式设置，否则会继承 read 超时"
+        assert t.pool <= 30, f"池等待上限过大：{t.pool}s"
+    finally:
+        asyncio.run(c.aclose())
+
+
+def test_connection_limit_above_default_subagent_count():
+    """池上限必须大于 USER_MAX_ACTIVE_SUBAGENTS(8)，否则主轮+teammate 必然排队。"""
+    from app.llm_client import _max_connections_from_env
+
+    assert _max_connections_from_env() > 8
+
+
+def test_connection_limit_env_override(monkeypatch):
+    from app.llm_client import _max_connections_from_env
+
+    monkeypatch.setenv("HLZ_LLM_MAX_CONNECTIONS", "64")
+    assert _max_connections_from_env() == 64
+    monkeypatch.setenv("HLZ_LLM_MAX_CONNECTIONS", "bad")
+    assert _max_connections_from_env() == 32
+    monkeypatch.setenv("HLZ_LLM_MAX_CONNECTIONS", "0")
+    assert _max_connections_from_env() >= 2, "0 会被 clamp 到下限，不能真的关掉连接"

@@ -20,12 +20,33 @@ import inspect
 import json
 import logging
 import os
+import time
 from typing import Any, AsyncIterator, Optional
 
 from .llm_client import ChatResult, LLMClient, LLMError
 from .tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _wall_clock_from_env(default: float = 0.0) -> float:
+    """整轮墙钟上限（秒）。0 = 不限（保持历史行为）。
+
+    为什么需要它：`max_turns` 只限制「模型往返次数」，不限制**时间**。
+    一次往返可以合法地慢到几分钟（长思考模型 + 长输出 + 重试预算 180s），
+    300 轮理论上能跑几小时。用户看到的就是「越跑越久，而且不知道还要多久」。
+
+    为什么默认 0（不限）：这是兜底闸，不是常规手段。多数正常任务不该被它打断，
+    贸然给个默认值会把「确实需要跑很久」的活切坏。需要硬上限时用
+    `AGENT_WALL_CLOCK_S` 显式打开（如 1800 = 30 分钟）。
+    """
+    raw = (os.environ.get("AGENT_WALL_CLOCK_S") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return default
 
 
 def _llm_retry_limit_from_env(default: int = 2) -> int:
@@ -109,6 +130,8 @@ class AgentLoop:
         self.system_prompt = system_prompt
         self.max_turns = max_turns
         self.history_store = history_store  # optional; when set, persists history
+        # 整轮墙钟上限（秒）；0 = 不限。见 _wall_clock_from_env 的说明。
+        self.wall_clock_s = _wall_clock_from_env()
         # Owner identity is server-generated.  It is never accepted from a tool
         # argument or model output.
         self.user_id = user_id
@@ -261,10 +284,23 @@ class AgentLoop:
         llm_retry_limit = _llm_retry_limit_from_env()
         # 团队待续跑预算：lead 想收工但队友还在跑时允许续几轮。
         team_grace_left = _team_grace_from_env()
+        # 墙钟起点：max_turns 限次数，这一条限时间。0 = 不限。
+        started_at = time.monotonic()
         while turn < self.max_turns:
             if stopped():
                 yield {"type": "done", "status": "stopped"}
                 return
+            # 墙钟闸：放在每轮开头，保证超时后不会先发起下一次模型调用。
+            if self.wall_clock_s > 0:
+                elapsed = time.monotonic() - started_at
+                if elapsed > self.wall_clock_s:
+                    logger.warning("整轮墙钟超限：%.0fs > %.0fs（第 %s 轮），停止",
+                                   elapsed, self.wall_clock_s, turn)
+                    yield {"type": "error",
+                           "error": (f"本轮运行已超过 {self.wall_clock_s:.0f}s 上限，已停止"
+                                     f"（第 {turn} 轮）。可用 AGENT_WALL_CLOCK_S 调整，"
+                                     "或设为 0 取消该上限。")}
+                    return
             turn += 1
             if self.message_injector is not None:
                 try:

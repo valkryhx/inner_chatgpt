@@ -244,6 +244,9 @@ npm run build        # 生成 frontend/dist
 | `AGENT_SOFT_LIMIT` | 覆盖自动压缩的 token 软线阈值 | 取用户模型的 `auto_compact_tokens`，否则 90% 上下文窗口 |
 | `AGENT_HARD_LIMIT` | 覆盖硬线裁剪的 token 阈值 | 取用户模型的 `hard_limit_tokens`，否则 95% 上下文窗口 |
 | `AGENT_MAX_TURNS` | 主 Agent 单轮最大模型轮数；兼容旧名 `AGENT_RECURSION_LIMIT` | 300 |
+| `AGENT_WALL_CLOCK_S` | 整轮墙钟上限（秒）；0 = 不限。`max_turns` 只限次数，这一条限时间 | 0 |
+| `HLZ_LLM_MAX_CONNECTIONS` | 模型客户端连接池上限（主轮与所有子代理共享） | 32 |
+| `HLZ_LLM_MAX_RETRIES` | 单次模型调用的重试次数（clamp 到 0–8） | 4 |
 
 ### 子代理 / Team
 

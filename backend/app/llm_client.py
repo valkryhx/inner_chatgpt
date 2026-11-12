@@ -335,6 +335,22 @@ def _prepare_tools(tools: Optional[list[dict]], api_mode: str) -> Optional[list[
     return out
 
 
+def _max_connections_from_env(default: int = 32) -> int:
+    """连接池上限。默认 32 而不是 8。
+
+    8 是个危险的数字：`USER_MAX_ACTIVE_SUBAGENTS` 默认也是 8，主轮 + 8 个
+    teammate 同时调模型时必然排队。排队本身不致命，但配合下面那个 pool
+    超时缺陷就会变成「每次都要等 2 分钟」。
+    """
+    raw = (os.environ.get("HLZ_LLM_MAX_CONNECTIONS") or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(2, min(int(raw), 256))
+    except (TypeError, ValueError):
+        return default
+
+
 class LLMClient:
     """One endpoint. Use chat_stream(); it yields text/reasoning deltas and
     returns a ChatResult with accumulated tool_calls + usage."""
@@ -346,9 +362,21 @@ class LLMClient:
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
+            # pool 单独设上限，原因是一个真实缺陷（2026-11-12 实测）：
+            # httpx.Timeout(read, connect=…) 里没给 pool 时，**pool 等待会沿用
+            # read 超时**。于是连接池被占满后，下一个请求不是快速失败，而是
+            # 干等满 read_timeout（默认 120s）才抛 PoolTimeout。
+            # 真机日志（backend/data/logs/app.log）里能看到这个形态：
+            # 相邻两次重试间隔正好 2 分钟，连续十几条 PoolTimeout。
+            #
+            # 池上限 8 本身也不该小到与 USER_MAX_ACTIVE_SUBAGENTS(8) 相等 ——
+            # 主轮 + 8 个 teammate 同时调用时必然排队。这里同时抬高上限。
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.s.timeout, connect=15.0),
-                limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+                timeout=httpx.Timeout(self.s.timeout, connect=15.0, pool=10.0),
+                limits=httpx.Limits(
+                    max_connections=_max_connections_from_env(),
+                    max_keepalive_connections=8,
+                ),
             )
         return self._client
 

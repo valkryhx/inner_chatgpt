@@ -191,3 +191,60 @@ def test_unknown_error_does_not_leak_whole_html():
     msg = _friendly_llm_error(Exception(big))
 
     assert len(msg) <= 320, f"应截断，实际长度 {len(msg)}"
+
+
+class _Clock:
+    """假时钟：首次读给起点，之后每次都跳到很远。
+
+    不能简单地给 time.monotonic 整体加偏移 —— 起点也是在循环开头读的，
+    两边同样被加，elapsed 恒为 0，闸门永远不会触发（第一版就是这么写错的）。
+    """
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def __call__(self) -> float:
+        self.reads += 1
+        return 0.0 if self.reads == 1 else 10_000.0
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_off_by_default(monkeypatch):
+    """默认不限墙钟：normal 任务不该被兜底闸打断（保持历史行为）。"""
+    monkeypatch.delenv("AGENT_WALL_CLOCK_S", raising=False)
+    loop = _loop(["答案"])
+    assert loop.wall_clock_s == 0.0
+    events = await _drain(loop)
+    assert not any(e["type"] == "error" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_stops_the_turn(monkeypatch):
+    """打开墙钟后，超限必须停下来，且不会再发起模型调用。"""
+    import app.agent_loop as al
+
+    loop = _loop(["甲", "乙", "丙"])
+    loop.wall_clock_s = 60.0
+    monkeypatch.setattr(al.time, "monotonic", _Clock())
+
+    events = await _drain(loop)
+
+    errs = [e for e in events if e["type"] == "error"]
+    assert errs, f"超限必须报错，实际 {[e['type'] for e in events]}"
+    assert "上限" in errs[0]["error"], errs[0]["error"]
+    assert loop.client.calls == 0, f"超限后不该再调用模型，实际 {loop.client.calls}"
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_error_names_the_env_var(monkeypatch):
+    """报错必须告诉用户怎么调，否则他们只会觉得「又卡住了」。"""
+    import app.agent_loop as al
+
+    loop = _loop(["甲"])
+    loop.wall_clock_s = 1.0
+    monkeypatch.setattr(al.time, "monotonic", _Clock())
+
+    events = await _drain(loop)
+
+    err = next(e for e in events if e["type"] == "error")
+    assert "AGENT_WALL_CLOCK_S" in err["error"], err["error"]
