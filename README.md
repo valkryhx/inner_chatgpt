@@ -255,7 +255,7 @@ npm run build        # 生成 frontend/dist
 | `SUBAGENT_MAX_TURNS` | 单个子代理模型轮数上限；可被 `spawn_agent` / `spawn_teammate` 的 `max_turns` 覆盖 | 300 |
 | `TEAM_DRAIN_TIMEOUT_S` | lead 已结束但 teammate 仍运行时，SSE 等待完成的上限（秒） | 300 |
 | `GLOBAL_MAX_ACTIVE_TEAMS` | 全进程活跃 Team 上限 | 16 |
-| `USER_MAX_ACTIVE_TEAMS` | 每个用户活跃 Team 上限 | 1 |
+| `USER_MAX_ACTIVE_TEAMS` | 每个用户活跃 Team 上限（会话级已保证一会话一 Team，这一级只管跨用户公平性，故不为 1） | 4 |
 | `SESSION_MAX_ACTIVE_TEAMS` | 每个会话活跃 Team 上限 | 1 |
 | `TEAM_MAX_ACTIVE_SUBAGENTS` | 每个 Team 同时活跃的子代理/teammate 上限 | 4 |
 | `USER_MAX_ACTIVE_SUBAGENTS` | 每个用户活跃子代理上限 | 8 |

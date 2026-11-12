@@ -11,6 +11,7 @@ export const REASONING_LEVELS = [
   'none',
   'minimal',
   'low',
+  'medium',
   'high',
   'xhigh',
   'max',

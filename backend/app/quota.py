@@ -24,7 +24,11 @@ def _env_int(name: str, default: int) -> int:
 @dataclass(frozen=True)
 class Limits:
     global_teams: int = _env_int("GLOBAL_MAX_ACTIVE_TEAMS", 16)
-    user_teams: int = _env_int("USER_MAX_ACTIVE_TEAMS", 1)
+    # 每用户上限不是「一人只能开一个 Team」。会话级 SESSION_MAX_ACTIVE_TEAMS=1
+    # 已经保证一个会话只有一个活跃 Team，用户级再卡 1 的后果是：同一用户的
+    # 两个标签页 / 两个会话互相排斥，后来的那一轮直接 team_unavailable。
+    # 用户级闸门的本意是「多用户之间的公平性」，所以默认放到 4。
+    user_teams: int = _env_int("USER_MAX_ACTIVE_TEAMS", 4)
     session_teams: int = _env_int("SESSION_MAX_ACTIVE_TEAMS", 1)
     team_subagents: int = _env_int("TEAM_MAX_ACTIVE_SUBAGENTS", 4)
     user_subagents: int = _env_int("USER_MAX_ACTIVE_SUBAGENTS", 8)
@@ -98,13 +102,28 @@ class QuotaManager:
 
     async def team_lease(self, scope: TeamScope, *, timeout_s: float = 0.0) -> Lease:
         """Acquire a long-lived active-team slot; owner must release explicitly."""
-        sems = [
-            self._global_teams,
-            self._user(self._user_teams, scope.user_id, self.limits.user_teams),
-            self._user(self._session_teams, (scope.user_id, scope.session_id),
-                       self.limits.session_teams),
-        ]
-        return await self._acquire_many(sems, timeout_s)
+        gates = (
+            ("全局 Team", self._global_teams, self.limits.global_teams),
+            ("用户 Team", self._user(self._user_teams, scope.user_id, self.limits.user_teams),
+             self.limits.user_teams),
+            ("会话 Team", self._user(self._session_teams, (scope.user_id, scope.session_id),
+                                     self.limits.session_teams),
+             self.limits.session_teams),
+        )
+        sems = [sem for _, sem, _ in gates]
+        try:
+            return await self._acquire_many(sems, timeout_s)
+        except QuotaExceeded as exc:
+            # 报错要能区分是「同会话已有 Team / 同用户别的会话占着 / 全局满了」。
+            # 只给一句 capacity_exceeded 时，用户分不清是自己多开标签页撞车，
+            # 还是租约真的泄漏了 —— 这两种的处置方式完全不同。
+            # 水位取在失败**之后**，才是导致这次失败的真实状态。
+            snapshot = "，".join(
+                f"{label} {sem._value}/{limit}" for label, sem, limit in gates
+            )
+            raise QuotaExceeded(
+                f"{exc} [{snapshot}；user={scope.user_id} session={scope.session_id}]"
+            ) from None
 
     @asynccontextmanager
     async def team(self, scope: TeamScope, *, timeout_s: float = 0.0) -> AsyncIterator[Lease]:

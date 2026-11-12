@@ -200,3 +200,132 @@ def test_route_cannot_use_another_users_config(isolated_db):
     with make_client("u1") as client:
         resp = client.post("/api/me/llm-models-probe", json={"config_id": cfg["id"]})
     assert resp.status_code == 404
+# ---------------- 思考等级探测 ----------------
+
+from app.model_discovery import (  # noqa: E402
+    _accepted_levels_from_message, _effort_payload, probe_reasoning_support,
+)
+
+
+def test_effort_payload_places_field_per_wire():
+    """两条线的字段位置不同，探测必须和 llm_client 保持一致。"""
+    chat = _effort_payload("chat", "m", "high")
+    assert chat["reasoning_effort"] == "high"
+    resp = _effort_payload("responses", "m", "high")
+    assert resp["reasoning"] == {"effort": "high"}
+    assert "reasoning_effort" not in resp
+
+
+def test_effort_payload_omits_field_when_empty():
+    assert "reasoning_effort" not in _effort_payload("chat", "m", "")
+    assert "reasoning" not in _effort_payload("responses", "m", "")
+
+
+def test_parse_official_style_enum():
+    msg = ("Failed to deserialize the JSON body into the target type: "
+           "reasoning_effort: unknown variant `bogus`, expected one of "
+           "`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `ultra`, `max` "
+           "at line 1 column 125")
+    assert _accepted_levels_from_message(msg) == [
+        "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max",
+    ]
+
+
+def test_parse_enum_drops_unknown_tokens_and_dedups():
+    msg = "expected one of `low`, `LOW`, `weird_thing`, `high`"
+    assert _accepted_levels_from_message(msg) == ["low", "high"]
+
+
+def test_parse_enum_absent_returns_empty():
+    assert _accepted_levels_from_message("bad request") == []
+    assert _accepted_levels_from_message("") == []
+
+
+def _mock_post_resp(status: int, text: str = "", json_body=None):
+    req = httpx.Request("POST", "https://h.com/v1/chat/completions")
+    if json_body is not None:
+        return httpx.Response(status, json=json_body, request=req)
+    return httpx.Response(status, text=text, request=req)
+
+
+def test_probe_validation_errors_do_not_hit_network():
+    async def must_not_run(*a, **k):
+        raise AssertionError("不该发请求")
+
+    with patch("httpx.AsyncClient.post", new=must_not_run):
+        assert run(probe_reasoning_support("", "k", "m"))["error"] == "缺少 base_url"
+        assert run(probe_reasoning_support("https://h.com", "", "m"))["error"] == "缺少 api_key"
+        assert run(probe_reasoning_support("https://h.com", "k", ""))["error"] == "缺少 model"
+
+
+def test_probe_validating_endpoint_is_supported_with_levels():
+    """校验型端点（官方 DeepSeek）：非法档位被 422 拒绝，并自报枚举。"""
+    body = ("reasoning_effort: unknown variant `x`, expected one of "
+            "`none`, `low`, `medium`, `high`")
+    with patch("httpx.AsyncClient.post", new=AsyncMock(return_value=_mock_post_resp(422, text=body))):
+        r = run(probe_reasoning_support("https://h.com/v1", "k", "m", wire_api="openai_chat"))
+    assert r["supported"] is True
+    assert r["levels"] == ["none", "low", "medium", "high"]
+
+
+def test_probe_dropping_endpoint_is_unsupported():
+    """静默丢弃型（湛卢 / xem 中转）：非法档位也 200。"""
+    with patch("httpx.AsyncClient.post",
+               new=AsyncMock(return_value=_mock_post_resp(200, json_body={"ok": 1}))):
+        r = run(probe_reasoning_support("https://h.com/v1", "k", "m", wire_api="openai_chat"))
+    assert r["supported"] is False
+    assert r["levels"] == []
+    assert "忽略" in r["hint"]
+
+
+def test_probe_other_status_is_undetermined_not_false():
+    """401/403/5xx 表示「没法判定」，绝不能当成「不支持」。"""
+    for status in (401, 403, 429, 500):
+        with patch("httpx.AsyncClient.post",
+                   new=AsyncMock(return_value=_mock_post_resp(status, text="nope"))):
+            r = run(probe_reasoning_support("https://h.com/v1", "k", "m"))
+        assert r["supported"] is None, status
+        assert f"HTTP {status}" in r["error"]
+
+
+def test_probe_network_error_is_undetermined():
+    async def boom(*a, **k):
+        raise httpx.ConnectError("no route")
+    with patch("httpx.AsyncClient.post", new=boom):
+        r = run(probe_reasoning_support("https://h.com/v1", "k", "m"))
+    assert r["supported"] is None
+    assert "ConnectError" in r["error"]
+
+
+def test_reasoning_probe_route_uses_stored_key(isolated_db):
+    cfg = run(db.create_llm_config(
+        "u1", label="t", base_url="https://gw.example/v1", api_key="sk-STORED",
+        model="m1", wire_format="", wire_api="openai_chat",
+    ))
+    captured = {}
+
+    async def fake_post(self, url, json=None, headers=None, **kw):
+        captured["url"] = url
+        captured["auth"] = (headers or {}).get("Authorization")
+        captured["payload"] = json
+        return _mock_post_resp(200, json_body={"ok": 1})
+
+    with patch("httpx.AsyncClient.post", new=fake_post):
+        with make_client("u1") as client:
+            resp = client.post("/api/me/llm-reasoning-probe", json={"config_id": cfg["id"]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["supported"] is False
+    assert captured["auth"] == "Bearer sk-STORED"
+    assert captured["url"].endswith("/chat/completions")
+    assert captured["payload"]["reasoning_effort"]  # 发的是非法档位
+
+
+def test_reasoning_probe_route_cannot_use_another_users_config(isolated_db):
+    cfg = run(db.create_llm_config(
+        "u2", label="other", base_url="https://gw.example/v1", api_key="sk-OTHER",
+        model="m1", wire_format="", wire_api="openai_chat",
+    ))
+    with make_client("u1") as client:
+        resp = client.post("/api/me/llm-reasoning-probe", json={"config_id": cfg["id"]})
+    assert resp.status_code == 404

@@ -211,6 +211,30 @@ class ProbeModelsOut(BaseModel):
     endpoint: str = ""
 
 
+class ProbeReasoningIn(BaseModel):
+    """探测某个模型是否接受 reasoning_effort。
+
+    与 ProbeModelsIn 同构：新建配置时 key 只在本次请求用，编辑时可用 config_id。
+    """
+    base_url: str = ""
+    api_key: str = ""
+    config_id: str = ""
+    model: str = ""
+    # 空 = 未指定；有 config_id 时用库里存的那条。显式传值优先。
+    wire_api: str = ""
+
+
+class ProbeReasoningOut(BaseModel):
+    # None = 无法判定（网络/鉴权/模型名错误），与 False（明确被忽略）必须区分。
+    supported: Optional[bool] = None
+    # 端点自报的可选档位（从 400/422 的 "expected one of ..." 里解析）；可能为空。
+    levels: list[str] = Field(default_factory=list)
+    # 本次探测实际发出去的非法档位，便于复现。
+    checked_level: str = ""
+    error: str = ""
+    hint: str = ""
+
+
 class LLMConfigUpdate(BaseModel):
     label: Optional[str] = None
     wire_api: Optional[str] = None

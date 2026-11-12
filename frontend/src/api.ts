@@ -219,6 +219,30 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  /**
+   * 探测这个端点的这个模型认不认 reasoning_effort。
+   * supported 三态：true=会校验（levels 是它自报的可选档位）、
+   * false=整段忽略（选哪档都不影响上游）、null=没判定出来（网络/鉴权/模型名）。
+   */
+  probeLlmReasoning: (body: {
+    base_url?: string
+    api_key?: string
+    config_id?: string
+    model?: string
+    wire_api?: string
+  }) =>
+    request<{
+      supported: boolean | null
+      levels: string[]
+      checked_level: string
+      error: string
+      hint: string
+    }>('/me/llm-reasoning-probe', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+
   // me: MCP servers
   listMcpServers: () => request<MCPServer[]>('/me/mcp-servers'),
   createMcpServer: (body: Partial<MCPServer>) =>

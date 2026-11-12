@@ -489,6 +489,14 @@ textarea, input { caret-color: var(--clay); }
   font-size: 11px; line-height: 1.5; color: var(--danger);
   word-break: break-word;
 }
+/* 思考等级探测：输入框 + 「测支持」按钮同一行 */
+.effort-row { display: flex; gap: 8px; align-items: center; }
+.effort-row input { flex: 1; min-width: 0; }
+.effort-row .ghost-btn { flex: none; white-space: nowrap; }
+.field-hint {
+  font-size: 11px; line-height: 1.5; color: var(--muted);
+  word-break: break-word;
+}
 .form-grid input, .form-grid select {
   padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: var(--r-md);
   background: var(--canvas); color: var(--ink); font-size: 13px; outline: none;

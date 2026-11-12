@@ -16,6 +16,8 @@ from ..schemas import (
     MCPServerUpdate,
     ProbeModelsIn,
     ProbeModelsOut,
+    ProbeReasoningIn,
+    ProbeReasoningOut,
 )
 
 router = APIRouter(prefix="/api/me", tags=["me"])
@@ -132,6 +134,38 @@ async def probe_llm_models(body: ProbeModelsIn, user: dict = Depends(get_current
 
     result = await list_remote_models(base_url, api_key)
     return ProbeModelsOut(**result)
+
+
+@router.post("/llm-reasoning-probe", response_model=ProbeReasoningOut)
+async def probe_llm_reasoning(body: ProbeReasoningIn, user: dict = Depends(get_current_user)):
+    """探测这个端点的这个模型认不认 reasoning_effort，以及它自报的可选档位。
+
+    为什么必须实测而不是查表：网关对未知档位分两类态度——校验型直接 400/422
+    （并在正文里列出合法枚举），静默丢弃型无论传什么都 200。湛卢和 xem 中转
+    都属于后者，所以「设置里能选 8 档」不代表上游会照做。
+    """
+    from ..model_discovery import probe_reasoning_support
+
+    base_url = (body.base_url or "").strip()
+    api_key = (body.api_key or "").strip()
+    model = (body.model or "").strip()
+    # 空 = 未指定，交给库里的配置决定；两者都没有才落到默认线。
+    wire_api = (body.wire_api or "").strip()
+
+    # 与 llm-models-probe 同一条取 key 规则：编辑既有配置时用库里的原值，
+    # 且严格按 user_id 隔离，绝不接受别人 config_id 的 key。
+    if body.config_id and (not api_key or not base_url or not model or not wire_api):
+        cfg = await db.get_llm_config(user["id"], body.config_id)
+        if not cfg:
+            raise HTTPException(status_code=404, detail="config not found")
+        api_key = api_key or (cfg.get("api_key") or "")
+        base_url = base_url or (cfg.get("base_url") or "")
+        model = model or (cfg.get("model") or "")
+        wire_api = wire_api or (cfg.get("wire_api") or "")
+
+    result = await probe_reasoning_support(base_url, api_key, model,
+                                           wire_api=wire_api or "openai_responses")
+    return ProbeReasoningOut(**result)
 
 
 # ---------------- MCP servers ----------------

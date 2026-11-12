@@ -108,6 +108,30 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
   // 已经为哪个 (base_url, key) 组合拉过列表。同一组合不重复请求——
   // 探测要几秒，用户反复点开下拉不该反复打端点。
   const probedRef = useRef('')
+  // 思考等级探测结果。null = 还没测过。
+  const [effortResult, setEffortResult] = useState<
+    { supported: boolean | null; levels: string[]; error: string; hint: string } | null
+  >(null)
+  const [effortProbing, setEffortProbing] = useState(false)
+
+  const probeReasoning = async () => {
+    setEffortProbing(true)
+    setEffortResult(null)
+    try {
+      const r = await api.probeLlmReasoning({
+        base_url: form.base_url || '',
+        api_key: form.api_key || '',
+        config_id: editingId && !form.api_key ? editingId : '',
+        model: String(form.model || ''),
+        wire_api: form.wire_api || '',
+      })
+      setEffortResult(r)
+    } catch (e: any) {
+      setEffortResult({ supported: null, levels: [], error: e?.message || String(e), hint: '' })
+    } finally {
+      setEffortProbing(false)
+    }
+  }
 
   const load = () => api.listLlmConfigs().then(setList).catch((e) => setError(String(e)))
   useEffect(() => {
@@ -128,7 +152,6 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
     const auto = !!opts.auto
     const sig = `${form.base_url}||${form.api_key}||${editingId || ''}`
     if (auto && probedRef.current === sig) return
-    probedRef.current = sig
     setProbing(true)
     setProbeError(null)
     try {
@@ -138,6 +161,7 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
         config_id: editingId && !form.api_key ? editingId : '',
       })
       if (r.ok) {
+        probedRef.current = sig   // 只有成功才钉住，失败要允许下次重试
         setRemoteModels(r.models)
         // 当前填的值不在真实列表里时，提示出来（这是 403 的直接成因）
         if (form.model && !r.models.some((m) => m.id === form.model)) {
@@ -146,12 +170,15 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
           )
         }
       } else {
+        // 失败必须让用户看见。曾经这里对「自动探测」静默处理，
+        // 结果端点不支持 /models（或后端没重启）时，用户只看到几条旧选项，
+        // 完全不知道列表没拉全——正是「明明该有 30+ 个模型却只有 3-4 个」的成因。
         setRemoteModels(null)
-        if (!auto) setProbeError(`${r.error}${r.hint ? ' —— ' + r.hint : ''}`)
+        setProbeError(`${r.error}${r.hint ? ' —— ' + r.hint : ''}`)
       }
     } catch (e: any) {
       setRemoteModels(null)
-      if (!auto) setProbeError(e?.message || String(e))
+      setProbeError(e?.message || String(e))
     } finally {
       setProbing(false)
     }
@@ -337,7 +364,9 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
               }}
             >
               {modelOptions.length === 0 && (
-                <option value={MODEL_CUSTOM}>（填写 Base URL 与 Key 后点此下拉，或手填模型 ID）</option>
+                <option value={MODEL_CUSTOM}>
+                  {probing ? '正在获取模型列表…' : '（填好 Base URL 与 Key 后点「获取模型」）'}
+                </option>
               )}
               {modelOptions.map((m) => (
                 <option key={m.value} value={m.value}>{m.label}</option>
@@ -349,9 +378,9 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
               className="ghost-btn small"
               onClick={() => probeModels()}
               disabled={probing || !form.base_url}
-              title="用当前 Base URL + API Key 查询该端点真实提供哪些模型"
+              title="用当前 Base URL + API Key 拉取该端点的全部可用模型"
             >
-              {probing ? '查询中…' : '刷新模型列表'}
+              {probing ? '获取中…' : '获取模型'}
             </button>
           </div>
           {probeError && <span className="field-error">{probeError}</span>}
@@ -373,7 +402,7 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
           )}
           <span className="field-help">
             模型名必须与端点 /models 返回的一致（很多网关带前缀，如 <code>moma/qwen3.7-max</code>）。
-            点「刷新模型列表」可直接获取；端点不支持时也可手填。
+            点「获取模型」可拉取该端点的全部可用模型；端点不支持时也可手填。
           </span>
         </label>
         <label>
@@ -408,8 +437,40 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
         </label>
         <label>
           <span>reasoning_effort</span>
-          <input value={form.reasoning_effort} onChange={(e) => setF('reasoning_effort', e.target.value)} placeholder="可空" />
+          <div className="effort-row">
+            <input value={form.reasoning_effort} onChange={(e) => setF('reasoning_effort', e.target.value)} placeholder="可空" />
+            <button
+              type="button"
+              className="ghost-btn small"
+              onClick={probeReasoning}
+              disabled={effortProbing || !String(form.model || '').trim()}
+              title="发一个非法档位给端点，看它报不报错——从而判断它是否真的支持思考等级"
+            >
+              {effortProbing ? '探测中…' : '测支持'}
+            </button>
+          </div>
         </label>
+        {effortResult && (
+          <div className={effortResult.supported === false ? 'field-error' : 'field-hint'}>
+            {effortResult.supported === true && (
+              <>
+                该端点<b>会校验</b> reasoning_effort。
+                {effortResult.levels.length > 0
+                  ? `它自报支持：${effortResult.levels.join(' / ')}`
+                  : '但没在报错里列出可选档位，建议手动试档或留空。'}
+              </>
+            )}
+            {effortResult.supported === false && (
+              <>
+                该端点<b>整段忽略</b> reasoning_effort：无论选哪一档都不改变上游行为。
+                这是网关侧限制，不是 Hlaudz 配置问题——留空即可，选了也不会生效。
+              </>
+            )}
+            {effortResult.supported === null && (
+              <>无法判定：{effortResult.error}{effortResult.hint ? ` —— ${effortResult.hint}` : ''}</>
+            )}
+          </div>
+        )}
         <label className="checkbox">
           <input type="checkbox" checked={form.is_default} onChange={(e) => setF('is_default', e.target.checked)} />
           <span>设为默认</span>

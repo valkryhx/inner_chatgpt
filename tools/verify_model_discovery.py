@@ -1,4 +1,4 @@
-"""端到端验证：设置页「刷新模型列表」是否真的拉到端点真实模型。
+"""端到端验证：设置页「获取模型」是否真的拉到端点真实模型。
 
 覆盖用户报的场景：hx 在湛卢下选了预制短名 qwen3-max → 403。
 改后应当：点刷新 → 出现 moma/qwen3.7-max 等真实 ID → 选中保存 → 对话可正常出字。
@@ -126,7 +126,7 @@ def main():
         print(f"  hint={r2['hint'][:60]!r}")
         print(f"  (前端会把这个 hint 显示在模型名下方)")
 
-        print("\n=== C. 浏览器：设置页刷新模型列表 ===")
+        print("\n=== C. 浏览器：设置页获取模型 ===")
         ok_ui = run_ui(base, email, pw, SHOT, ids)
         return 0 if (r["ok"] and has_qwen and not has_short and ok_ui) else 1
     finally:
@@ -162,14 +162,16 @@ def run_ui(base, email, pw, shots, expected_ids):
         # 填 base_url + key（湛卢）
         base_input = page.locator("input").filter(has=page.locator("xpath=.")).nth(0)
         # 直接按 label 文本定位更稳
-        page.locator("label", has_text="Base URL").locator("input").fill(
+        # 注意：模型名下拉的占位文案里也含 "Base URL"，所以这里取 .first，
+        # 否则 label 过滤会同时命中模型名那一栏（strict mode 报 2 个元素）。
+        page.locator("label", has_text="Base URL").locator("input").first.fill(
             "https://ecloud.10086.cn/api/query/aigateway/v1")
-        page.locator("label", has_text="API Key").locator("input").fill(
+        page.locator("label", has_text="API Key").locator("input").first.fill(
             load_key())
         page.wait_for_timeout(300)
 
-        # 点刷新模型列表
-        btn = page.locator("button", has_text="刷新模型列表")
+        # 点「获取模型」
+        btn = page.locator("button", has_text="获取模型")
         before = btn.count()
         print(f"  刷新按钮存在: {before > 0}")
         btn.first.click()
@@ -202,7 +204,7 @@ def run_ui(base, email, pw, shots, expected_ids):
         target = next((o for o in state["opts"] if "qwen3.7-max" in o), None)
         if target:
             page.locator("label", has_text="模型名").locator("select").select_option(target)
-            page.locator("label", has_text="标签").locator("input").fill("湛卢qwen")
+            page.locator("label", has_text="标签").locator("input").first.fill("湛卢qwen")
             # 按钮文案是「新增配置 / 保存修改」，不是「保存」——按类名更稳
             page.locator(".form-actions .new-btn").first.click()
             page.wait_for_timeout(2500)
