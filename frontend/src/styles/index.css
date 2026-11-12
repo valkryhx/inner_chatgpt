@@ -480,6 +480,15 @@ textarea, input { caret-color: var(--clay); }
 .form-grid label.checkbox span { font-size: 13px; color: var(--ink); }
 .form-grid label > span { font-size: 12px; color: var(--muted); }
 .field-help { font-size: 11px; color: var(--muted); line-height: 1.5; }
+/* 模型名必须来自端点 /models，这里给「刷新」按钮与结果状态留位置 */
+.model-pick-row { display: flex; gap: 8px; align-items: center; }
+.model-pick-row select { flex: 1; min-width: 0; }
+.model-pick-row .ghost-btn { flex: none; white-space: nowrap; }
+.field-help.ok { color: #2f7d4f; }
+.field-error {
+  font-size: 11px; line-height: 1.5; color: var(--danger);
+  word-break: break-word;
+}
 .form-grid input, .form-grid select {
   padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: var(--r-md);
   background: var(--canvas); color: var(--ink); font-size: 13px; outline: none;

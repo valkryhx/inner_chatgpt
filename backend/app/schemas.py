@@ -189,6 +189,28 @@ class LLMConfigIn(BaseModel):
     is_default: bool = False
 
 
+# ---------------- 模型列表探测（查端点自己的 /models） ----------------
+class ProbeModelsIn(BaseModel):
+    base_url: str = ""
+    # 新建配置时用户还没保存，key 只在这次请求里用一下，不落库。
+    api_key: str = ""
+    # 编辑既有配置时可只给 config_id，服务端用库里存的 key。
+    config_id: str = ""
+
+
+class RemoteModelItem(BaseModel):
+    id: str
+    owned_by: str = ""
+
+
+class ProbeModelsOut(BaseModel):
+    ok: bool = False
+    models: list[RemoteModelItem] = Field(default_factory=list)
+    error: str = ""
+    hint: str = ""
+    endpoint: str = ""
+
+
 class LLMConfigUpdate(BaseModel):
     label: Optional[str] = None
     wire_api: Optional[str] = None

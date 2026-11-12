@@ -14,6 +14,8 @@ from ..schemas import (
     MCPServerIn,
     MCPServerOut,
     MCPServerUpdate,
+    ProbeModelsIn,
+    ProbeModelsOut,
 )
 
 router = APIRouter(prefix="/api/me", tags=["me"])
@@ -104,6 +106,32 @@ async def delete_llm(config_id: str, user: dict = Depends(get_current_user)):
     if hub:
         await hub.invalidate(user["id"])
     return {"ok": True}
+
+
+@router.post("/llm-models-probe", response_model=ProbeModelsOut)
+async def probe_llm_models(body: ProbeModelsIn, user: dict = Depends(get_current_user)):
+    """查用户这个端点真实提供哪些模型。
+
+    模型名必须来自端点自己的 /models：前端以前硬编码「qwen3-max」这类短名，
+    在湛卢上并不存在，调用时被网关以 403「权限不足」拒绝——措辞误导性极强。
+    """
+    from ..model_discovery import list_remote_models
+
+    base_url = (body.base_url or "").strip()
+    api_key = (body.api_key or "").strip()
+
+    # 编辑既有配置时，前端不会把已存的 key 回传（只显示掩码），
+    # 允许用 config_id 取库里的原值；仍然强制按 user_id 隔离。
+    if not api_key and body.config_id:
+        cfg = await db.get_llm_config(user["id"], body.config_id)
+        if not cfg:
+            raise HTTPException(status_code=404, detail="config not found")
+        api_key = cfg.get("api_key") or ""
+        if not base_url:
+            base_url = cfg.get("base_url") or ""
+
+    result = await list_remote_models(base_url, api_key)
+    return ProbeModelsOut(**result)
 
 
 # ---------------- MCP servers ----------------

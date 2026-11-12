@@ -205,6 +205,19 @@ export const api = {
       body: JSON.stringify(body),
     }),
   deleteLlmConfig: (id: string) => request<{ ok: boolean }>(`/me/llm-configs/${id}`, { method: 'DELETE' }),
+  /** 查该端点真实提供哪些模型（用 base_url + key 调对方的 /models）。 */
+  probeLlmModels: (body: { base_url?: string; api_key?: string; config_id?: string }) =>
+    request<{
+      ok: boolean
+      models: { id: string; owned_by: string }[]
+      error: string
+      hint: string
+      endpoint: string
+    }>('/me/llm-models-probe', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
 
   // me: MCP servers
   listMcpServers: () => request<MCPServer[]>('/me/mcp-servers'),

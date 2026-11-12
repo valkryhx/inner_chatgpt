@@ -9,19 +9,10 @@ interface Props {
   onLlmChanged?: () => void
 }
 
-const MODEL_PRESETS = [
-  { value: 'deepseek-v4.1-flash', label: 'DeepSeek V4.1 Flash' },
-  { value: 'deepseek-flash', label: 'DeepSeek Flash' },
-  { value: 'deepseek-chat', label: 'DeepSeek Chat' },
-  { value: 'deepseek-reasoner', label: 'DeepSeek Reasoner' },
-  { value: 'glm-5.3-flash', label: 'GLM 5.3 Flash' },
-  { value: 'glm-4.7', label: 'GLM 4.7' },
-  { value: 'qwen3-max', label: 'Qwen3 Max' },
-  { value: 'kimi-k2.5', label: 'Kimi K2.5' },
-  { value: 'gpt-5.2', label: 'GPT-5.2' },
-  { value: 'gpt-5-mini', label: 'GPT-5 Mini' },
-] as const
-
+// 模型名必须来自端点自己的 /models。这里不再维护硬编码候选列表：
+// 曾经的 MODEL_PRESETS 用 qwen3-max / deepseek-flash 这类短名，在湛卢上
+// 一个都不存在（真实 ID 是 moma/qwen3.7-max），选中后调用被网关以
+// 403「权限不足」拒绝，用户会误以为 key 没权限。
 const MODEL_CUSTOM = '__custom__'
 
 const emptyLlm = {
@@ -29,7 +20,9 @@ const emptyLlm = {
   wire_api: 'openai_responses',
   base_url: 'https://api.deepseek.com',
   api_key: '',
-  model: 'deepseek-v4.1-flash',
+  // 留空：模型名必须由端点 /models 决定。预填一个猜的名字会让人
+  // 直接保存下去，然后在调用时撞 403/404。
+  model: '',
   context_window: 128000,
   max_tokens: 8192,
   auto_compact_tokens: null as number | null,
@@ -108,6 +101,13 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
   const [error, setError] = useState<string | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [customModel, setCustomModel] = useState(false)
+  // 从端点 /models 查到的真实模型列表。null = 还没查过。
+  const [remoteModels, setRemoteModels] = useState<{ id: string; owned_by: string }[] | null>(null)
+  const [probing, setProbing] = useState(false)
+  const [probeError, setProbeError] = useState<string | null>(null)
+  // 已经为哪个 (base_url, key) 组合拉过列表。同一组合不重复请求——
+  // 探测要几秒，用户反复点开下拉不该反复打端点。
+  const probedRef = useRef('')
 
   const load = () => api.listLlmConfigs().then(setList).catch((e) => setError(String(e)))
   useEffect(() => {
@@ -118,10 +118,65 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
     setForm({ ...emptyLlm })
     setEditingId(null)
     setCustomModel(false)
+    setRemoteModels(null)
+    setProbeError(null)
   }
+
+  // 用当前的 base_url + key 去问端点自己有哪些模型。
+  // key 为空且正在编辑既有配置时，后端会用库里存的那个（只按 user_id 取）。
+  const probeModels = async (opts: { auto?: boolean } = {}) => {
+    const auto = !!opts.auto
+    const sig = `${form.base_url}||${form.api_key}||${editingId || ''}`
+    if (auto && probedRef.current === sig) return
+    probedRef.current = sig
+    setProbing(true)
+    setProbeError(null)
+    try {
+      const r = await api.probeLlmModels({
+        base_url: form.base_url || '',
+        api_key: form.api_key || '',
+        config_id: editingId && !form.api_key ? editingId : '',
+      })
+      if (r.ok) {
+        setRemoteModels(r.models)
+        // 当前填的值不在真实列表里时，提示出来（这是 403 的直接成因）
+        if (form.model && !r.models.some((m) => m.id === form.model)) {
+          setProbeError(
+            `当前填的「${form.model}」不在该端点的模型列表里，实际调用会被拒绝。请从下方重新选择。`,
+          )
+        }
+      } else {
+        setRemoteModels(null)
+        if (!auto) setProbeError(`${r.error}${r.hint ? ' —— ' + r.hint : ''}`)
+      }
+    } catch (e: any) {
+      setRemoteModels(null)
+      if (!auto) setProbeError(e?.message || String(e))
+    } finally {
+      setProbing(false)
+    }
+  }
+
+  // 输入停手 700ms 就预取：用户还没点开下拉，列表已经在路上。
+  // 探测本身要几秒，等点开再查会让下拉里先是空的。
+  useEffect(() => {
+    const base = (form.base_url || '').trim()
+    const key = form.api_key || ''
+    if (!base) return
+    if (!key && !editingId) return
+    const t = setTimeout(() => { probeModels({ auto: true }) }, 700)
+    return () => clearTimeout(t)
+    // 只在端点/密钥变化时重新预取；form.model 等其它字段变化不该重打端点
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.base_url, form.api_key, editingId])
 
   const save = async () => {
     setError(null)
+    // 模型名为空时保存下去，要到真正对话才炸，且报错位置离这里很远。
+    if (!String(form.model || '').trim()) {
+      setError('请先选择或填写模型名（点开「模型名」下拉即可获取端点真实模型）')
+      return
+    }
     try {
       const body: any = { ...form }
       if (!body.api_key) delete body.api_key
@@ -138,6 +193,8 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
   const edit = (c: LLMConfig) => {
     setEditingId(c.id)
     setCustomModel(false)
+    setRemoteModels(null)
+    setProbeError(null)
     setForm({
       label: c.label,
       wire_api: c.wire_api,
@@ -162,11 +219,17 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
 
   const setF = (k: string, v: any) => setForm((f) => ({ ...f, [k]: v }))
 
-  // 既有配置里可能包含任意网关模型 ID；它们也必须出现在下拉中，
-  // 否则编辑配置时会被误判成“自定义”而丢失当前值。
+  // 下拉选项来源，按优先级：
+  //   1. 从端点 /models 查到的真实列表（唯一可靠来源）
+  //   2. 用户已保存的配置里出现过的模型名（保证编辑旧配置不丢值）
+  //   3. 当前表单里的值
+  // 硬编码的 MODEL_PRESETS 已不再作为「可选项」直接呈现——它们的短名在
+  // 具体网关上常常不存在（湛卢要 moma/ 前缀），选了就会 403。
   const modelOptions = (() => {
     const byValue = new Map<string, string>()
-    for (const p of MODEL_PRESETS) byValue.set(p.value, p.label)
+    if (remoteModels) {
+      for (const m of remoteModels) byValue.set(m.id, m.owned_by ? `${m.id} · ${m.owned_by}` : m.id)
+    }
     for (const c of list) {
       if (c.model && !byValue.has(c.model)) byValue.set(c.model, c.model)
     }
@@ -223,7 +286,16 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
         </label>
         <label className="full">
           <span>Base URL</span>
-          <input value={form.base_url} onChange={(e) => setF('base_url', e.target.value)} />
+          <input
+            value={form.base_url}
+            onChange={(e) => {
+              setF('base_url', e.target.value)
+              // 端点变了，上一个端点的模型列表立即作废——留着会把 A 家的
+              // 模型名存进 B 家的配置，调用时又是 404/403。
+              setRemoteModels(null)
+              setProbeError(null)
+            }}
+          />
         </label>
         <label className="full">
           <span>API Key（{editingId ? '留空不改' : '必填'}）</span>
@@ -231,17 +303,63 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
             type="password"
             value={form.api_key}
             onChange={(e) => setF('api_key', e.target.value)}
+            // 填完 key 就把探测发出去：端点 /models 要 0.5–4s，
+            // 等用户真的点开下拉再查，下拉里只会是空的。
+            onBlur={() => {
+              if (!remoteModels && !probing && form.base_url && form.api_key) {
+                probeModels({ auto: true })
+              }
+            }}
             placeholder="sk-..."
           />
         </label>
         <label>
           <span>模型名</span>
-          <select value={modelSelectValue} onChange={(e) => selectModel(e.target.value)}>
-            {modelOptions.map((m) => (
-              <option key={m.value} value={m.value}>{m.label}（{m.value}）</option>
-            ))}
-            <option value={MODEL_CUSTOM}>自定义模型 ID…</option>
-          </select>
+          <div className="model-pick-row">
+            <select
+              value={modelSelectValue}
+              onChange={(e) => selectModel(e.target.value)}
+              onFocus={() => {
+                // 用户点开下拉就按端点真实模型填充，不需要先知道要点「刷新」。
+                // key 没填且不是编辑既有配置时先不查，否则焦点一进来就弹 401。
+                if (!remoteModels && !probing && form.base_url
+                    && (form.api_key || editingId)) {
+                  probeModels({ auto: true })
+                }
+              }}
+              onMouseDown={() => {
+                // 有些环境（含 headless Chromium）点 select 不一定触发 focus，
+                // 这里补一条同样的路径，保证「点开下拉」这个动作稳定触发拉取。
+                if (!remoteModels && !probing && form.base_url
+                    && (form.api_key || editingId)) {
+                  probeModels({ auto: true })
+                }
+              }}
+            >
+              {modelOptions.length === 0 && (
+                <option value={MODEL_CUSTOM}>（填写 Base URL 与 Key 后点此下拉，或手填模型 ID）</option>
+              )}
+              {modelOptions.map((m) => (
+                <option key={m.value} value={m.value}>{m.label}</option>
+              ))}
+              <option value={MODEL_CUSTOM}>自定义模型 ID…</option>
+            </select>
+            <button
+              type="button"
+              className="ghost-btn small"
+              onClick={() => probeModels()}
+              disabled={probing || !form.base_url}
+              title="用当前 Base URL + API Key 查询该端点真实提供哪些模型"
+            >
+              {probing ? '查询中…' : '刷新模型列表'}
+            </button>
+          </div>
+          {probeError && <span className="field-error">{probeError}</span>}
+          {remoteModels && !probeError && (
+            <span className="field-help ok">
+              已从端点读取 {remoteModels.length} 个模型
+            </span>
+          )}
           {modelSelectValue === MODEL_CUSTOM && (
             <input
               value={form.model}
@@ -253,7 +371,10 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
               autoFocus
             />
           )}
-          <span className="field-help">可从常见模型中选择，也可选“自定义模型 ID”填写任意网关模型名。</span>
+          <span className="field-help">
+            模型名必须与端点 /models 返回的一致（很多网关带前缀，如 <code>moma/qwen3.7-max</code>）。
+            点「刷新模型列表」可直接获取；端点不支持时也可手填。
+          </span>
         </label>
         <label>
           <span>上下文窗口</span>
