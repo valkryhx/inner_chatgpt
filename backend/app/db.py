@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS user_llm_configs (
     auto_compact_tokens INTEGER,
     hard_limit_tokens   INTEGER,
     reasoning_effort TEXT NOT NULL DEFAULT '',
+    read_timeout     INTEGER NOT NULL DEFAULT 120,
     is_default       INTEGER NOT NULL DEFAULT 0,
     created_at       INTEGER NOT NULL,
     updated_at       INTEGER NOT NULL
@@ -111,7 +112,11 @@ async def init_db() -> None:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.executescript(_SCHEMA)
         # 旧库迁移：user_llm_configs 增加压缩阈值列（幂等）。
-        for col, decl in (("auto_compact_tokens", "INTEGER"), ("hard_limit_tokens", "INTEGER")):
+        # read_timeout：有些上游首字节就要 100+ 秒，120s 的全局默认对它们太紧，
+        # 必须让用户按端点自己调。旧库没有这一列时用 120 补齐。
+        for col, decl in (("auto_compact_tokens", "INTEGER"),
+                          ("hard_limit_tokens", "INTEGER"),
+                          ("read_timeout", "INTEGER NOT NULL DEFAULT 120")):
             try:
                 await conn.execute(f"ALTER TABLE user_llm_configs ADD COLUMN {col} {decl}")
             except Exception:
@@ -643,12 +648,13 @@ async def create_llm_config(user_id: str, **f: Any) -> dict[str, Any]:
         if is_default:
             await conn.execute("UPDATE user_llm_configs SET is_default=0 WHERE user_id=?", (user_id,))
         await conn.execute(
-            "INSERT INTO user_llm_configs(id,user_id,label,wire_api,base_url,api_key,model,context_window,max_tokens,auto_compact_tokens,hard_limit_tokens,reasoning_effort,is_default,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO user_llm_configs(id,user_id,label,wire_api,base_url,api_key,model,context_window,max_tokens,auto_compact_tokens,hard_limit_tokens,reasoning_effort,read_timeout,is_default,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (cid, user_id, f.get("label", ""), f.get("wire_api", "openai_chat"), f.get("base_url", ""),
              f.get("api_key", ""), f.get("model", ""), int(f.get("context_window", 128000)),
              int(f.get("max_tokens", 8192)), _opt_int(f.get("auto_compact_tokens")),
-             _opt_int(f.get("hard_limit_tokens")), f.get("reasoning_effort", ""), is_default, ts, ts),
+             _opt_int(f.get("hard_limit_tokens")), f.get("reasoning_effort", ""),
+             int(f.get("read_timeout") or 120), is_default, ts, ts),
         )
         await conn.commit()
         cur = await conn.execute("SELECT * FROM user_llm_configs WHERE id=?", (cid,))
@@ -657,7 +663,7 @@ async def create_llm_config(user_id: str, **f: Any) -> dict[str, Any]:
 
 
 async def update_llm_config(user_id: str, config_id: str, **f: Any) -> Optional[dict[str, Any]]:
-    allowed = {"label", "wire_api", "base_url", "api_key", "model", "context_window", "max_tokens", "auto_compact_tokens", "hard_limit_tokens", "reasoning_effort", "is_default"}
+    allowed = {"label", "wire_api", "base_url", "api_key", "model", "context_window", "max_tokens", "auto_compact_tokens", "hard_limit_tokens", "reasoning_effort", "read_timeout", "is_default"}
     sets, vals = [], []
     for k, v in f.items():
         if k not in allowed:

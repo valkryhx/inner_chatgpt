@@ -46,6 +46,7 @@ def _llm_out(row: dict) -> LLMConfigOut:
         auto_compact_tokens=row.get("auto_compact_tokens"),
         hard_limit_tokens=row.get("hard_limit_tokens"),
         reasoning_effort=row.get("reasoning_effort", "") or "",
+        read_timeout=int(row.get("read_timeout") or 120),
         is_default=bool(row.get("is_default")),
     )
 

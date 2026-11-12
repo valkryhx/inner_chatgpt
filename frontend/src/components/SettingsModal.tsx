@@ -28,6 +28,9 @@ const emptyLlm = {
   auto_compact_tokens: null as number | null,
   hard_limit_tokens: null as number | null,
   reasoning_effort: '',
+  // 单次调用的读超时（秒）。语义是「两次读取间的最大空闲」，不是总时长。
+  // 有些上游首字节就要 100+ 秒，120 对它们太紧，所以要能按端点调。
+  read_timeout: 120,
   is_default: true,
 }
 
@@ -233,6 +236,7 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
       auto_compact_tokens: c.auto_compact_tokens ?? null,
       hard_limit_tokens: c.hard_limit_tokens ?? null,
       reasoning_effort: c.reasoning_effort,
+      read_timeout: c.read_timeout ?? 120,
       is_default: c.is_default,
     })
   }
@@ -471,6 +475,20 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
             )}
           </div>
         )}
+        <label>
+          <span>读超时（秒）</span>
+          <input
+            type="number"
+            min={10}
+            max={600}
+            value={form.read_timeout ?? 120}
+            onChange={(e) => setF('read_timeout', e.target.value === '' ? 120 : parseInt(e.target.value || '120'))}
+          />
+          <span className="field-help">
+            两次数据之间的最大空闲，不是整段回复总时长——持续吐字的回答可以远超这个值。
+            有些端点首字节就要 100 秒以上，把它调大（上限 600）。
+          </span>
+        </label>
         <label className="checkbox">
           <input type="checkbox" checked={form.is_default} onChange={(e) => setF('is_default', e.target.checked)} />
           <span>设为默认</span>

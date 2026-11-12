@@ -186,6 +186,10 @@ class LLMConfigIn(BaseModel):
     auto_compact_tokens: Optional[int] = None
     hard_limit_tokens: Optional[int] = None
     reasoning_effort: str = ""
+    # 单次模型调用的读超时（秒）。read 超时的语义是「两次读取之间的最大空闲」，
+    # 不是整段请求总时长 —— 持续吐字的流式回答可以远超这个值。
+    # 有些上游首字节就要 100+ 秒，全局 120s 对它们太紧，所以要能按端点调。
+    read_timeout: int = 120
     is_default: bool = False
 
 
@@ -246,6 +250,7 @@ class LLMConfigUpdate(BaseModel):
     auto_compact_tokens: Optional[int] = None
     hard_limit_tokens: Optional[int] = None
     reasoning_effort: Optional[str] = None
+    read_timeout: Optional[int] = None
     is_default: Optional[bool] = None
 
 
@@ -262,6 +267,8 @@ class LLMConfigOut(BaseModel):
     auto_compact_tokens: Optional[int] = None
     hard_limit_tokens: Optional[int] = None
     reasoning_effort: str = ""
+    # 单次模型调用的读超时（秒）。read 超时 = 两次读取间的最大空闲，不是总时长。
+    read_timeout: int = 120
     is_default: bool = False
 
 

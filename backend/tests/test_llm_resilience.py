@@ -444,3 +444,57 @@ async def test_non_pool_timeout_does_not_grow(monkeypatch, _no_sleep):
         assert not grown, "读超时不该触发扩容"
     finally:
         await c.aclose()
+
+
+# ---------------- 读超时可配置 ----------------
+
+def test_read_timeout_default_is_120():
+    from app.llm import _read_timeout_from_config
+    assert _read_timeout_from_config({}) == 120
+
+
+def test_read_timeout_from_config_wins():
+    from app.llm import _read_timeout_from_config
+    assert _read_timeout_from_config({"read_timeout": 300}) == 300
+
+
+def test_read_timeout_accepts_legacy_timeout_key():
+    """兼容旧调用方用的 timeout 键名。"""
+    from app.llm import _read_timeout_from_config
+    assert _read_timeout_from_config({"timeout": 200}) == 200
+
+
+def test_read_timeout_env_fallback(monkeypatch):
+    from app.llm import _read_timeout_from_config
+    monkeypatch.setenv("HLZ_LLM_READ_TIMEOUT", "240")
+    assert _read_timeout_from_config({}) == 240
+
+
+def test_read_timeout_config_beats_env(monkeypatch):
+    from app.llm import _read_timeout_from_config
+    monkeypatch.setenv("HLZ_LLM_READ_TIMEOUT", "240")
+    assert _read_timeout_from_config({"read_timeout": 300}) == 300
+
+
+def test_read_timeout_is_clamped():
+    """下限防误配成 0（等于立即超时），上限防把坏端点当成「慢」。"""
+    from app.llm import _read_timeout_from_config
+    assert _read_timeout_from_config({"read_timeout": 1}) == 10
+    assert _read_timeout_from_config({"read_timeout": 0}) == 120, "0 视为未设置"
+    assert _read_timeout_from_config({"read_timeout": 99999}) == 600
+    assert _read_timeout_from_config({"read_timeout": "bad"}) == 120
+
+
+@pytest.mark.asyncio
+async def test_read_timeout_reaches_the_http_client():
+    """配置必须真的传到 httpx 的 timeout 上，否则这整条链路是摆设。"""
+    from app.llm import build_client_from_config
+    c = build_client_from_config({
+        "model": "m", "base_url": "https://h/v1", "api_key": "k",
+        "wire_api": "openai_chat", "read_timeout": 300,
+    })
+    try:
+        assert c.s.timeout == 300
+        assert c._get_client().timeout.read == 300
+    finally:
+        await c.aclose()

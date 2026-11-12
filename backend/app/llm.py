@@ -5,6 +5,8 @@ only turns yaml/db config into an LLMSettings and builds a `LLMClient`.
 """
 from __future__ import annotations
 
+import os
+
 from .config import LLMSettings, load_llm_settings  # noqa: F401 (re-export)
 from .llm_client import LLMClient, LLMSettings as ClientSettings
 
@@ -28,6 +30,47 @@ def build_client(settings: LLMSettings | None = None, *, max_tokens: int | None 
                  system_prompt: str = "") -> LLMClient:
     s = settings or load_llm_settings()
     return _from_settings(s, max_tokens=max_tokens, system_prompt=system_prompt)
+
+
+def _read_timeout_from_config(cfg: dict) -> int:
+    """单次模型调用的读超时。
+
+    语义（2026-11-12 实测）：这是**两次读取之间的最大空闲**，不是整段请求总时长。
+    所以一个持续吐字的流式回答可以跑几分钟而不超时；只有「这么久一个字节都没来」
+    才判失败。
+
+    为什么必须可按端点配置：有些上游（长思考模型、排队严重的网关）首字节就要
+    100+ 秒。全局 120s 对它们太紧，一撞上就是「明明能用却被我们切掉」。
+    实测：上游首字节 100s + 超时 120s → 成功；超时降到 100s → ReadTimeout。
+
+    真正的读失败还有两层兜底，这里放宽不会让请求无限挂住：
+    ① 连接层 connect=15s；
+    ② 重试等待总预算 RETRY_WAIT_BUDGET_S=180s；
+    ③ 整轮墙钟 AGENT_WALL_CLOCK_S（默认关，可显式打开）。
+
+    上限 600s：再长就该怀疑是端点坏了，而不是「它慢」。
+    """
+    raw = cfg.get("read_timeout")
+    if raw is None or str(raw).strip() == "":
+        # 兼容旧调用方：也接受 timeout 这个键名。
+        raw = cfg.get("timeout")
+    if raw is None or str(raw).strip() == "":
+        try:
+            raw = os.environ.get("HLZ_LLM_READ_TIMEOUT")
+        except Exception:
+            raw = None
+    if raw is None or str(raw).strip() == "":
+        return 120
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return 120
+    # 0 或负数一律当「未设置」，与 db 层 `read_timeout or 120` 的语义保持一致。
+    # 不能钳成 10 —— 那会让「留空/填 0」变成一个立刻超时的配置，
+    # 用户明明没打算改超时，却把端点配坏了。
+    if value <= 0:
+        return 120
+    return max(10, min(value, 600))
 
 
 def build_client_from_config(cfg: dict, *, max_tokens: int | None = None,
@@ -59,7 +102,7 @@ def build_client_from_config(cfg: dict, *, max_tokens: int | None = None,
         wire_api=wire,
         temperature=float(cfg.get("temperature", 1.0) or 1.0),
         max_tokens=tokens,
-        timeout=int(cfg.get("timeout", 120) or 120),
+        timeout=_read_timeout_from_config(cfg),
         max_retries=retries,
         reasoning_effort=(cfg.get("reasoning_effort") or None),
         system_prompt=system_prompt,

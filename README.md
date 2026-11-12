@@ -245,6 +245,7 @@ npm run build        # 生成 frontend/dist
 | `AGENT_HARD_LIMIT` | 覆盖硬线裁剪的 token 阈值 | 取用户模型的 `hard_limit_tokens`，否则 95% 上下文窗口 |
 | `AGENT_MAX_TURNS` | 主 Agent 单轮最大模型轮数；兼容旧名 `AGENT_RECURSION_LIMIT` | 300 |
 | `AGENT_WALL_CLOCK_S` | 整轮墙钟上限（秒）；0 = 不限。`max_turns` 只限次数，这一条限时间 | 0 |
+| `HLZ_LLM_READ_TIMEOUT` | 单次模型调用的读超时（秒）：**两次数据间的最大空闲，不是回复总时长**。可被每条模型配置的 `read_timeout` 覆盖；clamp 10–600 | 120 |
 | `HLZ_LLM_MAX_CONNECTIONS` | 模型客户端连接池初始上限（每用户每模型一个池；池满时自动翻倍） | 32 |
 | `HLZ_LLM_POOL_CEILING` | 连接池自动扩容硬上限（clamp 2–1024） | 128 |
 | `HLZ_LLM_POOL_SHRINK_S` | 连接池多久无饱和后回落到初始上限；0 = 不回落 | 600 |

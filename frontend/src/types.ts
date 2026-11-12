@@ -324,6 +324,8 @@ export interface LLMConfig {
   auto_compact_tokens?: number | null
   hard_limit_tokens?: number | null
   reasoning_effort: string
+  /** 单次模型调用的读超时（秒）。语义是「两次读取间的最大空闲」，不是总时长。 */
+  read_timeout?: number
   is_default: boolean
 }
 
