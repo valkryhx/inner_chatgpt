@@ -1533,6 +1533,18 @@ textarea, input { caret-color: var(--clay); }
 }
 .mcp-dot.ok { background: #4f8a5b; }
 .mcp-dot.warn { background: var(--danger); }
+/* 检测中：灰色 + 呼吸动画。颜色不能和 ok/warn 混（那样会被读成"已连/已断"）。 */
+.mcp-dot.idle {
+  background: var(--muted);
+  animation: mcp-pulse 1.2s ease-in-out infinite;
+}
+@keyframes mcp-pulse {
+  0%, 100% { opacity: 0.35; }
+  50%      { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mcp-dot.idle { animation: none; opacity: 0.7; }
+}
 
 .mcp-health {
   display: flex; align-items: center; gap: 6px;

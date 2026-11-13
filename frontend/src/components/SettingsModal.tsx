@@ -514,6 +514,11 @@ function McpSection() {
   const [error, setError] = useState<string | null>(null)
   const [effective, setEffective] = useState<string[]>([])
   const [servers, setServers] = useState<McpServerStatus[]>([])
+  // MCP 状态是异步查的，首次要连全部 server（实测冷启动 30+ 秒）。
+  // 「还在查」和「查失败」必须与「真的没配」分开，否则那 30 秒里
+  // 界面显示的是「未检测 · 共 0 个可用工具」，看起来像"MCP 全挂了"。
+  const [mcpState, setMcpState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [mcpError, setMcpError] = useState<string>('')
   const [probing, setProbing] = useState(false)
   const [jsonText, setJsonText] = useState('')
   const [notice, setNotice] = useState<string | null>(null)
@@ -523,13 +528,20 @@ function McpSection() {
 
   const load = (syncText = false) => {
     api.listMcpServers().then(setList).catch((e) => setError(String(e)))
+    setMcpState('loading')
     api
       .mcpEffective()
       .then((r) => {
         setEffective(r.tools)
         setServers(r.servers || [])
+        setMcpState('ready')
+        setMcpError('')
       })
-      .catch(() => {})
+      .catch((e: unknown) => {
+        // 不再静默：失败要说出来，并提供"重新检测"作为恢复手段。
+        setMcpState('error')
+        setMcpError(e instanceof Error ? e.message : String(e))
+      })
     api
       .mcpExport()
       .then((r) => {
@@ -590,12 +602,16 @@ function McpSection() {
       const r = await api.mcpProbe()
       setServers(r.servers || [])
       setEffective(r.tools || [])
+      setMcpState(r.ok ? 'ready' : 'error')
+      setMcpError(r.ok ? '' : (r.error || '未知原因'))
       if (!r.ok && r.error) setError('检测失败：' + r.error)
       else {
         const bad = (r.servers || []).filter((s) => !s.ok)
         setNotice(bad.length ? `检测完成：${bad.length} 个 server 连接失败` : '检测完成：全部已连接')
       }
     } catch (e: any) {
+      setMcpState('error')
+      setMcpError(e?.message || String(e))
       setError('检测失败：' + (e?.message || String(e)))
     } finally {
       setProbing(false)
@@ -625,19 +641,32 @@ function McpSection() {
 
       <div className="mcp-summary">
         <div className="mcp-summary-row">
-          <span className={`mcp-dot ${servers.length && servers.every((s) => s.ok) ? 'ok' : 'warn'}`} />
+          <span className={`mcp-dot ${mcpState === 'loading' ? 'idle'
+            : mcpState === 'error' ? 'warn'
+            : servers.length && servers.every((s) => s.ok) ? 'ok' : 'warn'}`} />
           <b>
-            {servers.length === 0
-              ? '未检测'
+            {mcpState === 'loading'
+              ? '正在检测 MCP 连接…'
+              : mcpState === 'error'
+              ? 'MCP 检测失败'
+              : servers.length === 0
+              ? '未配置 MCP'
               : servers.every((s) => s.ok)
               ? `全部 ${servers.length} 个 server 已连接`
               : `${servers.filter((s) => s.ok).length}/${servers.length} 个 server 已连接`}
           </b>
-          <span className="mcp-summary-tools">共 {effective.length} 个可用工具</span>
-          <button className="ghost-btn small" onClick={probe} disabled={probing}>
-            {probing ? '检测中…' : '重新检测连接'}
+          <span className="mcp-summary-tools">
+            {mcpState === 'ready' ? `共 ${effective.length} 个可用工具` : '工具数待检测'}
+          </span>
+          <button className="ghost-btn small" onClick={probe} disabled={probing || mcpState === 'loading'}>
+            {probing || mcpState === 'loading' ? '检测中…' : '重新检测连接'}
           </button>
         </div>
+        {mcpState === 'error' && (
+          <div className="mcp-summary-bad">
+            检测失败：{mcpError || '未知原因'}（可点「重新检测连接」重试）
+          </div>
+        )}
         {servers.filter((s) => !s.ok).length > 0 && (
           <div className="mcp-summary-bad">
             连接失败：

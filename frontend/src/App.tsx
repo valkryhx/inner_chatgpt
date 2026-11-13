@@ -138,7 +138,14 @@ export default function App() {
   const [activeStreamMsgId, setActiveStreamMsgId] = useState<string | null>(null)
   const [autoCompacted, setAutoCompacted] = useState<number>(0)
   const [health, setHealth] = useState<
-    { model: string; mcp_tools: number; servers: McpServerStatus[] } | null
+    {
+      model: string; mcp_tools: number; servers: McpServerStatus[]
+      // MCP 状态是异步拿的，而且首次要连全部 server（实测冷启动 30+ 秒）。
+      // 必须把「还在查」和「查失败」与「真的没配」区分开，否则用户在这 30 秒里
+      // 看到的是「未检测 · 0 个工具」，与「一个 MCP 都没配」长得一模一样。
+      mcp_state: 'idle' | 'loading' | 'ready' | 'error'
+      mcp_error: string
+    } | null
   >(null)
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null)
   const [models, setModels] = useState<LlmModelOption[]>([])
@@ -279,12 +286,32 @@ export default function App() {
   }, [])
 
   const refreshHealth = useCallback(async () => {
+    // 先置 loading：MCP 首次连接要几十秒，界面必须立刻表达「正在查」。
+    setHealth((prev) => ({
+      model: prev?.model || '',
+      mcp_tools: prev?.mcp_tools ?? 0,
+      servers: prev?.servers || [],
+      mcp_state: 'loading',
+      mcp_error: '',
+    }))
     const h = await api.health().catch(() => null)
-    const eff = await api.mcpEffective().catch(() => null)
+    // 不再 catch(() => null) 静默吞掉：失败要说出来，否则用户只能看到
+    // 一个与「没配 MCP」无法区分的空状态。
+    let eff: { tools: string[]; servers?: McpServerStatus[] } | null = null
+    let mcpState: 'ready' | 'error' = 'ready'
+    let mcpError = ''
+    try {
+      eff = await api.mcpEffective()
+    } catch (e: unknown) {
+      mcpState = 'error'
+      mcpError = e instanceof Error ? e.message : String(e)
+    }
     setHealth({
       model: h?.model || '',
-      mcp_tools: eff ? eff.tools.length : h?.mcp_tools ?? 0,
+      mcp_tools: eff ? eff.tools.length : 0,
       servers: eff?.servers || [],
+      mcp_state: mcpState,
+      mcp_error: mcpError,
     })
   }, [])
 

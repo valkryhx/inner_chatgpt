@@ -7,8 +7,17 @@ interface Props {
   /**
    * 健康状态。`servers` 由 App 从 /api/me/mcp-effective 合并进来，
    * 不在 /api/health 的返回里——所以这里必须显式声明，否则取不到类型。
+   *
+   * `mcp_state` 区分「正在查 / 查失败 / 查成功」：MCP 首次连接要 30+ 秒，
+   * 少了这两个字段，那 30 秒里的空白与「一个 MCP 都没配」长得一样。
    */
-  health: { model: string; mcp_tools: number; servers: McpServerStatus[] } | null
+  health: {
+    model: string
+    mcp_tools: number
+    servers: McpServerStatus[]
+    mcp_state?: 'idle' | 'loading' | 'ready' | 'error'
+    mcp_error?: string
+  } | null
   user: User
   activeModel?: string | null
   onSelect: (id: string) => void
@@ -55,6 +64,12 @@ export default function Sidebar({
   // health.servers 来自 /mcp-effective，与对话轮次共用同一份 runtime。
   const servers = health?.servers || []
   const badServers = servers.filter((s) => !s.ok)
+  // MCP 状态是异步查的（首次要连全部 server，冷启动实测 30+ 秒）。
+  // 「正在查」「查失败」「真没配」必须分开说，否则用户在这 30 秒里
+  // 看到的是「MCP 未检测 · 0 工具」，与「一个都没配」无法区分。
+  const mcpState = health?.mcp_state || 'idle'
+  const mcpLoading = mcpState === 'loading' || mcpState === 'idle'
+  const mcpFailed = mcpState === 'error'
 
   const pinned = sessions.filter((s) => s.pinned)
   const rest = sessions.filter((s) => !s.pinned)
@@ -177,15 +192,21 @@ export default function Sidebar({
         className="mcp-health"
         onClick={onOpenSettings}
         title={
-          badServers.length
+          mcpFailed
+            ? `MCP 检测失败：${health?.mcp_error || '未知原因'}（点击查看详情）`
+            : badServers.length
             ? `连接失败：${badServers.map((s) => s.name).join('、')}（点击查看详情）`
             : 'MCP 与工具状态（点击打开设置）'
         }
       >
-        <span className={`mcp-dot ${badServers.length ? 'warn' : 'ok'}`} />
+        <span className={`mcp-dot ${mcpLoading ? 'idle' : mcpFailed || badServers.length ? 'warn' : 'ok'}`} />
         <span className="mcp-health-text">
-          {servers.length === 0
-            ? 'MCP 未检测'
+          {mcpLoading
+            ? 'MCP 检测中…'
+            : mcpFailed
+            ? 'MCP 检测失败'
+            : servers.length === 0
+            ? '未配置 MCP'
             : badServers.length
             ? `${badServers.length} 个 MCP 断开`
             : `MCP 正常 · ${health?.mcp_tools ?? 0} 工具`}
