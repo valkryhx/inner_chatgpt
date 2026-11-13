@@ -192,6 +192,15 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
     server a tool belongs to.  Connection failures are recorded in ``.manifest``
     instead of being silently dropped: the old silent fallback made the agent
     claim "that MCP has no tools" while the server was merely down.
+
+    **并发连接**（2026-11-12）：多个 server 同时连，总耗时 = 最慢那个，
+    而不是各个相加。实测 4 server（其中 1 个 stdio 起不来、吃满 12s 超时）：
+    串行 32s → 并发后接近单个超时。
+
+    并发安全性已核实：
+    - 连接**不走**配额（`quota.mcp_call` 只在工具调用时用，见 `mcp_client.py:301`）；
+    - `MCPToolset.__aenter__` / `_discover` 只读自身状态，无全局锁或共享可变状态；
+    - 每个 server 各自独立 `MCPToolset`，失败互不影响（各自 try/except）。
     """
     servers = [m for m in await db.list_mcp_servers(user_id) if m.get("enabled")]
     if not servers:
@@ -199,48 +208,85 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
         return await MCPToolset(demo_mcp, user_id=user_id).__aenter__()
 
     connect_timeout = float(os.environ.get("MCP_CONNECT_TIMEOUT", "12"))
-    toolsets: list[MCPToolset] = []
-    manifest: list[dict[str, Any]] = []
-    for srv in servers:
+    # 并发上限：用户配 20 个 server 时不该一次拉起 20 个子进程。
+    # 8 是折中——常见配置（2–6 个）完全并发，极端配置也不会把机器打满。
+    try:
+        max_parallel = max(1, int(os.environ.get("MCP_CONNECT_CONCURRENCY", "8")))
+    except (TypeError, ValueError):
+        max_parallel = 8
+    gate = asyncio.Semaphore(max_parallel)
+
+    async def _connect_one(srv: dict) -> tuple[str, MCPToolset | None, dict]:
+        """连一个 server，返回 (name, 可用 toolset 或 None, manifest 行)。
+
+        绝不抛异常：单个 server 失败只影响它自己那一行 manifest。
+        """
         name = srv.get("name") or srv.get("id") or "mcp"
-        ts = None
-        try:
-            if srv.get("transport") == "builtin_demo":
-                from mcp_server.server import mcp as demo_mcp
-                ts = MCPToolset(demo_mcp, user_id=user_id, server_name=name)
+        ts: MCPToolset | None = None
+        async with gate:
+            try:
+                if srv.get("transport") == "builtin_demo":
+                    from mcp_server.server import mcp as demo_mcp
+                    ts = MCPToolset(demo_mcp, user_id=user_id, server_name=name)
+                else:
+                    target = {
+                        "transport": srv.get("transport", "http"),
+                        "url": srv.get("url", ""),
+                        "command": srv.get("command", ""),
+                        "args": srv.get("args", []) or [],
+                        "headers": srv.get("headers", {}) or {},
+                        "env": srv.get("env", {}) or {},
+                    }
+                    ts = MCPToolset(target, user_id=user_id, server_name=name)
                 await asyncio.wait_for(ts.__aenter__(), timeout=connect_timeout)
-            else:
-                target = {
-                    "transport": srv.get("transport", "http"),
-                    "url": srv.get("url", ""),
-                    "command": srv.get("command", ""),
-                    "args": srv.get("args", []) or [],
-                    "headers": srv.get("headers", {}) or {},
-                    "env": srv.get("env", {}) or {},
-                }
-                ts = MCPToolset(target, user_id=user_id, server_name=name)
-                await asyncio.wait_for(ts.__aenter__(), timeout=connect_timeout)
-            if ts.tools:
-                toolsets.append(ts)
-                manifest.append(ts.status())
-            else:
+                if ts.tools:
+                    return name, ts, ts.status()
                 # 连上了但零工具 / 连接失败都在 ts.error 里
-                manifest.append({
+                row = {
                     "name": name, "ok": False, "tool_count": 0,
                     "error": ts.error or "该 server 没有暴露任何工具", "tools": [],
-                })
+                }
                 await ts.__aexit__(None, None, None)
-        except Exception as e:
-            manifest.append({
-                "name": name, "ok": False, "tool_count": 0,
-                "error": f"{type(e).__name__}: {e}", "tools": [],
-            })
-            if ts is not None:
-                try:
-                    await ts.__aexit__(None, None, None)
-                except Exception:
-                    pass
+                return name, None, row
+            except Exception as e:  # noqa: BLE001
+                if ts is not None:
+                    try:
+                        await ts.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                return name, None, {
+                    "name": name, "ok": False, "tool_count": 0,
+                    "error": f"{type(e).__name__}: {e}", "tools": [],
+                }
+
+    results = await asyncio.gather(
+        *(_connect_one(s) for s in servers), return_exceptions=True)
+
+    # **按配置顺序**还原：gather 保留入参顺序，所以这里天然是有序的。
+    # manifest 的顺序会被前端直接展示，乱序会让用户以为配置变了。
+    toolsets: list[MCPToolset] = []
+    manifest: list[dict[str, Any]] = []
+    for srv, res in zip(servers, results):
+        if isinstance(res, BaseException):
+            # 理论上 _connect_one 不会抛，但 CancelledError 等 BaseException 会到这里。
+            # 不能让它把整批连接结果吞掉（其余 server 可能已经连好了）。
+            if isinstance(res, asyncio.CancelledError):
+                # 真被取消：把已连的关掉再抛，避免留下孤儿连接/子进程
+                for ts in toolsets:
+                    try:
+                        await ts.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                raise res
+            name = srv.get("name") or srv.get("id") or "mcp"
+            manifest.append({"name": name, "ok": False, "tool_count": 0,
+                             "error": f"{type(res).__name__}: {res}", "tools": []})
             continue
+        _name, ts, row = res
+        if ts is not None:
+            toolsets.append(ts)
+        manifest.append(row)
+
     if not toolsets:
         from mcp_server.server import mcp as demo_mcp
         fallback = await MCPToolset(demo_mcp, user_id=user_id).__aenter__()
