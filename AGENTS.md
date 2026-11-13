@@ -160,9 +160,11 @@
 
 | 文档 | 用途 |
 |---|---|
+| `docs/20261113-CC源码结论核验方法论.md` | **源码调研核验方法论（长期有效）**：推翻旧结论的旁证要求、import 图为何不是证据（共享 chunk 被 1263 个模块引用）、断言「进上下文」须走到终态、措辞纪律与返工检查清单。从记忆机制调研的二次核验中提炼 |
 | `docs/20261112-Hlaudz首帧串行阻塞核实与优化设计.md` | **首帧串行阻塞（已实测）**：软线压缩在首帧前调 LLM（超软线首帧 719→5859ms）、注入点无超时、无慢件延期通道；P1–P5 改造与 300ms 硬指标 |
-| `docs/20261112-Hlaudz记忆系统实施方案.md` | **记忆系统实施方案（设计，未开工）**：读侧复用 `message_injector` attachment 通道、写侧复用 subagent 后台运行时、`memories/<user_id>/` 物理隔离 + DB 行级隔离；M1–M5 分阶段与 S-M1~S-M5 e2e 用例 |
-| `docs/20261112-CC319记忆系统源码调研.md` | **CC 记忆系统源码调研**：读=attachment producer（不是 hook）、写=后台 fork 子代理 `[extractMemories]`（注册为 `post_turn_memory`，CJK 2 字算 1 词） |
+| `docs/20261113-CC319记忆机制源码核实v2.md` | **CC 记忆机制权威调研（最新，取代 20261112 版）**：6 条读路径（含 `relevant_memories` 相关性选择器、`AutoMem` 索引注入、MCP 记忆库、账号记忆）/ 2 条写路径（`extractMemories` + `auto_dream` 合并）/ 四类记忆提示词全文 / 隔离与 28 个环境变量分类，逐条带行号证据 |
+| `docs/20261112-Hlaudz记忆系统实施方案.md` | **记忆系统实施方案（设计，未开工）**：读侧复用 `message_injector` attachment 通道、写侧复用 subagent 后台运行时、`memories/<user_id>/` 物理隔离 + DB 行级隔离；M1–M5 分阶段与 S-M1~S-M5 e2e 用例。**开工前须按 v2 调研 §14.7 修正其 §2 类型模型 / §4.2 闸门 / §5 工具面** |
+| `docs/20261112-CC319记忆系统源码调研.md` | **已被 `20261113-…核实v2.md` 取代**：方向（attachment 而非 hook）成立，但 `MEMORY.md` 注入方式与 `agent-memory*` 作用域含义有误，且漏掉 `relevant_memories` / MCP 记忆库 / `auto_dream` 三套机制。仅供追溯 |
 | `docs/20261111-Hlaudz对标GA-CC优化总纲.md` | **本轮优化总纲（最新）**：对标 GA main@f234d92 与 CC 319 的现状坐标、10 项差距矩阵、P0–P3 路线图、三层测试策略 |
 | `docs/20261111-Hlaudz-内置工具与结果预算方案.md` | 方向 ①：`file_glob`/`file_grep`、统一预算层、退出码语义、写前必读、并行分组 |
 | `docs/20261111-Hlaudz-subagent与team测试优化方案.md` | 方向 ②：L3 真实 e2e 骨架 S1–S8、GA 12 类缺陷目录、steer / 名字钉住 / 通知注入 / 关闭竞态 |
