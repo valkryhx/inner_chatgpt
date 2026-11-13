@@ -15,7 +15,22 @@ interface Props {
 // 403「权限不足」拒绝，用户会误以为 key 没权限。
 const MODEL_CUSTOM = '__custom__'
 
-const emptyLlm = {
+type LlmForm = {
+  label: string
+  wire_api: string
+  base_url: string
+  api_key: string
+  model: string
+  context_window: number
+  max_tokens: number
+  auto_compact_tokens: number | null
+  hard_limit_tokens: number | null
+  reasoning_effort: string
+  read_timeout: number
+  is_default: boolean
+}
+
+const emptyLlm: LlmForm = {
   label: '',
   wire_api: 'openai_responses',
   base_url: 'https://api.deepseek.com',
@@ -25,13 +40,32 @@ const emptyLlm = {
   model: '',
   context_window: 128000,
   max_tokens: 8192,
-  auto_compact_tokens: null as number | null,
-  hard_limit_tokens: null as number | null,
+  auto_compact_tokens: null,
+  hard_limit_tokens: null,
   reasoning_effort: '',
   // 单次调用的读超时（秒）。语义是「两次读取间的最大空闲」，不是总时长。
   // 有些上游首字节就要 100+ 秒，120 对它们太紧，所以要能按端点调。
   read_timeout: 120,
   is_default: true,
+}
+
+/** 把已保存的配置转成表单初值。编辑视图**挂载时**就用它，没有空表单过渡。 */
+function formFromConfig(c: LLMConfig): LlmForm {
+  return {
+    label: c.label,
+    wire_api: c.wire_api,
+    base_url: c.base_url,
+    // 后端只回脱敏值；留空表示「不修改」，保存时不带 api_key 字段。
+    api_key: '',
+    model: c.model,
+    context_window: c.context_window,
+    max_tokens: c.max_tokens,
+    auto_compact_tokens: c.auto_compact_tokens ?? null,
+    hard_limit_tokens: c.hard_limit_tokens ?? null,
+    reasoning_effort: c.reasoning_effort,
+    read_timeout: c.read_timeout ?? 120,
+    is_default: c.is_default,
+  }
 }
 
 
@@ -63,10 +97,8 @@ export default function SettingsModal({ onClose, onLlmChanged }: Props) {
     <div className="modal-mask" onMouseDown={onMaskMouseDown} onClick={onMaskClick}>
       <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
         <div className="modal-head">
-          <h2>我的设置</h2>
-          <button className="ghost-btn" onClick={onClose}>
-            关闭
-          </button>
+          <h2>设置</h2>
+          <button className="icon-btn" onClick={onClose} aria-label="关闭">✕</button>
         </div>
         <div className="modal-tabs">
           <button className={tab === 'llm' ? 'active' : ''} onClick={() => setTab('llm')}>
@@ -98,62 +130,152 @@ export default function SettingsModal({ onClose, onLlmChanged }: Props) {
   )
 }
 
+
+/**
+ * 我的 APIKey：列表视图 / 编辑视图二选一。
+ *
+ * 为什么必须分成两个视图（而不是像以前那样「列表常驻 + 底部一个共用表单」）：
+ * 共用表单靠 `editingId` 这个隐式状态分叉，而表单初值又是可变的
+ * （`emptyLlm` ↔ 点编辑后逐字段赋值）。两者叠加的结果是「点编辑的瞬间，
+ * 表单仍处于新增态」——模型名下拉因 knownModel=false 显示成「自定义模型 ID」
+ * 空输入框，用户看到的就是「编辑却像是新增」。
+ *
+ * 拆开之后，编辑视图**挂载时就拿到完整初值**（formFromConfig 一次性给全），
+ * 不存在空表单过渡帧；新增视图也从一开始就是干净的默认值。
+ */
 function LlmSection({ onChanged }: { onChanged?: () => void }) {
   const [list, setList] = useState<LLMConfig[]>([])
-  const [form, setForm] = useState<{ [k: string]: any }>({ ...emptyLlm })
   const [error, setError] = useState<string | null>(null)
-  const [editingId, setEditingId] = useState<string | null>(null)
-  const [customModel, setCustomModel] = useState(false)
-  // 从端点 /models 查到的真实模型列表。null = 还没查过。
-  const [remoteModels, setRemoteModels] = useState<{ id: string; owned_by: string }[] | null>(null)
-  const [probing, setProbing] = useState(false)
-  const [probeError, setProbeError] = useState<string | null>(null)
-  // 已经为哪个 (base_url, key) 组合拉过列表。同一组合不重复请求——
-  // 探测要几秒，用户反复点开下拉不该反复打端点。
-  const probedRef = useRef('')
-  // 思考等级探测结果。null = 还没测过。
-  const [effortResult, setEffortResult] = useState<
-    { supported: boolean | null; levels: string[]; error: string; hint: string } | null
-  >(null)
-  const [effortProbing, setEffortProbing] = useState(false)
-
-  const probeReasoning = async () => {
-    setEffortProbing(true)
-    setEffortResult(null)
-    try {
-      const r = await api.probeLlmReasoning({
-        base_url: form.base_url || '',
-        api_key: form.api_key || '',
-        config_id: editingId && !form.api_key ? editingId : '',
-        model: String(form.model || ''),
-        wire_api: form.wire_api || '',
-      })
-      setEffortResult(r)
-    } catch (e: any) {
-      setEffortResult({ supported: null, levels: [], error: e?.message || String(e), hint: '' })
-    } finally {
-      setEffortProbing(false)
-    }
-  }
+  // null = 列表视图；{ config: undefined } = 新增；{ config } = 编辑
+  const [editor, setEditor] = useState<{ config?: LLMConfig } | null>(null)
 
   const load = () => api.listLlmConfigs().then(setList).catch((e) => setError(String(e)))
   useEffect(() => {
     load()
   }, [])
 
-  const reset = () => {
-    setForm({ ...emptyLlm })
-    setEditingId(null)
-    setCustomModel(false)
-    setRemoteModels(null)
-    setProbeError(null)
+  if (editor) {
+    return (
+      <LlmEditor
+        config={editor.config}
+        onCancel={() => setEditor(null)}
+        onSaved={async () => {
+          setEditor(null)
+          await load()
+          onChanged?.()
+        }}
+      />
+    )
   }
 
-  // 用当前的 base_url + key 去问端点自己有哪些模型。
-  // key 为空且正在编辑既有配置时，后端会用库里存的那个（只按 user_id 取）。
+  const del = async (id: string) => {
+    if (!confirm('删除该配置？')) return
+    await api.deleteLlmConfig(id)
+    await load()
+    onChanged?.()
+  }
+
+  return (
+    <div className="settings-section">
+      <p className="hint">
+        配置你自己的模型端点。默认配置将用于你的会话，未配置则回退系统默认模型。
+      </p>
+
+      <div className="cfg-list">
+        {list.length === 0 && <div className="hint">尚未配置（将回退到系统默认模型）</div>}
+        {list.map((c) => (
+          <div className="cfg-item" key={c.id}>
+            <div>
+              <b>{c.label || c.model}</b> {c.is_default && <span className="tag">默认</span>}
+              <div className="cfg-meta">
+                {c.wire_api} · {c.model} · key {c.has_api_key ? c.api_key_masked : '未设置'}
+              </div>
+            </div>
+            <div className="cfg-actions">
+              <button className="ghost-btn" onClick={() => setEditor({ config: c })}>
+                编辑
+              </button>
+              <button className="ghost-btn danger" onClick={() => del(c.id)}>
+                删除
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {error && <div className="auth-error">{error}</div>}
+      <div className="form-actions">
+        <button className="new-btn small" onClick={() => setEditor({})}>
+          新增配置
+        </button>
+      </div>
+    </div>
+  )
+}
+
+
+/** 新增 / 编辑 表单。挂载即定型：`config` 决定它是哪一态，之后不再切换。 */
+function LlmEditor({
+  config,
+  onCancel,
+  onSaved,
+}: {
+  config?: LLMConfig
+  onCancel: () => void
+  onSaved: () => void | Promise<void>
+}) {
+  const isEdit = !!config
+  // 关键：初值在首次渲染时就是完整的。编辑态直接由 config 展开，
+  // 不会出现"先空表单、再填充"的那一帧。
+  const [form, setForm] = useState<LlmForm>(() =>
+    config ? formFromConfig(config) : { ...emptyLlm },
+  )
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  // 从端点 /models 查到的真实模型列表。null = 还没查过。
+  const [remoteModels, setRemoteModels] = useState<{ id: string; owned_by: string }[] | null>(null)
+  const [probing, setProbing] = useState(false)
+  const [probeError, setProbeError] = useState<string | null>(null)
+  const [advanced, setAdvanced] = useState(false)
+  // 已经为哪个 (base_url, key) 组合拉过列表。同一组合不重复请求。
+  const probedRef = useRef('')
+  const [effortResult, setEffortResult] = useState<
+    { supported: boolean | null; levels: string[]; error: string; hint: string } | null
+  >(null)
+  const [effortProbing, setEffortProbing] = useState(false)
+
+  const editingId = config?.id || ''
+  const setF = <K extends keyof LlmForm>(k: K, v: LlmForm[K]) =>
+    setForm((f) => ({ ...f, [k]: v }))
+
+  // 编辑态：已保存的模型名一定要出现在候选里。
+  // 这是"编辑不该看起来像新增"的另一半保证——即使还没拉过 /models，
+  // 下拉也要显示这条配置自己的模型名，而不是退回"自定义模型 ID"。
+  const modelOptions = (() => {
+    const byValue = new Map<string, string>()
+    if (remoteModels) {
+      for (const m of remoteModels) byValue.set(m.id, m.owned_by ? `${m.id} · ${m.owned_by}` : m.id)
+    }
+    if (config?.model) byValue.set(config.model, config.model)
+    if (form.model && !byValue.has(form.model)) byValue.set(form.model, form.model)
+    return Array.from(byValue, ([value, label]) => ({ value, label }))
+  })()
+  const knownModel = modelOptions.some((m) => m.value === form.model)
+  // 只有用户显式选了「自定义」才进自定义分支；有值但不在候选里时，
+  // 仍把它当已知值展示（编辑旧配置的常见情况）。
+  const selectValue = knownModel ? form.model : MODEL_CUSTOM
+
+  const selectModel = (value: string) => {
+    if (value === MODEL_CUSTOM) {
+      // 进入自定义：清空以便重填，但如果原来有值也不该丢——保留在输入框里
+      return
+    }
+    setF('model', value)
+  }
+
   const probeModels = async (opts: { auto?: boolean } = {}) => {
     const auto = !!opts.auto
-    const sig = `${form.base_url}||${form.api_key}||${editingId || ''}`
+    const sig = `${form.base_url}||${form.api_key}||${editingId}`
     if (auto && probedRef.current === sig) return
     setProbing(true)
     setProbeError(null)
@@ -166,7 +288,6 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
       if (r.ok) {
         probedRef.current = sig   // 只有成功才钉住，失败要允许下次重试
         setRemoteModels(r.models)
-        // 当前填的值不在真实列表里时，提示出来（这是 403 的直接成因）
         if (form.model && !r.models.some((m) => m.id === form.model)) {
           setProbeError(
             `当前填的「${form.model}」不在该端点的模型列表里，实际调用会被拒绝。请从下方重新选择。`,
@@ -188,7 +309,6 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
   }
 
   // 输入停手 700ms 就预取：用户还没点开下拉，列表已经在路上。
-  // 探测本身要几秒，等点开再查会让下拉里先是空的。
   useEffect(() => {
     const base = (form.base_url || '').trim()
     const key = form.api_key || ''
@@ -196,117 +316,67 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
     if (!key && !editingId) return
     const t = setTimeout(() => { probeModels({ auto: true }) }, 700)
     return () => clearTimeout(t)
-    // 只在端点/密钥变化时重新预取；form.model 等其它字段变化不该重打端点
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form.base_url, form.api_key, editingId])
+  }, [form.base_url, form.api_key])
+
+  const probeReasoning = async () => {
+    setEffortProbing(true)
+    setEffortResult(null)
+    try {
+      const r = await api.probeLlmReasoning({
+        base_url: form.base_url || '',
+        api_key: form.api_key || '',
+        config_id: editingId && !form.api_key ? editingId : '',
+        model: String(form.model || ''),
+        wire_api: form.wire_api || '',
+      })
+      setEffortResult(r)
+    } catch (e: any) {
+      setEffortResult({ supported: null, levels: [], error: e?.message || String(e), hint: '' })
+    } finally {
+      setEffortProbing(false)
+    }
+  }
 
   const save = async () => {
     setError(null)
-    // 模型名为空时保存下去，要到真正对话才炸，且报错位置离这里很远。
     if (!String(form.model || '').trim()) {
       setError('请先选择或填写模型名（点开「模型名」下拉即可获取端点真实模型）')
       return
     }
+    setBusy(true)
     try {
       const body: any = { ...form }
       if (!body.api_key) delete body.api_key
-      if (editingId) await api.updateLlmConfig(editingId, body)
+      if (isEdit) await api.updateLlmConfig(editingId, body)
       else await api.createLlmConfig(body)
-      reset()
-      await load()
-      onChanged?.()
+      await onSaved()
     } catch (e: any) {
       setError(e?.message || String(e))
+    } finally {
+      setBusy(false)
     }
   }
 
-  const edit = (c: LLMConfig) => {
-    setEditingId(c.id)
-    setCustomModel(false)
-    setRemoteModels(null)
-    setProbeError(null)
-    setForm({
-      label: c.label,
-      wire_api: c.wire_api,
-      base_url: c.base_url,
-      api_key: '',
-      model: c.model,
-      context_window: c.context_window,
-      max_tokens: c.max_tokens,
-      auto_compact_tokens: c.auto_compact_tokens ?? null,
-      hard_limit_tokens: c.hard_limit_tokens ?? null,
-      reasoning_effort: c.reasoning_effort,
-      read_timeout: c.read_timeout ?? 120,
-      is_default: c.is_default,
-    })
-  }
-
-  const del = async (id: string) => {
-    if (!confirm('删除该配置？')) return
-    await api.deleteLlmConfig(id)
-    await load()
-    onChanged?.()
-  }
-
-  const setF = (k: string, v: any) => setForm((f) => ({ ...f, [k]: v }))
-
-  // 下拉选项来源，按优先级：
-  //   1. 从端点 /models 查到的真实列表（唯一可靠来源）
-  //   2. 用户已保存的配置里出现过的模型名（保证编辑旧配置不丢值）
-  //   3. 当前表单里的值
-  // 硬编码的 MODEL_PRESETS 已不再作为「可选项」直接呈现——它们的短名在
-  // 具体网关上常常不存在（湛卢要 moma/ 前缀），选了就会 403。
-  const modelOptions = (() => {
-    const byValue = new Map<string, string>()
-    if (remoteModels) {
-      for (const m of remoteModels) byValue.set(m.id, m.owned_by ? `${m.id} · ${m.owned_by}` : m.id)
-    }
-    for (const c of list) {
-      if (c.model && !byValue.has(c.model)) byValue.set(c.model, c.model)
-    }
-    if (form.model && !byValue.has(form.model)) byValue.set(form.model, form.model)
-    return Array.from(byValue, ([value, label]) => ({ value, label }))
-  })()
-  const knownModel = modelOptions.some((m) => m.value === form.model)
-  const modelSelectValue = customModel || !knownModel ? MODEL_CUSTOM : form.model
-  const selectModel = (value: string) => {
-    if (value === MODEL_CUSTOM) {
-      setCustomModel(true)
-      if (knownModel) setF('model', '')
-      return
-    }
-    setCustomModel(false)
-    setF('model', value)
-  }
+  const title = isEdit ? '编辑模型配置' : '新增模型配置'
 
   return (
     <div className="settings-section">
-      <p className="hint">配置你自己的模型端点。留空 api_key 表示编辑时不修改；默认配置将用于你的会话，未配置则回退系统默认模型。</p>
-      <div className="cfg-list">
-        {list.length === 0 && <div className="hint">尚未配置（将回退到系统默认模型）</div>}
-        {list.map((c) => (
-          <div className="cfg-item" key={c.id}>
-            <div>
-              <b>{c.label || c.model}</b> {c.is_default && <span className="tag">默认</span>}
-              <div className="cfg-meta">
-                {c.wire_api} · {c.model} · key {c.has_api_key ? c.api_key_masked : '未设置'}
-              </div>
-            </div>
-            <div className="cfg-actions">
-              <button className="ghost-btn" onClick={() => edit(c)}>
-                编辑
-              </button>
-              <button className="ghost-btn danger" onClick={() => del(c.id)}>
-                删除
-              </button>
-            </div>
-          </div>
-        ))}
+      <div className="editor-head">
+        <button className="ghost-btn small back-btn" onClick={onCancel} type="button">
+          <span aria-hidden="true">←</span> 返回
+        </button>
+        <div className="editor-title">
+          <h3>{title}</h3>
+          {isEdit && form.is_default && <span className="tag">默认</span>}
+        </div>
       </div>
+
       <div className="form-grid">
         <label>
           <span>标签</span>
-          <input value={form.label} onChange={(e) => setF('label', e.target.value)} placeholder="如 我的DeepSeek" />
+          <input value={form.label} onChange={(e) => setF('label', e.target.value)}
+                 placeholder="如 我的DeepSeek" />
         </label>
         <label>
           <span>协议</span>
@@ -329,38 +399,26 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
           />
         </label>
         <label className="full">
-          <span>API Key（{editingId ? '留空不改' : '必填'}）</span>
+          <span>API Key（{isEdit ? '留空不改' : '必填'}）</span>
           <input
             type="password"
             value={form.api_key}
             onChange={(e) => setF('api_key', e.target.value)}
-            // 填完 key 就把探测发出去：端点 /models 要 0.5–4s，
-            // 等用户真的点开下拉再查，下拉里只会是空的。
             onBlur={() => {
               if (!remoteModels && !probing && form.base_url && form.api_key) {
                 probeModels({ auto: true })
               }
             }}
-            placeholder="sk-..."
+            placeholder={isEdit ? '留空表示不修改已保存的 Key' : 'sk-...'}
           />
         </label>
-        <label>
+        <label className="full">
           <span>模型名</span>
           <div className="model-pick-row">
             <select
-              value={modelSelectValue}
+              value={selectValue}
               onChange={(e) => selectModel(e.target.value)}
               onFocus={() => {
-                // 用户点开下拉就按端点真实模型填充，不需要先知道要点「刷新」。
-                // key 没填且不是编辑既有配置时先不查，否则焦点一进来就弹 401。
-                if (!remoteModels && !probing && form.base_url
-                    && (form.api_key || editingId)) {
-                  probeModels({ auto: true })
-                }
-              }}
-              onMouseDown={() => {
-                // 有些环境（含 headless Chromium）点 select 不一定触发 focus，
-                // 这里补一条同样的路径，保证「点开下拉」这个动作稳定触发拉取。
                 if (!remoteModels && !probing && form.base_url
                     && (form.api_key || editingId)) {
                   probeModels({ auto: true })
@@ -389,17 +447,12 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
           </div>
           {probeError && <span className="field-error">{probeError}</span>}
           {remoteModels && !probeError && (
-            <span className="field-help ok">
-              已从端点读取 {remoteModels.length} 个模型
-            </span>
+            <span className="field-help ok">已从端点读取 {remoteModels.length} 个模型</span>
           )}
-          {modelSelectValue === MODEL_CUSTOM && (
+          {!knownModel && (
             <input
               value={form.model}
-              onChange={(e) => {
-                setCustomModel(true)
-                setF('model', e.target.value)
-              }}
+              onChange={(e) => setF('model', e.target.value)}
               placeholder="输入模型 ID，如 my-gateway-model"
               autoFocus
             />
@@ -409,105 +462,127 @@ function LlmSection({ onChanged }: { onChanged?: () => void }) {
             点「获取模型」可拉取该端点的全部可用模型；端点不支持时也可手填。
           </span>
         </label>
-        <label>
-          <span>上下文窗口</span>
-          <input
-            type="number"
-            value={form.context_window}
-            onChange={(e) => setF('context_window', parseInt(e.target.value || '0'))}
-          />
-        </label>
-        <label>
-          <span>max_tokens</span>
-          <input type="number" value={form.max_tokens} onChange={(e) => setF('max_tokens', parseInt(e.target.value || '0'))} />
-        </label>
-        <label>
-          <span>自动压缩阈值 tokens（空=按窗口×0.90）</span>
-          <input
-            type="number"
-            value={form.auto_compact_tokens ?? ''}
-            placeholder={'派生 ' + Math.round((form.context_window || 0) * 0.9)}
-            onChange={(e) => setF('auto_compact_tokens', e.target.value === '' ? null : parseInt(e.target.value || '0'))}
-          />
-        </label>
-        <label>
-          <span>硬线阈值 tokens（空=按窗口×0.95）</span>
-          <input
-            type="number"
-            value={form.hard_limit_tokens ?? ''}
-            placeholder={'派生 ' + Math.round((form.context_window || 0) * 0.95)}
-            onChange={(e) => setF('hard_limit_tokens', e.target.value === '' ? null : parseInt(e.target.value || '0'))}
-          />
-        </label>
-        <label>
-          <span>reasoning_effort</span>
-          <div className="effort-row">
-            <input value={form.reasoning_effort} onChange={(e) => setF('reasoning_effort', e.target.value)} placeholder="可空" />
-            <button
-              type="button"
-              className="ghost-btn small"
-              onClick={probeReasoning}
-              disabled={effortProbing || !String(form.model || '').trim()}
-              title="发一个非法档位给端点，看它报不报错——从而判断它是否真的支持思考等级"
-            >
-              {effortProbing ? '探测中…' : '测支持'}
-            </button>
-          </div>
-        </label>
-        {effortResult && (
-          <div className={effortResult.supported === false ? 'field-error' : 'field-hint'}>
-            {effortResult.supported === true && (
-              <>
-                该端点<b>会校验</b> reasoning_effort。
-                {effortResult.levels.length > 0
-                  ? `它自报支持：${effortResult.levels.join(' / ')}`
-                  : '但没在报错里列出可选档位，建议手动试档或留空。'}
-              </>
-            )}
-            {effortResult.supported === false && (
-              <>
-                该端点<b>整段忽略</b> reasoning_effort：无论选哪一档都不改变上游行为。
-                这是网关侧限制，不是 Hlaudz 配置问题——留空即可，选了也不会生效。
-              </>
-            )}
-            {effortResult.supported === null && (
-              <>无法判定：{effortResult.error}{effortResult.hint ? ` —— ${effortResult.hint}` : ''}</>
-            )}
-          </div>
-        )}
-        <label>
-          <span>读超时（秒）</span>
-          <input
-            type="number"
-            min={10}
-            max={600}
-            value={form.read_timeout ?? 120}
-            onChange={(e) => setF('read_timeout', e.target.value === '' ? 120 : parseInt(e.target.value || '120'))}
-          />
-          <span className="field-help">
-            两次数据之间的最大空闲，不是整段回复总时长——持续吐字的回答可以远超这个值。
-            有些端点首字节就要 100 秒以上，把它调大（上限 600）。
-          </span>
-        </label>
-        <label className="checkbox">
-          <input type="checkbox" checked={form.is_default} onChange={(e) => setF('is_default', e.target.checked)} />
-          <span>设为默认</span>
-        </label>
       </div>
+
+      <div className="advanced-toggle">
+        <button type="button" className="ghost-btn small" onClick={() => setAdvanced((v) => !v)}
+                aria-expanded={advanced}>
+          {advanced ? '收起高级设置' : '高级设置'}
+        </button>
+        <span className="field-help">
+          上下文窗口、max_tokens、压缩阈值、思考等级、读超时
+        </span>
+      </div>
+
+      {advanced && (
+        <div className="form-grid">
+          <label className="full checkbox">
+            <input type="checkbox" checked={form.is_default}
+                   onChange={(e) => setF('is_default', e.target.checked)} />
+            <span>设为默认</span>
+          </label>
+          <label>
+            <span>上下文窗口</span>
+            <input type="number" value={form.context_window}
+                   onChange={(e) => setF('context_window', parseInt(e.target.value || '0'))} />
+          </label>
+          <label>
+            <span>max_tokens</span>
+            <input type="number" value={form.max_tokens}
+                   onChange={(e) => setF('max_tokens', parseInt(e.target.value || '0'))} />
+          </label>
+          <label>
+            <span>自动压缩阈值 tokens（空=按窗口×0.90）</span>
+            <input
+              type="number"
+              value={form.auto_compact_tokens ?? ''}
+              placeholder={'派生 ' + Math.round((form.context_window || 0) * 0.9)}
+              onChange={(e) => setF('auto_compact_tokens',
+                e.target.value === '' ? null : parseInt(e.target.value || '0'))}
+            />
+          </label>
+          <label>
+            <span>硬线阈值 tokens（空=按窗口×0.95）</span>
+            <input
+              type="number"
+              value={form.hard_limit_tokens ?? ''}
+              placeholder={'派生 ' + Math.round((form.context_window || 0) * 0.95)}
+              onChange={(e) => setF('hard_limit_tokens',
+                e.target.value === '' ? null : parseInt(e.target.value || '0'))}
+            />
+          </label>
+          <label className="full">
+            <span>reasoning_effort</span>
+            <div className="effort-row">
+              <input value={form.reasoning_effort}
+                     onChange={(e) => setF('reasoning_effort', e.target.value)}
+                     placeholder="可空" />
+              <button
+                type="button"
+                className="ghost-btn small"
+                onClick={probeReasoning}
+                disabled={effortProbing || !String(form.model || '').trim()}
+                title="发一个非法档位给端点，看它报不报错——从而判断它是否真的支持思考等级"
+              >
+                {effortProbing ? '探测中…' : '测支持'}
+              </button>
+            </div>
+          </label>
+          {effortResult && (
+            <div
+              className={effortResult.supported === false ? 'field-error' : 'field-hint'}
+              style={{ gridColumn: '1 / -1' }}
+            >
+              {effortResult.supported === true && (
+                <>
+                  该端点<b>会校验</b> reasoning_effort。
+                  {effortResult.levels.length > 0
+                    ? `它自报支持：${effortResult.levels.join(' / ')}`
+                    : '但没在报错里列出可选档位，建议手动试档或留空。'}
+                </>
+              )}
+              {effortResult.supported === false && (
+                <>
+                  该端点<b>整段忽略</b> reasoning_effort：无论选哪一档都不改变上游行为。
+                  这是网关侧限制，不是 Hlaudz 配置问题——留空即可，选了也不会生效。
+                </>
+              )}
+              {effortResult.supported === null && (
+                <>无法判定：{effortResult.error}{effortResult.hint ? ` —— ${effortResult.hint}` : ''}</>
+              )}
+            </div>
+          )}
+          <label className="full">
+            <span>读超时（秒）</span>
+            <input
+              type="number"
+              min={10}
+              max={600}
+              value={form.read_timeout ?? 120}
+              onChange={(e) => setF('read_timeout',
+                e.target.value === '' ? 120 : parseInt(e.target.value || '120'))}
+            />
+            <span className="field-help">
+              两次数据之间的最大空闲，不是整段回复总时长——持续吐字的回答可以远超这个值。
+              有些端点首字节就要 100 秒以上，把它调大（上限 600）。
+            </span>
+          </label>
+        </div>
+      )}
+
       {error && <div className="auth-error">{error}</div>}
       <div className="form-actions">
-        <button className="new-btn small" onClick={save}>
-          {editingId ? '保存修改' : '新增配置'}
+        <button className="new-btn small" onClick={save} disabled={busy}>
+          {busy ? '保存中…' : isEdit ? '保存修改' : '新增配置'}
         </button>
-        {editingId && (
-          <button className="ghost-btn" onClick={reset}>
-            取消
-          </button>
-        )}
+        <button className="ghost-btn" onClick={onCancel} disabled={busy}>
+          取消
+        </button>
       </div>
     </div>
   )
 }
+
 
 function McpSection() {
   const [list, setList] = useState<MCPServer[]>([])

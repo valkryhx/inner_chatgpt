@@ -505,6 +505,42 @@ textarea, input { caret-color: var(--clay); }
 .form-actions { display: flex; gap: 10px; align-items: center; }
 .new-btn.small { width: auto; padding: 8px 18px; font-size: 13px; }
 
+/* ---------- 设置内页（新增/编辑独立视图） ----------
+   编辑是「一层内页」而不是复用列表下方的表单：靠返回按钮回列表。
+   head 用同一条线把「返回 / 标题 / 状态」串起来，比浮层更稳，
+   也让用户清楚自己不在列表里了。 */
+.editor-head {
+  display: flex; align-items: center; gap: 10px;
+  padding-bottom: 10px; border-bottom: 1px solid var(--line);
+}
+.editor-head h3 {
+  margin: 0; font-size: 14px; font-weight: 650; color: var(--ink);
+  letter-spacing: -0.01em;
+}
+/* 返回按钮：箭头与文字之间要有真实间距。
+   直接写「← 返回」时，中文字体下箭头会与首字黏连，看起来像「←返回」。 */
+.back-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  flex: none; font-weight: 500;
+}
+.back-btn span { font-size: 13px; line-height: 1; }
+/* 标题与其状态标签是一个整体：紧邻，不与「返回」同起一条基线。
+   之前 tag 直接挂在 head 的 flex 里，会被 gap 推远，
+   读起来像"编辑模型配置"和"默认"是两个互不相干的东西。 */
+.editor-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.editor-title .tag { margin-left: 0; flex: none; }
+.editor-head .tag { margin-left: 0; }
+
+/* 高级设置的折叠入口。
+   不用左侧竖线（会在等宽表单里显得像另一个区块的边界，读起来像"分栏"）；
+   改成与表单同起点的浅色分隔线，明确它是表单的延续而不是并列区块。 */
+.advanced-toggle {
+  display: flex; align-items: center; gap: 10px;
+  padding-top: 12px; border-top: 1px solid var(--line);
+}
+.advanced-toggle .ghost-btn.small { flex: none; }
+.advanced-toggle .field-help { margin: 0; }
+
 /* ===== 会话模型切换 ===== */
 .model-picker { display: inline-flex; align-items: center; gap: 6px; margin-right: 6px; }
 .model-picker-label { font-size: 11px; color: var(--muted); }
