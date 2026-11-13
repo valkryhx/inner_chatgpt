@@ -32,6 +32,12 @@ from .config import DB_PATH
 # 团队协作专用通道：neath 事件都走这个名字，便于单独分流到 JSONL 文件。
 TEAM_LOGGER_NAME = "hlaudz.team"
 
+# 首帧前奏专用通道：结构化字段（各段耗时）必须能 grep。
+# 为什么必须单独一个通道：普通 Formatter 不渲染 `extra`，所以
+# `logger.info("...", extra={"soft": 5000})` 落盘后只剩一行人话，
+# 数字全丢了。而「首帧慢在哪一段」恰恰只能靠这些字段回答。
+PRELUDE_LOGGER_NAME = "hlaudz.prelude"
+
 _DEFAULT_FORMAT = "%(levelname)-7s %(asctime)s %(name)s: %(message)s"
 _DATE_FORMAT = "%H:%M:%S"
 
@@ -156,6 +162,23 @@ def setup_logging() -> dict[str, Any]:
             # 不向上冒泡到 root：否则同一行会同时出现在 console 与文件里，
             # 且 console 上的自然语言形态对 grep 没帮助。
             team_logger.propagate = False
+
+        # 首帧前奏：独立 JSONL（字段可 grep），同时保留 root 上的人话版本。
+        # 两者并存是有意的：
+        #   - JSONL 回答「soft 段花了多少 ms」这类精确问题；
+        #   - root 的人话行让 `tail app.log` 时也能看出发生过一轮。
+        if _env_flag("HLZ_PRELUDE_LOG_FILE", default=True):
+            prelude_path = _logs_dir() / f"prelude-{time.strftime('%Y%m%d')}.jsonl"
+            prelude_path.parent.mkdir(parents=True, exist_ok=True)
+            prelude_handler = logging.handlers.RotatingFileHandler(
+                prelude_path, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8")
+            prelude_handler.setFormatter(JsonLineFormatter())
+            prelude_handler.setLevel(logging.INFO)
+            prelude_logger = logging.getLogger(PRELUDE_LOGGER_NAME)
+            prelude_logger.addHandler(prelude_handler)
+            prelude_logger.setLevel(logging.INFO)
+            # 允许冒泡：root 上那条人话行是给 `tail` 用的，成本可忽略。
+            prelude_logger.propagate = True
 
         # 第三方库降噪
         for noisy in ("httpx", "httpcore", "aiosqlite", "fastmcp"):

@@ -23,6 +23,7 @@ import os
 import time
 from typing import Any, AsyncIterator, Optional
 
+from .injector_guard import InjectorGuard, injector_timeout_from_env
 from .llm_client import ChatResult, LLMClient, LLMError
 from .tools import ToolRegistry
 
@@ -137,10 +138,29 @@ class AgentLoop:
         self.user_id = user_id
         # 可选：每轮模型调用前的消息注入器（子代理 steer 用）
         self.message_injector = message_injector
+        # 注入器超时预算（见 injector_guard）：0 = 不限（历史行为）。
+        # 注意不能在这里就把 guard 绑死：`message_injector` 在构造之后会被
+        # host.py / sse.py 重新赋值，所以必须按「当前注入器」惰性绑定。
+        self._injector_timeout_s = injector_timeout_from_env()
+        self._injector_guard = None
+        self._injector_guard_for = None
         # 可选：团队待续跑闸。模型想收工时调用它；返回非空字符串表示
         # 「还有团队工作在跑」并给出原因，循环据此续跑而不是结束。
         # Team 之外永远是 None，行为与历史完全一致。
         self.team_gate = team_gate
+
+    def _injector_guard_now(self) -> InjectorGuard:
+        """按**当前** `message_injector` 返回 guard（惰性绑定）。
+
+        为什么不在 `__init__` 里建一次：`message_injector` 在构造之后会被
+        `subagent/host.py` 与 `sse.py` 重新赋值。若 init 时就绑死，那两处赋值
+        之后 guard 仍然包着旧的（可能是 None 的）注入器，等于注入静默失效。
+        所以按注入器对象的身份缓存：换了注入器就换 guard。
+        """
+        if self._injector_guard is None or self._injector_guard_for is not self.message_injector:
+            self._injector_guard = InjectorGuard(self.message_injector, self._injector_timeout_s)
+            self._injector_guard_for = self.message_injector
+        return self._injector_guard
 
     # ---------- sanitation: repair dangling tool_calls ----------
     async def sanitize(self, history: list[dict]) -> bool:
@@ -262,6 +282,34 @@ class AgentLoop:
         stop_event: Optional[asyncio.Event] = None,
         session_id: str = "",
     ) -> AsyncIterator[dict]:
+        """公开入口：包一层，保证任何出口（含异常/取消）都收尾注入器。
+
+        为什么要包装而不是在循环里加 flush：`_run_stream_inner` 有 5 个
+        `return` 出口（停止/错误/完成/超墙钟/超轮数）外加异常与取消路径，
+        逐个加必然漏掉一个。放在生成器的 finally 里只写一次。
+        """
+        try:
+            async for ev in self._run_stream_inner(history, stop_event, session_id):
+                yield ev
+        finally:
+            await self._flush_injector()
+
+    async def _flush_injector(self) -> None:
+        """给未完成的注入任务一个短宽限；真丢时留明确日志（见 injector_guard）。"""
+        guard = self._injector_guard
+        if guard is None:
+            return
+        try:
+            await guard.flush()
+        except BaseException:  # noqa: BLE001 - 收尾绝不能影响正常结束
+            logger.warning("注入器收尾失败", exc_info=True)
+
+    async def _run_stream_inner(
+        self,
+        history: list[dict],
+        stop_event: Optional[asyncio.Event] = None,
+        session_id: str = "",
+    ) -> AsyncIterator[dict]:
         """Mutates `history` in place (appends assistant/tool messages). Emits events.
         The caller is responsible for appending the trailing user message first."""
         def stopped() -> bool:
@@ -303,15 +351,12 @@ class AgentLoop:
                     return
             turn += 1
             if self.message_injector is not None:
-                try:
-                    injected = self.message_injector() or []
-                    # 注入器需要读库（团队收件箱）时是异步的；这里是 async 生成器，
-                    # 直接 await 即可，不必为了「同步注入」再加一层缓存。
-                    if inspect.isawaitable(injected):
-                        injected = await injected
-                    injected = injected or []
-                except Exception:
-                    injected = []
+                guard = self._injector_guard_now()
+                injected, inject_timed_out = await guard.collect()
+                if inject_timed_out:
+                    # 只发事件、不中断本轮：注入是增强，失败不该让整轮失败。
+                    yield {"type": "injector_timeout",
+                           "timeout_s": self._injector_timeout_s}
                 for msg in injected:
                     history.append(msg)
                     yield {"type": "message_injected", "text": msg.get("content", "")}

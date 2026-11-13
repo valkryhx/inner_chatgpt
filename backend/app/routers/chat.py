@@ -26,6 +26,7 @@ from .. import uploads
 from ..subagent.context import AgentContext
 from ..subagent.session import build_turn_runtime, prepare_turn_team
 from ..logging_setup import team_event
+from ..prelude_timing import PreludeTimer, async_span
 from ..steer_queue import get_queue
 
 _SUBAGENT_EVENT_ID = "__subagent__"
@@ -362,6 +363,9 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                         tool_policy: str = "full",
                         attachments: list[dict] | None = None,
                         reasoning_effort: str = "") -> AsyncIterator[str]:
+    # 首帧前奏计时：从进入本生成器开始，到第一个 message_start 为止。
+    # 只做 time.monotonic() 与一次汇总日志，不改任何行为（见 prelude_timing）。
+    prelude = PreludeTimer(user_id, session_id, generation_id)
     # Register/capture the current streaming task at the very top.  The
     # prelude below can await runtime construction and compaction; registering
     # only after it would leave stop unable to cancel a request that is stuck
@@ -393,26 +397,52 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     # sanitize).  Those awaits can take seconds; if the user stops during them,
     # the stop endpoint must at least find the user row and assistant
     # placeholder to converge, instead of erasing what they just typed.
-    try:
-        await db.add_message(session_id, "user", content=text,
-                             blocks=_attachment_blocks(attachments))
-        await db.add_message(session_id, "assistant", content="", status="streaming", message_id=message_id)
-    except Exception:
-        pass
+    async with async_span(prelude, "add_msg"):
+        try:
+            await db.add_message(session_id, "user", content=text,
+                                 blocks=_attachment_blocks(attachments))
+            await db.add_message(session_id, "assistant", content="", status="streaming", message_id=message_id)
+        except Exception:
+            pass
+
+    # ---- 首帧提前（P3）----
+    # `message_start` 只需要 message_id（在调用本生成器之前就生成了），
+    # 与压缩/派生 runtime 完全无关。历史实现把它排在 7 件前奏之后，导致
+    # 「超软线时摘要调 LLM 5 秒，用户界面 5 秒全空白」（实测，见
+    # docs/20261112-Hlaudz首帧串行阻塞核实与优化设计.md §1.1）。
+    #
+    # 提前到这里后，首帧只依赖「两行消息已落库」，剩下的都排到首帧之后。
+    # 前端对 message_start 的处理只是替换本地消息 id，提前无副作用；
+    # 后续任何一段失败仍会走下面的 error 分支把消息收敛成 error 状态。
+    #
+    # 注意：这段必须在 hub/ur 就绪之前，因为 ur 的构造在冷启动时要连全部
+    # MCP server（几百 ms）。首帧不等它。
+    event_id = 0
+
+    def frame(etype: str, data: dict[str, Any]) -> str:
+        nonlocal event_id
+        event_id += 1
+        return sse_frame(etype, data, event_id)
+
+    yield frame("message_start", {"message_id": message_id})
+    prelude.mark("first_frame")
 
     hub = get_hub()
     if hub is None:
         await team_store.release_generation(user_id, session_id, generation_id)
+        prelude.emit(level=logging.WARNING)
         yield sse_frame("error", {"error": "runtime not ready"})
         return
     try:
-        ur = await hub.get_user_runtime(user_id, model_id)
+        async with async_span(prelude, "runtime"):
+            ur = await hub.get_user_runtime(user_id, model_id)
         # 会话级思考等级：派生视图，不改缓存里的 runtime（见 agent.with_effort）
         ur = with_effort(ur, reasoning_effort)
     except Exception as e:  # noqa: BLE001
         # 典型场景：全新部署、用户还没配置任何模型（且仓库不携带 llm.yaml）。
         # 这里以 SSE 事件返回可读提示，而不是让前端只看到 500。
         await team_store.release_generation(user_id, session_id, generation_id)
+        prelude.emit(level=logging.WARNING)
         yield sse_frame("error", {
             "error": f"无法初始化模型：{type(e).__name__}: {e}",
             "hint": "请先在「设置 -> 我的模型」新增模型（base_url / api_key / model）并设为默认。",
@@ -434,20 +464,42 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     except Exception:
         pass
 
-    # 软线自动压缩（对齐 GenericAgent）：本轮前按 token 阈值判断，超软线才摘要较早消息。
+    # 软线自动压缩（对齐 GenericAgent）：按 token 阈值判断，超软线才摘要较早消息。
     # 与硬线不同，这里会真正调用 LLM 生成摘要，并替换 checkpoint 为「摘要 + 近段」。
+    #
+    # P4：默认**不在赛前做**，而是记下「本轮结束后补跑」（见 deferred_compact）。
+    # 理由：软线不影响本轮能否开始（硬线才是正确性问题），而且它的输入
+    # 「历史 + 本轮输入」在本轮结束后完全等价——赛后压与赛前压结果相同。
+    # 赛前做的话，摘要的几秒会推迟首个 token（实测超软线 +5~9s）。
+    #
+    # 关闭开关（HLZ_SOFT_COMPACT_DEFER=0）时退回 P3 行为：赛前压缩。
     try:
-        from ..compaction import enforce_soft_limit
-        soft = await enforce_soft_limit(user_id, session_id, pending_text=text)
-        if soft is not None:
-            yield sse_frame("compaction", soft)
+        from ..deferred_compact import soft_defer_enabled
+        if soft_defer_enabled():
+            prelude.count("soft_deferred")
+        else:
+            from ..compaction import enforce_soft_limit
+            async with async_span(prelude, "soft"):
+                soft = await enforce_soft_limit(user_id, session_id, pending_text=text)
+            if soft is not None:
+                prelude.count("soft_called")
+                yield sse_frame("compaction", soft)
     except Exception:
         pass
 
     # 硬线兜底：本轮前若 checkpoint 已超硬线，先裁剪最旧消息（不调用 LLM），避免请求超窗。
+    # 先抢占上一轮的赛后压缩：它持有同一把压缩锁，若还在跑（最长 60s），
+    # 这条硬线会等锁 —— 那等于把 P3 降下来的首帧延迟又加回去。
+    try:
+        from ..deferred_compact import preempt as _preempt_compact
+        if await _preempt_compact(user_id, session_id):
+            logger.info("已抢占上一轮的赛后压缩，本轮硬线优先")
+    except Exception:  # noqa: BLE001 - 抢占失败最多是等一下锁
+        pass
     try:
         from ..compaction import enforce_hard_limit
-        trimmed = await enforce_hard_limit(user_id, session_id)
+        async with async_span(prelude, "hard"):
+            trimmed = await enforce_hard_limit(user_id, session_id)
         if trimmed is not None:
             yield sse_frame("compaction", {"trigger": "hard_trim", **trimmed})
     except Exception:
@@ -456,7 +508,8 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     # 自愈：若上一轮因工具异常中断，checkpoint 可能残留「AI 已发 tool_calls 但无 tool 结果」
     # 的悬空状态，会导致本次请求被模型服务 400 拒绝并级联污染会话。这里先修复（补结果或截断）。
     try:
-        healed = await ur.sanitize_pending_tool_calls(session_id)
+        async with async_span(prelude, "sanitize"):
+            healed = await ur.sanitize_pending_tool_calls(session_id)
         if healed:
             yield sse_frame("healed", {"repaired": True})
     except Exception:
@@ -468,7 +521,7 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     # 消息块按「事件真实发生顺序」累积：文本增量并入当前文本块，
     # 工具/图表在出现的位置插入。这样刷新后顺序与流式时一致。
     blocks: list[dict[str, Any]] = []
-    event_id = 0
+    # 注意：`event_id` 与 `frame()` 已在首帧之前定义（P3 把首帧提前了）。
     persist_lock = asyncio.Lock()
     last_persist_at = 0.0
     terminal_status: str | None = None
@@ -487,11 +540,6 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
         else:
             blocks.append({"type": "reasoning", "text": chunk})
 
-    def frame(etype: str, data: dict[str, Any]) -> str:
-        nonlocal event_id
-        event_id += 1
-        return sse_frame(etype, data, event_id)
-
     async def _persist(status: str, *, force: bool = False) -> None:
         nonlocal last_persist_at
         now = asyncio.get_running_loop().time()
@@ -508,15 +556,14 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
             except Exception:
                 pass
 
-    yield frame("message_start", {"message_id": message_id})
-
     # ---- 子代理：本轮派生的 Runtime（含 5 个编排工具）+ 子代理事件合并进同一条 SSE ----
     ctx = AgentContext(user_id=user_id, session_id=session_id,
                        message_id=message_id, generation_id=generation_id)
     turn = None
     team_ctx = ctx
     try:
-        turn = await build_turn_runtime(ur, ctx, tool_policy=tool_policy)
+        async with async_span(prelude, "build_turn"):
+            turn = await build_turn_runtime(ur, ctx, tool_policy=tool_policy)
         # build_turn_runtime creates the server-owned team id. All host and
         # child contexts must use that same id; never trust a tool argument.
         if getattr(turn, "team_id", ""):
@@ -527,7 +574,8 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
             # Compatibility for lightweight test doubles with the pre-scope
             # signature. Production RuntimeHub always uses the five-argument form.
             hub.register_subagent_host(session_id, generation_id, turn.host)
-        await prepare_turn_team(turn, team_ctx)
+        async with async_span(prelude, "team"):
+            await prepare_turn_team(turn, team_ctx)
         # Register only once the turn is fully built: a failure above drops the
         # turn, and the stream's finally would then never clean it up.
         _register_acp_manager(hub, user_id, session_id, generation_id, turn)
@@ -702,6 +750,19 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
         _finalize_sub_blocks(status)
         await _persist(status, force=True)
         yield frame("done", {"message_id": message_id, "status": status, "model": ur.model.model_name})
+
+        # P4：赛后补压缩。**必须放在 done 之后**——用户看到「完成」就不该
+        # 再等摘要那几秒。这里只登记后台任务，不 await。
+        #
+        # 只在本轮"正常完成"时调度：停止/错误时压缩会把用户主动中断的半截
+        # 上下文一起摘要掉，反而制造混乱（下一轮反正还会再压）。
+        if status == "complete":
+            try:
+                from ..deferred_compact import schedule_soft_compact
+                if schedule_soft_compact(user_id, session_id) is not None:
+                    prelude.count("soft_deferred")
+            except Exception:  # noqa: BLE001 - 调度失败不能影响本轮结果
+                logger.warning("赛后压缩调度失败", exc_info=True)
     except asyncio.CancelledError:
         terminal_status = "stopped"
         _finalize_and_persist_after_cancel(
@@ -716,6 +777,9 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
         await _persist(terminal_status, force=True)
         yield frame("error", {"error": f"{type(e).__name__}: {e}"})
     finally:
+        # 前奏汇总日志：放在 finally 里，保证异常/取消路径也能拿到那一段的数字
+        # （这些路径下「首帧为什么会慢/卡住」恰恰最需要证据）。
+        prelude.emit()
         # Cancellation-safe cleanup: synchronous releases happen before any
         # await, so a cancelled anyio scope cannot leak the Team quota.
         was_unknown = terminal_status is None

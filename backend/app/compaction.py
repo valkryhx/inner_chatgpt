@@ -8,6 +8,7 @@ Design aligns with GenericAgent core/context.py:
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from . import db
@@ -25,6 +26,34 @@ SUMMARY_PROMPT = (
 HARD_TRIM_RECOVER_RATIO = 0.6
 SOFT_LINE_RECOVER_RATIO = 0.5
 AUTO_MIN_KEEP_MESSAGES = 2
+
+# 压缩互斥锁：按 (user_id, session_id) 一把。
+#
+# 为什么需要：`enforce_soft_limit` / `enforce_hard_limit` 都是「读 → 算 → 写」，
+# 而 `HistoryStore` 的锁只包住**单次 set()**，`get()` 完全不加锁。两个压缩
+# 并发时会出现经典丢失更新：
+#
+#     软线: get(A) ──[调 LLM 3-5s]── set(基于 A 的摘要)
+#     硬线:      get(A) ── set(基于 A 的裁剪)          ↑ 覆盖掉硬线的裁剪
+#
+# 后果很实际：硬线刚裁下去的消息又回来了，下一次请求仍然超窗。
+# 现在压缩是顺序调用的，靠「调用顺序」隐式保证；一旦有人并行化（P3 之后
+# 首帧提前会让这类并行变得自然），就会踩到这个坑。
+_compaction_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+def compaction_lock(user_id: str, session_id: str) -> asyncio.Lock:
+    """取（并按需创建）该会话的压缩互斥锁。
+
+    注意：锁只保证**进程内**互斥。多进程部署时各进程各有各的锁，
+    真正的并发安全仍依赖 SQLite 的事务与 busy_timeout。
+    """
+    key = (str(user_id), str(session_id))
+    lock = _compaction_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _compaction_locks[key] = lock
+    return lock
 
 
 def _dialog_text(messages, budget=24000):
@@ -125,7 +154,16 @@ def _tail_keep_from(messages, keep_from, budget):
 
 
 async def manual_compact(user_id, session_id, keep=6, instructions=""):
-    """Manual compaction (/compact + toolbar button)."""
+    """Manual compaction (/compact + toolbar button).
+
+    与自动压缩共用会话级锁：用户点「压缩」时若那一轮正好在自动压缩，
+    两边并发写回会互相覆盖。
+    """
+    async with compaction_lock(user_id, session_id):
+        return await _manual_compact_locked(user_id, session_id, keep, instructions)
+
+
+async def _manual_compact_locked(user_id, session_id, keep=6, instructions=""):
     hub = get_hub()
     if hub is None:
         return {"compacted": False, "trigger": "manual", "message": "runtime 未就绪"}
@@ -173,7 +211,18 @@ async def manual_compact(user_id, session_id, keep=6, instructions=""):
 
 
 async def enforce_soft_limit(user_id, session_id, pending_text=""):
-    """Soft-line auto compaction before a turn. Returns stats dict or None."""
+    """Soft-line auto compaction before a turn. Returns stats dict or None.
+
+    外层持**会话级压缩锁**：整个「读 → 摘要 → 写」序列必须互斥，
+    否则并发的硬线裁剪会被这里的写回覆盖（见 `compaction_lock` 的说明）。
+    锁**故意包住 LLM 摘要调用**——摘要基于的输入必须与最终写回一致，
+    中途放锁等于允许别人在中间改历史。
+    """
+    async with compaction_lock(user_id, session_id):
+        return await _enforce_soft_limit_locked(user_id, session_id, pending_text)
+
+
+async def _enforce_soft_limit_locked(user_id, session_id, pending_text=""):
     hub = get_hub()
     if hub is None:
         return None
@@ -257,7 +306,16 @@ async def enforce_soft_limit(user_id, session_id, pending_text=""):
 
 
 async def enforce_hard_limit(user_id, session_id):
-    """Hard-line: drop oldest messages (no LLM). Returns stats or None."""
+    """Hard-line: drop oldest messages (no LLM). Returns stats or None.
+
+    与软线共用同一把会话级压缩锁：两者都是「读 → 改 → 写」，
+    并发会丢失更新（硬线刚裁的消息被软线的写回覆盖 -> 下次仍超窗）。
+    """
+    async with compaction_lock(user_id, session_id):
+        return await _enforce_hard_limit_locked(user_id, session_id)
+
+
+async def _enforce_hard_limit_locked(user_id, session_id):
     hub = get_hub()
     if hub is None:
         return None
