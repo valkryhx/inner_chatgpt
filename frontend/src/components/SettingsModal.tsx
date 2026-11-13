@@ -245,31 +245,42 @@ function LlmEditor({
   const [effortProbing, setEffortProbing] = useState(false)
 
   const editingId = config?.id || ''
+  // 用户是否显式选择了「自定义模型 ID…」。
+  // 单独一个状态而不是"值在不在候选里"：后者会让输入框在打字过程中消失。
+  // 初始值来自已有配置——编辑一条非候选模型时，直接进自定义态。
+  const [customMode, setCustomMode] = useState(false)
   const setF = <K extends keyof LlmForm>(k: K, v: LlmForm[K]) =>
     setForm((f) => ({ ...f, [k]: v }))
 
-  // 编辑态：已保存的模型名一定要出现在候选里。
-  // 这是"编辑不该看起来像新增"的另一半保证——即使还没拉过 /models，
-  // 下拉也要显示这条配置自己的模型名，而不是退回"自定义模型 ID"。
+  // 候选模型来源，按优先级：
+  //   1. 端点 /models 查到的真实列表（唯一可靠来源）
+  //   2. 编辑态已保存的模型名（保证不丢值、也不退回"自定义"）
+  // **不把 form.model 无条件塞进来**：那样用户每敲一个字符，该值就变成
+  // "已知模型"，自定义输入框会在第一次按键后消失（实测踩到过）。
   const modelOptions = (() => {
     const byValue = new Map<string, string>()
     if (remoteModels) {
       for (const m of remoteModels) byValue.set(m.id, m.owned_by ? `${m.id} · ${m.owned_by}` : m.id)
     }
     if (config?.model) byValue.set(config.model, config.model)
-    if (form.model && !byValue.has(form.model)) byValue.set(form.model, form.model)
     return Array.from(byValue, ([value, label]) => ({ value, label }))
   })()
   const knownModel = modelOptions.some((m) => m.value === form.model)
-  // 只有用户显式选了「自定义」才进自定义分支；有值但不在候选里时，
-  // 仍把它当已知值展示（编辑旧配置的常见情况）。
-  const selectValue = knownModel ? form.model : MODEL_CUSTOM
+  // 何时显示"自定义模型 ID"输入框：
+  //   - 用户主动选了「自定义模型 ID…」（customMode）
+  //   - 或者当前值确实不在候选里（新增态：候选为空，必须能手填）
+  // 两个条件取或。**不用"值在不在候选"单独决定**——那会让输入框在打字
+  // 过程中消失（第一个字符使值进入候选 -> knownModel 变 true -> 框没了）。
+  const showCustomInput = customMode || !knownModel
+  // 下拉显示什么：自定义态显示「自定义模型 ID…」；否则显示当前模型名。
+  const selectValue = showCustomInput ? MODEL_CUSTOM : form.model
 
   const selectModel = (value: string) => {
     if (value === MODEL_CUSTOM) {
-      // 进入自定义：清空以便重填，但如果原来有值也不该丢——保留在输入框里
+      setCustomMode(true)
       return
     }
+    setCustomMode(false)
     setF('model', value)
   }
 
@@ -425,15 +436,22 @@ function LlmEditor({
                 }
               }}
             >
+              {/* 候选为空时（新增态还没探测），用一个占位选项解释该怎么拿列表。
+                  它复用 MODEL_CUSTOM 的 value——但下面那行就**不再**重复渲染
+                  「自定义模型 ID…」，否则同一 value 会出现两个 option。 */}
               {modelOptions.length === 0 && (
                 <option value={MODEL_CUSTOM}>
-                  {probing ? '正在获取模型列表…' : '（填好 Base URL 与 Key 后点「获取模型」）'}
+                  {probing
+                    ? '正在获取模型列表…'
+                    : '（填好 Base URL 与 Key 后点「获取模型」，或直接在下方手填）'}
                 </option>
               )}
               {modelOptions.map((m) => (
                 <option key={m.value} value={m.value}>{m.label}</option>
               ))}
-              <option value={MODEL_CUSTOM}>自定义模型 ID…</option>
+              {modelOptions.length > 0 && (
+                <option value={MODEL_CUSTOM}>自定义模型 ID…</option>
+              )}
             </select>
             <button
               type="button"
@@ -445,11 +463,21 @@ function LlmEditor({
               {probing ? '获取中…' : '获取模型'}
             </button>
           </div>
-          {probeError && <span className="field-error">{probeError}</span>}
-          {remoteModels && !probeError && (
-            <span className="field-help ok">已从端点读取 {remoteModels.length} 个模型</span>
-          )}
-          {!knownModel && (
+          {/* 状态行固定占位：探测成功/失败/进行中会切换文字，
+              但如果只在有内容时才渲染，下方整块内容会被顶下去约 23px
+              （实测），表现为"页面抖一下"。这里让它始终占位、只换文字。 */}
+          <span className={`field-help model-status${
+            probeError ? ' is-error' : remoteModels ? ' ok' : ''}`}>
+            {probing
+              ? '正在从端点读取模型列表…'
+              : probeError
+              ? probeError
+              : remoteModels
+              ? `已从端点读取 ${remoteModels.length} 个模型`
+              : /* 占位符：保持行高，内容为不可见空格 */
+                ' '}
+          </span>
+          {showCustomInput && (
             <input
               value={form.model}
               onChange={(e) => setF('model', e.target.value)}

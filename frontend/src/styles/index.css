@@ -485,6 +485,16 @@ textarea, input { caret-color: var(--clay); }
 .model-pick-row select { flex: 1; min-width: 0; }
 .model-pick-row .ghost-btn { flex: none; white-space: nowrap; }
 .field-help.ok { color: #2f7d4f; }
+/* 模型探测状态行：始终占位，只换文字。
+   实测「成功」那行出现时会把下方内容顶下去 23px，用户看到的就是页面抖一下。
+   固定 min-height 让三种状态（读取中 / 成功 / 失败）和空占位共用同一行高。 */
+.field-help.model-status {
+  display: block;
+  min-height: 1.5em;       /* 与 line-height 一致，空占位也撑住这一行 */
+  color: var(--muted);
+}
+.field-help.model-status.ok { color: #2f7d4f; }
+.field-help.model-status.is-error { color: var(--danger); }
 .field-error {
   font-size: 11px; line-height: 1.5; color: var(--danger);
   word-break: break-word;
