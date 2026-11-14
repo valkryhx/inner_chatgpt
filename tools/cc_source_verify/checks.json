@@ -691,6 +691,56 @@
    "file": "m0191_0x1155a4cc.js",
    "line": 2419,
    "must_contain": "idleFlushSeconds"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 2592,
+   "must_contain": "fet() !== null"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 2594,
+   "must_contain": "tengu_slate_thimble"
+  },
+  {
+   "file": "m0040_0x11239205.js",
+   "line": 5124,
+   "must_contain": "function ye()"
+  },
+  {
+   "file": "m0040_0x11239205.js",
+   "line": 5125,
+   "must_contain": "isInteractive"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 3834,
+   "must_contain": "settingsHooksOff"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 3849,
+   "must_contain": "zd(T, G.messages"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 3850,
+   "must_contain": "C7s(G"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 10414,
+   "must_contain": "throughStopHooks"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 10074,
+   "must_contain": "Jd(N, ie"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 1254,
+   "must_contain": "V$t() || er()"
   }
  ]
 }
