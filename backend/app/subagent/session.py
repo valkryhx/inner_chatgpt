@@ -28,7 +28,9 @@ from ..builtin_tools import build_builtin_tools
 from ..scope import TeamScope
 from ..team_host import TeamHost
 from ..team_tools import build_lead_tools
-from ..tool_policy import POLICY_FULL, filter_tools as filter_tool_policy, normalize as normalize_policy
+from ..tool_policy import (POLICY_FULL, allows_memory_read, allows_memory_write,
+                           filter_tools as filter_tool_policy,
+                           normalize as normalize_policy)
 from ..tools import ToolRegistry
 from .capabilities import ORCHESTRATION_TOOLS
 from .context import AgentContext
@@ -232,6 +234,7 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
     # 3) 独立的 AgentLoop：**必须挂主对话的 history_store**，
     #    否则主对话的 assistant/tool 消息不会落 session_history，下一轮上下文就丢了。
     #    （子代理用独立的侧链表，与这里无关。）
+    #
     # 记忆注入器：包在 _lead_injector **外面**（背景知识先于本轮新发生的事）。
     # 注意它读的是 team_ctx.user_id（闭包），不从请求参数反查 —— A2A / 子代理
     # 路径上反查会取到错误的主体（记忆方案 §2.3 第三条保证）。
@@ -241,13 +244,26 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
     # 记忆会既以 `[记忆]` 又以 `[记忆·相关]` 注入两遍 —— 2026-11-14 真机实测
     # 就是 `injected_count=2` 且内容完全相同。集合必须**同一个对象**。
     from ..memory_inject import MemoryInjector, wrap_with_memory
+    # 读侧按档位裁剪（见 tool_policy.allows_memory_read）：chat_only 连记忆
+    # 都不该看到 —— 它的契约是「什么都不碰」，否则三档不是严格包含的阶梯。
     _shared_slugs: set[str] = set()
-    _memory_injector = MemoryInjector(team_ctx.user_id, injected_slugs=_shared_slugs)
+    _memory_injector = (
+        MemoryInjector(team_ctx.user_id, injected_slugs=_shared_slugs)
+        if allows_memory_read(policy_level) else None
+    )
 
     # 轮次收尾钩子（M4 后台记忆提取）。team 路径的 loop 是本轮新建的，
     # 直接在这里挂；SSE 层的 _install_memory_turn_end 见到 _memory_aware
     # 就不会重复挂（一个 loop 只能有一个钩子）。
-    from ..memory_extract import make_turn_end_hook as _make_turn_end_hook
+    #
+    # ⚠️ 必须按 tool_policy 裁剪：这个钩子会在轮末**写记忆**，而它不经过
+    # registry（`tool_policy` 的常规兜底是「registry 里没有该工具」）。
+    # 不裁的话，A2A 的 read_only / chat_only token 会拿到一条绕过 registry
+    # 的写入通道 —— 写入的内容还会在**下一个会话**里被当成用户事实注入，
+    # 是一次用户看不见的持久副作用。这正是「只读」要禁止的事。
+    _make_turn_end_hook = None
+    if allows_memory_write(policy_level):
+        from ..memory_extract import make_turn_end_hook as _make_turn_end_hook
 
     class _TurnEndUR:
         """钩子只需要 user_id 与 client，不需要完整的 UserRuntime。"""
@@ -327,8 +343,9 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
         message_injector=wrap_with_memory(_lead_injector, _memory_injector),
         # 收工前的团队闸：队友还在跑就别结束这一轮
         team_gate=_team_gate,
-        # 轮次正常收尾时的后台记忆提取（每件独立，失败不影响本轮）
-        on_turn_end=_make_turn_end_hook(_turn_end_ur),
+        # 轮次正常收尾时的后台记忆提取（每件独立，失败不影响本轮）。
+        # 非 full 档为 None —— 见上面 _make_turn_end_hook 处的说明。
+        on_turn_end=_make_turn_end_hook(_turn_end_ur) if _make_turn_end_hook else None,
     )
     # 标记：本注入器已经会 drain 用户插话队列。非 team 路径据此避免再装一个，
     # 否则同一条消息会被两个注入器各取一次（其中一次取到空，看起来没事，

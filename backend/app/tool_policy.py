@@ -57,6 +57,46 @@ def allows(name: str, policy: str) -> bool:
     return name in READ_ONLY_TOOLS
 
 
+# --------------------------------------------------------------------------
+# 记忆的两条旁路：它们**不经过 registry**，所以 `allows()` 管不到
+# --------------------------------------------------------------------------
+#
+# 记忆有四个进出点，只有 ① 走 registry：
+#
+#   ① 模型调 memory_list / memory_read / memory_write   → registry（allows 覆盖）
+#   ② 读侧注入（MemoryInjector / 选择器预取）            → 不走 registry
+#   ③ 写侧后台提取（AgentLoop.on_turn_end 钩子）          → 不走 registry
+#   ④ dream 巡检合并                                      → 服务端维护任务，与 token 无关
+#
+# ②③ 必须单独判，否则「chat_only 拿不到任何工具」和「chat_only 动不到任何东西」
+# 是两回事 —— 这个区别在 2026-11-14 的 M5 实测里漏了：read_only / chat_only
+# 的 token 仍然挂着后台提取钩子，等于拿到一条绕过 registry 的**写**通道，
+# 而且写进去的内容会在下一个会话里被当成用户事实注入（用户看不见的持久副作用）。
+#
+# 三档的记忆语义（严格包含，逐档收窄）：
+#
+#   full       读 ✅  写 ✅   —— 与网页端完全一致
+#   read_only  读 ✅  写 ❌   —— 「看得到的都看得到，但什么都别动」
+#   chat_only  读 ❌  写 ❌   —— 「什么都不碰」。它的文案是「不注入任何工具」，
+#                              把记忆注入也算进来才自洽：否则最严的一档反而
+#                              能看到用户最私人的内容，阶梯就断了。
+#
+# 为什么 read_only 保留读：读的边界是 user_id，token 已经把它绑死了，
+# 读自己用户的记忆不构成越权（对照 CC：MCP 记忆库在只读场景同样可读不可写）。
+MEMORY_READ_POLICIES = frozenset({POLICY_FULL, POLICY_READ_ONLY})
+MEMORY_WRITE_POLICIES = frozenset({POLICY_FULL})
+
+
+def allows_memory_read(policy: str) -> bool:
+    """记忆**读侧**（注入、选择器预取）是否生效。"""
+    return normalize(policy) in MEMORY_READ_POLICIES
+
+
+def allows_memory_write(policy: str) -> bool:
+    """记忆**写侧**（后台提取）是否生效。"""
+    return normalize(policy) in MEMORY_WRITE_POLICIES
+
+
 def filter_tools(tools: Sequence[Any], policy: str) -> list[Any]:
     level = normalize(policy)
     if level == POLICY_FULL:
@@ -70,5 +110,5 @@ def describe(level: str) -> str:
         return "完整权限：内置文件/执行工具 + MCP + 子代理编排 + GA"
     if level == POLICY_READ_ONLY:
         return ("只读：file_read / list_files / load_skill / memory_list / memory_read；"
-                "无写入、无执行、无 MCP、无编排、无 GA")
-    return "纯对话：不注入任何工具"
+                "无写入、无记忆写入、无执行、无 MCP、无编排、无 GA")
+    return "纯对话：不注入任何工具，也不注入记忆"

@@ -156,7 +156,7 @@
   临时 MCP server 重启复现），全部 0 失败，含反向确认。
 - 详见 `docs/20261110-MCP与Hlaudz全链路测试与缺陷修复.md`。
 
-**P9：记忆系统 —— M1/M2/M3/M3.5/M4/M4.5 已完成（2026-11-14），M5 未开工。**
+**P9：记忆系统 —— M1/M2/M3/M3.5/M4/M4.5/M5 已完成（2026-11-14）。**
 
 - 最小可用集已跑通：**手工记忆（模型调 `memory_write` 或用户手写 `.md`）+ 关键词/类型排序注入 +
   每用户隔离 + 设置页可审计可删除**。自动提取（`HLZ_MEMORY_AUTO_WRITE`）按方案保持**默认关闭**。
@@ -232,9 +232,34 @@
   必定先抢走 slug。按方案 §3.7「选择器与 AutoMem 互斥」改为 `keyword_injection_enabled()`
   让位，**不叠加**（叠加等于让这个功能白做，还会让用户误以为选择器在起作用）。
   验证：**41 项新测 + 13 条变异全部被抓 + 全量 1053 passed**。
+- **M5（A2A 档位 + 跨用户 e2e）已完成，抓到一个真实越权缺陷**：`tool_policy` 的
+  保证是「运行期靠 registry 里没有该工具兜底」，但记忆有**四个**进出点，只有
+  「模型调 `memory_*`」那一条走 registry —— **读侧注入（`MemoryInjector` /
+  选择器预取）与写侧后台提取（`on_turn_end` 钩子）都不走**。实测确认：
+  `read_only` / `chat_only` 的 token **仍然挂后台提取钩子**，等于拿到一条绕过
+  registry 的写入通道，写进去的内容还会在**下一个会话**里被当成用户事实注入
+  （用户看不见的持久副作用）。
+  修法：`tool_policy.py` 新增 `allows_memory_read()` / `allows_memory_write()`，
+  **判据集中一处**（散开就迟早漏一处，本次缺陷正是「session 判了、sse 没判」的典型），
+  三个安装点（`subagent/session.py`、`sse.py` 的注入器与钩子安装器）只负责「问一句」，
+  并由 `_TurnUR` 透传 `tool_policy`（否则 sse 层永远看到默认 full）。
+  **三档定为严格包含的阶梯**：full 读写全开 / read_only 读开写关 / chat_only 读写全关。
+  chat_only 连读也掐，是因为「最严的一档反而是唯一能看到用户私人记忆的档」会让阶梯断掉；
+  read_only 保留读，因为读的边界是 user_id，token 已绑死（对照 CC 的 MCP 记忆库可读不可写）。
+  `MemoryInjector` 本身**不**判档位（闸在安装点）—— 否则「直接构造注入器」的正当用法
+  都要重传 policy，闸会重新散开。
+  验证：**17 项单测 + 3 条反向确认逐条变红**；L3 真机 4 场景全绿 ——
+  S-M4a（只读 token 工具面只有 `memory_list`/`memory_read`，无 `memory_write`，
+  runId `1794658763-33de`）、**S-M4b 只读零写入 0→0**（`1794658775-2c77`，105.6s）、
+  **S-M4c 正向对照同一提示词 full token 0→1**（`1794658898-1827`，105.9s）、
+  S-M3 跨用户隔离（A 复述哨兵、B 答「两个查询都返回 0 条」，`1794659010-26a5`）。
+  **S-M4b 与 S-M4c 是一对，缺一不可** —— 没有正向对照，「零写入」可能只是空断言。
+  跑法：`cd backend && python -m tests.e2e.memory_a2a_cases`（后端须以
+  `work/_launch_m5.py` 启动：`HLZ_MEMORY_AUTO_WRITE=1` + `HLZ_MEMORY_SELECTOR=0`）。
 - **未完成：真·多 worker（`workers=N`）实测**。若改多 worker 部署，需重跑
   `multi_process_lock.py` 并验证 lifespan 里 `recover_dream_state()` 被多 worker 并发调用的行为。
 - 详见 `docs/20261114-记忆系统M3.5选择性召回实施记录.md`、
+  `docs/20261114-记忆系统M5-A2A档位与跨用户隔离.md`、
   `docs/20261114-记忆系统M1-M3实施记录.md`（§11 是 M4.5 专章）与
   `docs/20261114-记忆系统三项未覆盖验证记录.md`；设计与分阶段计划见 `docs/20261112-Hlaudz记忆系统实施方案.md`。
 
@@ -247,6 +272,7 @@
 | `docs/20261114-CC319记忆机制源码复核v3.md` | **CC 记忆机制复核（最新，权威，6 项疑似已清零）**：对 v2 逐条回源复核（63 个行号区间 + 55 条解释性结论），定案 6 处 v2 错误——① `MEMORY.md` 默认走 `instructions` attachment 而非 system prompt（`n0n()` 默认 true → announced）；② `memory_list` 定义在 `m0816:2988`（v2 指的 `m0591:75831` 是 `memory_read` 的 schema），有 `cursor`/默认页 50；③ 索引 cap 25000 是 UTF-16 code unit 不是字节（单文件召回 4096 才是真字节）；④ `Dl()` 非主拼装器（主路径是 `li`/`Ll`）且不含类型表/禁止清单；⑤ `aY()` 是 SDK 入口判定；⑥ 28 个环境变量里 2 个零读取、2 个只写不读。**另含 6 项 chunk 落地后的定论**（`Gn` 剥 `[1m]`、`Cae` 确含 `system-reminder`、`rr`=远端能力、`yIe` 恒 null 致账号记忆链死代码、`DISABLE_ORG_MEMORY` 拦组织同步、`n0n()` 默认 true）+ 6 条口径提醒 + **51 条可直接引用的白名单**。**另有落地时发现的第 7 处**：闸门适用模式划分不准（第 4 道权限闸仅文件模式、`first_look` 是 MCP 专属第 8 道，文件模式下 CC 无此闸）。复现脚本 `tools/cc_source_verify/`（`build_chunk_map.py` 1764 chunk 全命中、`verify_line_refs.py` 102 项行号断言）。**与 v2 冲突以此为准** |
 | `docs/20261113-CC319记忆机制源码核实v2.md` | **CC 记忆机制权威调研（已被 v3 复核）**：6 条读路径（含 `relevant_memories` 相关性选择器、`AutoMem` 索引注入、MCP 记忆库、账号记忆）/ 2 条写路径（`extractMemories` + `auto_dream` 合并）/ 四类记忆提示词全文 / 隔离与 28 个环境变量分类，逐条带行号证据。**方向与 51 条事实成立，但有 6 处错误见 v3 §1；§7 账号记忆时序在本 build 不会真的发生，见 v3 §4.4** |
 | `docs/20261114-CC319记忆触发时机核实.md` | **CC 记忆的触发时机（写/读/dream 三者何时发生）**：写侧不是常驻后台而是「每个用户轮次结束尝试一次」（`Jd` → `executeExtractMemories` → `ir` → `ar` → `Le`），文件模式下还有 `tengu_passport_quail` 一道默认 false 的外层闸（v2/v3 均未记录）；读侧 `AutoMem` 索引每次模型调用装配时读，`relevant_memories` 选择器受 `lSe()` 门控**默认不跑**；dream 与提取器同点触发但被 24h + 5 会话 + 10min 三道时间闸压成隔天级，且**不做**「从失败中学习」。**推翻方案 §3.7 的「读侧主路径」与「每 generation 一次」两处说法** |
+| `docs/20261114-记忆系统M5-A2A档位与跨用户隔离.md` | **M5 A2A 档位（最新，已落地，抓出真实越权缺陷）**：`tool_policy` 只兜住 registry 那一条通道，记忆的**读侧注入与写侧后台提取都不走 registry** → `read_only`/`chat_only` 仍会写记忆（写进去的内容还会在下一个会话被当事实注入）。修法是 `allows_memory_read()` / `allows_memory_write()` 判据集中一处 + 三个安装点问一句 + `_TurnUR` 透传档位。**三档定为严格包含的阶梯**（chat_only 连读也掐，否则最严一档反而最能看到私人记忆）。17 项单测 + 3 条反向确认 + **4 个真机场景含正向对照**（S-M4b 零写入 0→0 必须配 S-M4c full token 0→1，否则是空断言） |
 | `docs/20261114-记忆系统M3.5选择性召回实施记录.md` | **M3.5 选择性召回（最新，已落地，默认关闭）**：`memory_prefetch.py` 的 `PrefetchHandle`（promise / settled_at / consumed_on_iteration，对齐 CC 的 `Ivi`）+ 六道入口闸 + slug 集合去重 + 会话字节预算 + 独立小模型 client。**两个挂点**（启动在轮循环前、消费在工具步骤后）为何不能合一。**S-M6 实测 62.5% → 100%（44 条记忆 / 8 条无字面重合查询）、S-M7 启动 4.9ms / settle 中位 183ms**。**真机抓到的两个缺陷**：① 共享去重集合缺失导致同一条记忆注入两遍；② 关键词路径抢 slug 致选择器白跑 → 改为互斥。41 项单测 + 13 条变异 + 全量 1053 passed。§6 顺带用 9.9μs 实测回答「`AgentLoop` 为何必须每轮新建」 |
 | `docs/20261114-记忆系统三项未覆盖验证记录.md` | **记忆三项未覆盖验证（最新，其中一项抓出真缺陷）**：① Playwright UI **52/52**（`tools/memory_verify/ui_dream.py`，8 截图，含「按钮在可视区内」「原生 confirm 要显式接管」「落库核对不能用列表文本」三个只有真浏览器能发现的设计点，以及一次「截图残留」误报的排查记录）；② 进程内并发 6 场景（`concurrent_write.py`）—— **抓出 `memory_delete` 无版本保护导致的数据丢失（C-2b，100% 可复现）**，修法是「先读后删 + 读后未变」两道代码级闸，并解释为何不靠 prompt、不要求模型传 if_version；③ 跨进程锁 4 场景（`multi_process_lock.py`）—— 用两个真实进程而非 uvicorn --workers（后者在 `multiprocessing.spawn` 下要 `if __name__` 保护），33–35 次抢锁、持锁窗口两两不重叠。**另含 C-3 判据纠错**（索引并发期允许陈旧，因为 `MEMORY.md` 目前无运行期读取者；只验收敛性 + 无幽灵行），以及 `last_consolidated=0` 时首次不受时间闸约束这一「碰巧成立」语义的钉住 |
 | `docs/20261114-记忆系统M1-M3实施记录.md` | **记忆 M1–M4.5 实施记录（最新，已落地，含 L3 真机 e2e）**：`memory_store.py`（文件即真相 + DB 索引 + `_reconcile` 自愈 + `cursor` 分页 + `if_version` CAS + 两套预算口径）/ `memory_tools.py`（三件套，子代理在装配处就被裁掉）/ `memory_inject.py`（`wrap_with_memory` 组合、slug 集合去重、`_volatile` 在 `HistoryStore` 统一剥离）/ `routers/memory.py` + 设置页「我的记忆」tab。**§11 是 M4.5 dream 专章**：巡检任务 + DB 行锁 + 启动收敛 + `index_pending` 可重入 + dream 专属 `memory_delete` + 三道代码级闸 + 提示词为何没有照抄 CC。**168 项测试 + 15 项反向确认 + 11 条变异 + L2 集成 + 6 个 L3 真机 e2e（S-M1~S-M5、S-M8）**；顺带修掉 steer 跨代失效与注入路径 O(文件内容) 两处既有缺陷 |

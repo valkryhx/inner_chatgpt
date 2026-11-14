@@ -167,7 +167,7 @@ export default function A2aSection() {
               ? agent.tool_policies
               : [
                   { id: 'full', description: '完整权限：内置文件/执行工具 + MCP + 子代理编排 + GA' },
-                  { id: 'read_only', description: '只读：file_read / list_files / load_skill' },
+                  { id: 'read_only', description: '只读：file_read / list_files / load_skill / memory_list / memory_read（不写记忆）' },
                   { id: 'chat_only', description: '纯对话：不注入任何工具' },
                 ]
             ).map((p) => (

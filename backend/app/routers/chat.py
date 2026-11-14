@@ -161,6 +161,9 @@ class _TurnUR:
         # 插话队列按 generation 定位；team 路径的注入器已经会 drain，
         # 这里带上是为了「没有 team 时的普通路径」能用同一个键。
         self.generation_id = getattr(turn, "generation_id", "")
+        # 本轮能力档位。sse 层据此决定要不要挂「会写记忆」的后台钩子 ——
+        # 那条钩子不经过 registry，是 tool_policy 覆盖不到的第二条写通道。
+        self.tool_policy = getattr(turn, "tool_policy", "") or "full"
 
 logger = logging.getLogger(__name__)
 

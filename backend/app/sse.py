@@ -151,6 +151,15 @@ def _install_memory_injector(ur, user_id: str, session_id: str, user_text: str) 
     loop = getattr(ur, "loop", None)
     if loop is None:
         return
+    # 记忆读侧按档位裁剪（见 tool_policy.allows_memory_read）：
+    # chat_only 的契约是「什么都不碰」，连记忆都不该看到。
+    # read_only 保留读 —— 读的边界是 user_id，token 已经绑死。
+    try:
+        from .tool_policy import allows_memory_read
+        if not allows_memory_read(getattr(ur, "tool_policy", "") or "full"):
+            return
+    except Exception:  # noqa: BLE001
+        pass
     try:
         from .memory_inject import install_memory_injector
         # team 路径（subagent/session.py）已经装过记忆注入器。此时**不能**再装一个：
@@ -177,10 +186,24 @@ def _install_memory_turn_end(ur, user_id: str) -> None:
 
     为什么 ``AgentLoop`` 不直接知道记忆：钩子是它唯一知道的形态。
     这样 agent_loop 不 import 记忆模块，记忆关了也不会在核心里留死代码。
+
+    ⚠️ 按 ``tool_policy`` 裁剪：这个钩子会**写记忆**，且不经过 registry，
+    所以 ``tool_policy`` 的常规兜底（「registry 里没有该工具」）管不到它。
+    只读 / 纯对话档若挂上，就等于给了它们一条绕过 registry 的写通道，
+    写入的内容还会在下一个会话里被当成用户事实注入（M5 发现的缺陷）。
+
+    ⚠️ 读侧注入（``_install_memory_injector``）**不裁**：记忆的读边界是
+    user_id，token 已经绑死，读自己的记忆不构成越权。
     """
     loop = getattr(ur, "loop", None)
     if loop is None:
         return
+    try:
+        from .tool_policy import allows_memory_write
+        if not allows_memory_write(getattr(ur, "tool_policy", "") or "full"):
+            return
+    except Exception:  # noqa: BLE001
+        pass
     # team 路径（subagent/session.py）已经在构造里挂了钩子。
     # 一个 loop 只能有一个 on_turn_end，重复挂会顶掉前一个。
     if getattr(loop, "_memory_aware", False):
