@@ -58,12 +58,29 @@ async def lifespan(app: FastAPI):
         await memory_store.init_tables()
     except Exception:
         pass
+    # dream 状态表 + 启动收敛（清残留锁、running -> interrupted）。
+    # **只收敛不补跑**：启动时正要连 MCP、建连接池，dream 会抢资源拖慢首帧。
+    # 与 subagent_store / team_store 的 recover_* 是同一类问题、同一套解法。
+    try:
+        from . import memory_dream
+        await memory_dream.init_tables()
+        await memory_dream.recover_dream_state("server restart")
+    except Exception:
+        pass
     hub = RuntimeHub()
     await hub.startup()
     set_hub(hub)
+    dream_handle = None
     try:
+        # 记忆合并巡检任务（M4.5）。默认 600s 醒一次，内置 24h / 5 会话三道闸。
+        from . import memory_dream
+        if memory_dream.dream_enabled():
+            dream_handle = memory_dream.start_dream_loop(
+                memory_dream.default_client_provider)
         yield
     finally:
+        if dream_handle is not None:
+            await dream_handle.stop()
         await hub.shutdown()
         set_hub(None)
 

@@ -1,4 +1,4 @@
-"""记忆系统 L3 真实 e2e：S-M1 / S-M2 / S-M3 / S-M5。
+"""记忆系统 L3 真实 e2e：S-M1 / S-M2 / S-M3 / S-M4 / S-M5 / S-M8。
 
 按 `.claude/skills/hlaudz-e2e/SKILL.md` 的铁律：真 LLM、唯一 runId、事件落盘、哨兵 token、
 **负对照**。这里额外被测的两件事在方案 §7.2：
@@ -8,7 +8,9 @@
 | S-M1 | 第一轮交代偏好 -> 第二轮新 generation 问「你知道我的偏好吗」-> 必须答出 |
 | S-M2 | 全程中文 >= 3 轮，验证 prose 闸门不会误杀中文（CJK 计数的真机验证） |
 | S-M3 | A 用户说过偏好，B 用户问同一句 -> **必须说没有**（负对照，最重要） |
+| S-M4 | 模型本轮没主动写记忆，后台提取兜底写入（需 HLZ_MEMORY_AUTO_WRITE=1） |
 | S-M5 | 开/关记忆的 TTFT 差异 < 1500ms（远超 100ms 硬指标，但先量出基线） |
+| S-M8 | 5 条重复记忆 -> dream 合并：条数下降、**内容不丢**、索引重建（M4.5） |
 
 跑法::
 
@@ -406,8 +408,141 @@ async def case_sm4(client: httpx.AsyncClient, token: str, out: Path) -> dict:
     }
 
 
+async def _user_id(client: httpx.AsyncClient, token: str) -> str:
+    """从 /api/auth/me 拿 user_id；拿不到返回空串（调用方按「无法核对」处理）。"""
+    for path in ("/api/auth/me", "/api/me"):
+        try:
+            r = await client.get(path, headers={"Authorization": f"Bearer {token}"})
+            if r.status_code != 200:
+                continue
+            payload = r.json() or {}
+            uid = str((payload.get("user") or {}).get("id") or payload.get("id") or "")
+            if uid:
+                return uid
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
+async def case_sm8(client: httpx.AsyncClient, token: str, out: Path) -> dict:
+    """S-M8：dream **真的把重复记忆合并了**（真 LLM，M4.5 的核心证据）。
+
+    造 5 条讲同一件事的记忆（不同 slug、不同措辞、其中一条带相对日期
+    「上周三」），然后调「立即整理」，验证：
+
+    1. 条数下降（真的合并了，不是「原样不动」）；
+    2. **内容没丢** —— 保留者里仍有哨兵与核心事实。这条最重要：
+       一个「删了但没合并」的实现也能让条数下降，那是数据丢失不是整理；
+    3. 索引被重建，且条数与实际条数一致；
+    4. 相对日期被换成绝对日期或去时间化的说法（方案 §4.6 的第 2 个设计点）。
+
+    前置：后端需要有一条可用的用户模型配置（dream 用用户自己的模型）。
+    """
+    status = await client.get("/api/me/memories/status",
+                              headers={"Authorization": f"Bearer {token}"})
+    status.raise_for_status()
+    st = status.json()
+    dream = st.get("dream") or {}
+    if not dream.get("enabled"):
+        return {
+            "case": "S-M8",
+            "checks": [{"kind": "precondition", "ok": False,
+                        "detail": "dream 未启用（HLZ_MEMORY_DREAM_ENABLED=0 "
+                                  "或 HLZ_MEMORY_DISABLED=1）"}],
+            "ok": False,
+        }
+
+    # 5 条讲同一件事的记忆，措辞各异，其中一条用相对日期
+    dupes = [
+        ("call-pref-a", "用户要求以后叫他「老徐」",
+         f"# 称呼\n\n用户明确说过：以后都叫他「老徐」。\n\n标记 {SENTINEL}\n"),
+        ("call-pref-b", "称呼偏好：叫老徐，不要用全名",
+         "用户不喜欢被叫全名，希望被称呼为老徐。\n"),
+        ("call-pref-c", "用户的名字/称呼",
+         "他姓徐，习惯被叫「老徐」。\n"),
+        ("call-pref-d", "上周三说过要叫老徐",
+         "上周三他提过一次：以后称呼他老徐。\n"),
+        ("call-pref-e", "称呼方式确认",
+         "确认：称呼上用「老徐」，与「用户称呼」那条是同一件事。\n"),
+    ]
+    for slug, desc, body in dupes:
+        await _write_memory(client, token, slug=slug, title=desc,
+                            description=desc, content=body, kind="user")
+
+    before = await _list_memories(client, token)
+    before_slugs = {e["slug"] for e in before.get("entries") or []}
+    before_total = int(before.get("total") or 0)
+
+    # 「立即整理」：跳过 24h / 5 会话两道闸（真 LLM 调用，可能几十秒）
+    r = await client.post("/api/me/memories/dream",
+                          headers={"Authorization": f"Bearer {token}"}, timeout=600)
+    r.raise_for_status()
+    dream_out = r.json()
+
+    after = await _list_memories(client, token)
+    after_slugs = {e["slug"] for e in after.get("entries") or []}
+    after_total = int(after.get("total") or 0)
+
+    # 读全部正文，确认哨兵与核心事实都还在
+    bodies: dict[str, str] = {}
+    for slug in after_slugs:
+        rr = await client.get(f"/api/me/memories/{slug}",
+                              headers={"Authorization": f"Bearer {token}"})
+        if rr.status_code == 200:
+            d = rr.json()
+            bodies[slug] = (d.get("content") or "") + "\n" + (d.get("description") or "")
+    all_text = "\n".join(bodies.values())
+
+    # 索引：MEMORY.md 的行数与实际条数一致（不该有指向已删条目的幽灵行）
+    index_rows = 0
+    try:
+        from app import memory_store as ms
+        uid = await _user_id(client, token)
+        if uid:
+            ipath = ms.index_path(uid)
+            if ipath.exists():
+                text = ipath.read_text(encoding="utf-8")
+                index_rows = sum(1 for ln in text.split("\n") if ln.startswith("- ["))
+    except Exception:  # noqa: BLE001 - 索引核对是加分项，读不到不判失败
+        index_rows = -1
+
+    merged_slugs = before_slugs - after_slugs
+    checks = [
+        {"kind": "dream_ran", "ok": bool(dream_out.get("ran")),
+         "detail": f"ran={dream_out.get('ran')} reason={dream_out.get('reason')}"},
+        {"kind": "count_reduced", "ok": after_total < before_total,
+         "detail": f"{before_total} -> {after_total}（写入 {dream_out.get('written')}，"
+                   f"删除 {dream_out.get('deleted')}）"},
+        {"kind": "something_deleted", "ok": bool(merged_slugs),
+         "detail": f"消失的 slug：{sorted(merged_slugs)}"},
+        # 最重要的一条：条数下降必须来自「合并」，不是「丢了」
+        {"kind": "content_preserved", "ok": SENTINEL in all_text and "老徐" in all_text,
+         "detail": f"哨兵在？{SENTINEL in all_text}；老徐在？{'老徐' in all_text}"},
+        {"kind": "index_rebuilt", "ok": bool(dream_out.get("index_rebuilt")),
+         "detail": str(dream_out.get("index_rebuilt"))},
+        {"kind": "index_matches_count",
+         "ok": index_rows < 0 or index_rows == after_total,
+         "detail": f"索引行 {index_rows} / 实际 {after_total}"},
+        # 相对日期应被转成绝对日期或去时间化的说法
+        {"kind": "relative_date_fixed",
+         "ok": "上周三" not in all_text,
+         "detail": f"正文里还有「上周三」？{'上周三' in all_text}"},
+    ]
+    return {
+        "case": "S-M8",
+        "checks": checks,
+        "ok": all(c["ok"] for c in checks),
+        "before_total": before_total,
+        "after_total": after_total,
+        "before_slugs": sorted(before_slugs),
+        "after_slugs": sorted(after_slugs),
+        "dream": dream_out,
+        "bodies": {k: v[:300] for k, v in bodies.items()},
+    }
+
+
 CASES = {"S-M1": case_sm1, "S-M2": case_sm2, "S-M3": case_sm3,
-         "S-M4": case_sm4, "S-M5": case_sm5}
+         "S-M4": case_sm4, "S-M5": case_sm5, "S-M8": case_sm8}
 
 
 async def main(argv: list[str]) -> int:

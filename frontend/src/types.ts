@@ -394,6 +394,22 @@ export interface MemoryDetail extends MemoryEntry {
   content: string
 }
 
+export interface DreamState {
+  enabled: boolean
+  /** 上次**成功**合并的时刻（ms）；0 = 从没跑过 */
+  last_consolidated?: number
+  /** 上次**开始**的时刻（ms），用于诊断「反复在同一处崩」 */
+  last_attempt?: number
+  /** idle | running | failed | interrupted */
+  last_status?: string
+  last_error?: string
+  runs?: number
+  /** Phase 3 成功了但索引还没重建；下一轮巡检会补上 */
+  index_pending?: boolean
+  min_hours?: number
+  min_sessions?: number
+}
+
 export interface MemoryStatus {
   enabled: boolean
   /** 自动提取开关：默认 false。开着才会「自己长东西」，需要用户知情 */
@@ -403,6 +419,18 @@ export interface MemoryStatus {
   total: number
   inject_budget: number
   inject_max: number
+  dream?: DreamState
+}
+
+export interface DreamRunResult {
+  ran: boolean
+  reason: string
+  user_id: string
+  written: string[]
+  deleted: string[]
+  index_rebuilt: boolean
+  error: string
+  elapsed_s: number
 }
  
 /* ---------- workspace 文件下载 ---------- */

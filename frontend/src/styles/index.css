@@ -646,6 +646,28 @@ textarea, input { caret-color: var(--clay); }
   background: var(--surface); border-radius: var(--r-sm);
 }
 .memory-search { display: flex; gap: 8px; align-items: center; }
+
+/* dream 合并（M4.5）。
+   与「状态条」分成两块而不是挤在一起：dream 是一个**动作**（可点），
+   状态是只读信息。混在一行里用户会以为那个按钮是筛选。 */
+.memory-dream {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+.memory-dream-head {
+  display: flex; flex-wrap: wrap; align-items: center;
+  justify-content: space-between; gap: 8px;
+}
+.memory-dream-head b { font-size: 13px; }
+.memory-dream-head .ghost-btn { flex: 0 0 auto; }
+.memory-dream-result {
+  font-size: 12px; line-height: 1.6; color: var(--ink-2);
+  padding: 7px 10px; border-radius: var(--r-sm);
+  background: var(--surface); border-left: 2px solid var(--accent);
+}
+
 .memory-search input { flex: 1; min-width: 0; }
 .memory-item { align-items: flex-start; }
 .memory-item-main { min-width: 0; flex: 1; }

@@ -22,6 +22,7 @@ import type {
   MemoryPage,
   MemoryDetail,
   MemoryStatus,
+  DreamRunResult,
   TeamSnapshot,
   WorkspaceListing,
 } from './types'
@@ -373,6 +374,9 @@ export const api = {
     }),
   deleteMemory: (slug: string) =>
     request<{ ok: boolean }>(`/me/memories/${encodeURIComponent(slug)}`, { method: 'DELETE' }),
+  /** 「立即整理」：跳过 24h / 5 会话两道闸跑一次 dream（仍然尊重锁与开关）。 */
+  runDream: () =>
+    request<DreamRunResult>('/me/memories/dream', { method: 'POST' }),
 }
 
 

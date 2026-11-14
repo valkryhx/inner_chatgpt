@@ -73,6 +73,24 @@ async def memory_status(user: dict = Depends(get_current_user)):
         total = await ms.count_memories(user["id"])
     except Exception:  # noqa: BLE001
         total = 0
+    dream_state: dict = {}
+    try:
+        from .. import memory_dream
+
+        st = await memory_dream.get_state(user["id"])
+        dream_state = {
+            "enabled": memory_dream.dream_enabled(),
+            "last_consolidated": int(st.get("last_consolidated") or 0),
+            "last_attempt": int(st.get("last_attempt") or 0),
+            "last_status": str(st.get("last_status") or "idle"),
+            "last_error": str(st.get("last_error") or ""),
+            "runs": int(st.get("runs") or 0),
+            "index_pending": bool(st.get("index_pending")),
+            "min_hours": memory_dream.min_hours(),
+            "min_sessions": memory_dream.min_sessions(),
+        }
+    except Exception:  # noqa: BLE001 - dream 状态读不到不该让整个状态接口 500
+        dream_state = {"enabled": False}
     return {
         "enabled": ms.memory_enabled(),
         "auto_write": ms.auto_write_enabled(),
@@ -81,7 +99,35 @@ async def memory_status(user: dict = Depends(get_current_user)):
         "total": total,
         "inject_budget": ms.inject_budget(),
         "inject_max": ms.inject_max_entries(),
+        "dream": dream_state,
     }
+
+
+@router.post("/me/memories/dream")
+async def run_dream_now(user: dict = Depends(get_current_user)):
+    """设置页「立即整理」：跳过时间闸与会话数闸，跑一次 dream。
+
+    仍然尊重锁与开关 —— 否则用户连点两次会并发两个 dream，
+    而它们改的是同一批文件，后写覆盖前写。
+    """
+    from .. import memory_dream
+
+    if not memory_dream.dream_enabled():
+        raise HTTPException(status_code=400,
+                            detail="dream 已被关闭（HLZ_MEMORY_DREAM_ENABLED=0）")
+    client = await memory_dream.default_client_provider(user["id"])
+    if client is None:
+        raise HTTPException(status_code=400, detail="该用户还没有可用的模型配置")
+    try:
+        out = await memory_dream.dream_once(user["id"], client, force=True)
+    finally:
+        closer = getattr(client, "aclose", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:  # noqa: BLE001
+                pass
+    return out.to_dict()
 
 
 @router.get("/me/memories/{slug}")

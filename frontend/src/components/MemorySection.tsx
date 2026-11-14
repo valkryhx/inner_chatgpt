@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { MemoryEntry, MemoryStatus } from '../types'
+import type { DreamState, MemoryEntry, MemoryStatus } from '../types'
 
 /** 记忆类型的中文标签（与后端 memory_store.KINDS 对齐）。 */
 const MEMORY_KINDS: Array<{ value: string; label: string; hint: string }> = [
@@ -19,6 +19,51 @@ function fmtDay(ms: number): string {
   const d = new Date(ms)
   const p = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+function fmtWhen(ms?: number): string {
+  if (!ms) return '从未'
+  const d = new Date(ms)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+    + `${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/** dream 的节奏说明：让用户知道它「什么时候会自己动」。 */
+function dreamSummary(d: DreamState): string {
+  if (!d.enabled) return '已关闭'
+  const hours = d.min_hours ?? 24
+  const sessions = d.min_sessions ?? 5
+  return `每 ${hours} 小时且期间有 ${sessions} 个会话活动时自动整理一次`
+}
+
+/**
+ * dream 状态标签。
+ *
+ * 为什么要暴露 `last_status` 与 `runs` 而不只是「上次整理时间」：
+ * 连续失败时「上次整理：3 天前」看不出任何问题；而
+ * 「已尝试 6 次 / 状态 failed / 原因：超时」一眼就知道它在原地打转。
+ */
+function dreamStatusTag(d: DreamState) {
+  const tags: JSX.Element[] = [
+    <span className="tag tag-ro" key="last">
+      上次整理：{fmtWhen(d.last_consolidated)}
+    </span>,
+  ]
+  if (d.last_status === 'failed') {
+    tags.push(<span className="tag tag-ro" key="st">上次失败</span>)
+  } else if (d.last_status === 'interrupted') {
+    tags.push(<span className="tag tag-ro" key="st">上次被中断</span>)
+  } else if (d.last_status === 'running') {
+    tags.push(<span className="tag tag-user" key="st">正在整理…</span>)
+  }
+  if (d.index_pending) {
+    tags.push(<span className="tag tag-ro" key="idx">索引待重建</span>)
+  }
+  if ((d.runs ?? 0) > 0) {
+    tags.push(<span className="tag tag-ro" key="runs">已跑 {d.runs} 次</span>)
+  }
+  return <div className="memory-flags">{tags}</div>
 }
 
 const EMPTY_FORM = {
@@ -49,6 +94,10 @@ export default function MemorySection() {
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  // dream「立即整理」的独立状态：它可能跑几十秒，不能和保存/删除共用一个 busy，
+  // 否则按钮会在整理期间全部变灰，用户以为界面卡死了。
+  const [dreaming, setDreaming] = useState(false)
+  const [dreamNotice, setDreamNotice] = useState<string | null>(null)
 
   // 编辑态：editing 为空 = 新建
   const [editing, setEditing] = useState<string | null>(null)
@@ -67,6 +116,36 @@ export default function MemorySection() {
       setTotal(page.total)
     } catch (e: any) {
       setError(e?.message || String(e))
+    }
+  }
+
+  const onDream = async () => {
+    setError(null)
+    setNotice(null)
+    setDreamNotice(null)
+    setDreaming(true)
+    try {
+      const r = await api.runDream()
+      if (!r.ran) {
+        setDreamNotice(`没有整理：${r.reason}`)
+      } else {
+        const parts = [
+          `写入 ${r.written.length} 条`,
+          `删除 ${r.deleted.length} 条`,
+          `索引${r.index_rebuilt ? '已重建' : '未重建'}`,
+          `耗时 ${r.elapsed_s}s`,
+        ]
+        setDreamNotice(
+          (r.error ? `整理出错（${r.error}），已处理的部分保留：` : '整理完成：')
+          + parts.join(' · '),
+        )
+      }
+      // 整理会改条数与索引，两个都要刷
+      await Promise.all([loadStatus(), load()])
+    } catch (e: any) {
+      setDreamNotice(`整理失败：${e?.message || String(e)}`)
+    } finally {
+      setDreaming(false)
     }
   }
 
@@ -196,6 +275,29 @@ export default function MemorySection() {
             </span>
             {status.disabled_by_env && <span className="tag tag-ro">环境变量已停用后台任务</span>}
           </div>
+        </div>
+      )}
+
+      {status?.dream && (
+        <div className="memory-dream">
+          <div className="memory-dream-head">
+            <div>
+              <b>记忆整理（dream）</b>
+              <span className="memory-budget">
+                {dreamSummary(status.dream)}
+              </span>
+            </div>
+            <button
+              className="ghost-btn"
+              disabled={busy || !status.dream.enabled}
+              onClick={onDream}
+              title="跳过 24 小时 / 5 会话两道闸，立刻整理一次"
+            >
+              {dreaming ? '整理中…' : '立即整理'}
+            </button>
+          </div>
+          {dreamStatusTag(status.dream)}
+          {dreamNotice && <div className="memory-dream-result">{dreamNotice}</div>}
         </div>
       )}
 
