@@ -454,6 +454,15 @@ const INJECTED_KINDS: Array<{ test: (t: string) => boolean; kind: InjectedKind }
     },
   },
   {
+    // 记忆：memory_inject 每轮注入的记忆块（前缀由 format_memory_block 固定）
+    test: (t) => t.startsWith('[记忆]'),
+    kind: {
+      label: '记忆',
+      mark: '◈',
+      strip: /^\[记忆\][^\n]*\n?/,
+    },
+  },
+  {
     // 子代理完成通知（subagent/host.py 的 _notification_chunks）
     test: (t) => t.startsWith('[任务通知]'),
     kind: {
@@ -491,6 +500,11 @@ function InjectedNote({ text }: { text: string }) {
   const body = kind.strip ? text.replace(kind.strip, '') : text
   const firstLine = body.split(NEWLINE)[0] || ''
   const multi = body.includes(NEWLINE) || body.length > firstLine.length
+  // 记忆块逐条一行，用列表展示比一整段 pre-wrap 更好读：
+  // 它是「这个用户的 N 条背景」，不是一段话。
+  const memoryLines = kind.label === '记忆'
+    ? body.split(NEWLINE).map((l) => l.trim()).filter(Boolean)
+    : null
   return (
     <div className="injected-note">
       <button type="button" className="injected-note-head" onClick={() => setOpen((v) => !v)}
@@ -500,7 +514,19 @@ function InjectedNote({ text }: { text: string }) {
         <span className="injected-note-preview">{firstLine}</span>
         {multi && <span className="injected-note-caret">{open ? '收起' : '展开'}</span>}
       </button>
-      {open && multi && <p className="injected-note-body">{body}</p>}
+      {open && multi && (
+        memoryLines ? (
+          <div className="injected-note-body">
+            <ul className="memory-lines">
+              {memoryLines.map((line, i) => (
+                <li key={i}>{line.replace(/^-\s*/, '')}</li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <p className="injected-note-body">{body}</p>
+        )
+      )}
     </div>
   )
 }

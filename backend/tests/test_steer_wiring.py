@@ -52,8 +52,15 @@ async def test_plain_path_gets_steer_injector():
 
 
 @pytest.mark.asyncio
-async def test_injector_is_idempotent():
-    """装两次不能变成两个注入器把消息取两遍。"""
+async def test_injector_is_rebuilt_each_generation_but_not_duplicated():
+    """每代重装（否则第二代丢插话），但不能变成两个注入器把消息取两遍。
+
+    旧版本这条测的是「装两次返回同一个对象」。那个语义是错的：
+    ``ur.loop`` 是 ``RuntimeHub`` 缓存的，注入器闭包捕获第一代的
+    generation_id，只装一次会让第二代起插话全部失效
+    （探针 2026-11-14：gen1 收到、gen2 空）。
+    正确的语义是「每代换新、但始终只有一个」。
+    """
     ur = _UR()
     ur.loop._steer_aware = False
     get_queue("u1", "s1", "g1").push("只说一次")
@@ -62,8 +69,28 @@ async def test_injector_is_idempotent():
     first = ur.loop.message_injector
     _ensure_steer_injector(ur, "u1", "s1")
 
-    assert ur.loop.message_injector is first
-    assert len(ur.loop.message_injector()) == 1
+    assert ur.loop.message_injector is not first, "每代必须换新（闭包里的 generation 要更新）"
+    assert len(ur.loop.message_injector()) == 1, "但不能把同一条消息取两遍"
+
+
+@pytest.mark.asyncio
+async def test_steer_works_across_generations_on_cached_loop():
+    """同一个 loop 跑两代，两代都能收到各自那代的插话（回归用例）。"""
+    ur = _UR(generation_id="g1")
+    ur.loop._steer_aware = False
+    get_queue("u1", "s1", "g1").push("第一代插话")
+
+    _ensure_steer_injector(ur, "u1", "s1")
+    assert any("第一代插话" in m["content"] for m in ur.loop.message_injector())
+
+    # 同一轮对话结束后，父级会把 generation_id 换成新的（chat.py:623）
+    ur.generation_id = "g2"
+    get_queue("u1", "s1", "g2").push("第二代插话")
+
+    _ensure_steer_injector(ur, "u1", "s1")
+    got = ur.loop.message_injector()
+    assert any("第二代插话" in m["content"] for m in got), \
+        "第二代必须能收到插话（旧实现这里恒为空）"
 
 
 @pytest.mark.asyncio
@@ -78,6 +105,23 @@ async def test_team_loop_is_not_double_wired():
     assert ur.loop.message_injector is None, "team 路径不该再装一个"
     # 消息仍留在队列里，等 team 的注入器来取
     assert len(get_queue("u1", "s1", "g1").snapshot()) == 1
+
+
+@pytest.mark.asyncio
+async def test_team_owner_blocks_reinstall_but_plain_owner_does_not():
+    """``_steer_owner="team"`` 时让位；``="plain"`` 时每代重装。"""
+    team_ur = _UR()
+    team_ur.loop._steer_aware = True
+    team_ur.loop._steer_owner = "team"
+    _ensure_steer_injector(team_ur, "u1", "s1")
+    assert team_ur.loop.message_injector is None
+
+    plain_ur = _UR()
+    plain_ur.loop._steer_aware = False
+    _ensure_steer_injector(plain_ur, "u1", "s1")
+    first = plain_ur.loop.message_injector
+    _ensure_steer_injector(plain_ur, "u1", "s1")
+    assert plain_ur.loop.message_injector is not first
 
 
 @pytest.mark.asyncio
@@ -236,8 +280,14 @@ async def test_run_agent_stream_wires_injector_for_plain_path():
             self._steer_aware = False
 
         async def run_stream(self, history, stop_event=None, session_id=""):
-            # 模拟「模型调用前」这个 fold 点
+            # 模拟「模型调用前」这个 fold 点。
+            # 注入器可能是同步函数，也可能是协程函数（记忆注入器是后者，
+            # compose 之后统一成协程）。生产路径由 InjectorGuard.collect()
+            # 按 inspect.isawaitable 分路；这里压缩成两行同样的语义。
+            import inspect
             injected = self.message_injector() if self.message_injector else []
+            if inspect.isawaitable(injected):
+                injected = await injected
             seen.append(injected)
             yield {"type": "done", "status": "complete"}
 

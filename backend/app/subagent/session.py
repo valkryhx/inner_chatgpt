@@ -232,6 +232,12 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
     # 3) 独立的 AgentLoop：**必须挂主对话的 history_store**，
     #    否则主对话的 assistant/tool 消息不会落 session_history，下一轮上下文就丢了。
     #    （子代理用独立的侧链表，与这里无关。）
+    # 记忆注入器：包在 _lead_injector **外面**（背景知识先于本轮新发生的事）。
+    # 注意它读的是 team_ctx.user_id（闭包），不从请求参数反查 —— A2A / 子代理
+    # 路径上反查会取到错误的主体（记忆方案 §2.3 第三条保证）。
+    from ..memory_inject import MemoryInjector, wrap_with_memory
+    _memory_injector = MemoryInjector(team_ctx.user_id)
+
     def _lead_injector():
         """Lead 的注入点：团队收件箱 + 子代理结束通知。
 
@@ -295,8 +301,10 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
         max_turns=_max_turns(),
         history_store=base_runtime.store,
         user_id=team_ctx.user_id,
-        # 子代理完成通知 + 团队收件箱：每轮模型调用前注入（fold 点）
-        message_injector=_lead_injector,
+        # 记忆（最外层，先注入）-> 子代理通知 / team 收件箱 / 用户插话。
+        # 必须用 wrap_with_memory 组合而不是直接赋值：直接赋值会把
+        # _lead_injector 覆盖掉，团队消息与子代理通知就再也进不来了。
+        message_injector=wrap_with_memory(_lead_injector, _memory_injector),
         # 收工前的团队闸：队友还在跑就别结束这一轮
         team_gate=_team_gate,
     )
@@ -304,6 +312,15 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
     # 否则同一条消息会被两个注入器各取一次（其中一次取到空，看起来没事，
     # 但队列语义会变得难以推理）。
     loop._steer_aware = True
+    # 标记：记忆注入器已经装好了。SSE 层见到这个标记就**不再装第二个**，
+    # 只把本轮的检索线索（用户说了什么）补进去 —— 否则两个 MemoryInjector
+    # 各有自己的 _injected_slugs，同一批记忆会被注入两遍。
+    #
+    # 这里不用 rebuild_message_injector 的槽位机制：team 路径的 loop 是
+    # **本轮新建**的（不是 RuntimeHub 缓存的），不存在跨代叠加问题，
+    # 直接在构造时组合一次更直观。
+    loop._memory_aware = True
+    loop._memory_injector = _memory_injector
     return TurnRuntime(
         loop=loop,
         host=host,

@@ -27,6 +27,10 @@ DB_PATH = DATA_DIR / "app.db"
 # (file read/write/patch, code_run working directory).
 SKILLS_DIR = DATA_DIR / "skills"
 WORKSPACES_DIR = DATA_DIR / "workspaces"
+# Per-user memory store: file-of-truth `<slug>.md` + DB index.
+# 正文永远在文件里（模型可直接读写），DB 只放索引。见
+# docs/20261112-Hlaudz记忆系统实施方案.md §2。
+MEMORIES_DIR = DATA_DIR / "memories"
 # Read-only skills shipped with the repository (available to every user).
 BUILTIN_SKILLS_DIR = ROOT_DIR / "backend" / "skills_builtin"
 # Shared / public skills: repo-shipped (or operator-imported) directory that every

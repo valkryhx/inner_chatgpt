@@ -363,6 +363,47 @@ export interface Skill {
   /** 内置/公用 Skill 只读 */
   readonly?: boolean
 }
+
+/* ---------- 记忆（设置页「我的记忆」） ---------- */
+
+export type MemoryKind = 'user' | 'feedback' | 'project' | 'reference'
+
+export interface MemoryEntry {
+  slug: string
+  title: string
+  description: string
+  kind: MemoryKind | string
+  tags: string[]
+  scope: string
+  created_at: number
+  updated_at: number
+  /** 内容 sha256 前 12 位，用于 CAS（改前带上可避免覆盖别人的修改） */
+  version: string
+  chars: number
+}
+
+export interface MemoryPage {
+  entries: MemoryEntry[]
+  /** 还有多少条没取到（配合 next_cursor 续读） */
+  remaining: number
+  next_cursor: string
+  total: number
+}
+
+export interface MemoryDetail extends MemoryEntry {
+  content: string
+}
+
+export interface MemoryStatus {
+  enabled: boolean
+  /** 自动提取开关：默认 false。开着才会「自己长东西」，需要用户知情 */
+  auto_write: boolean
+  dream_enabled: boolean
+  disabled_by_env: boolean
+  total: number
+  inject_budget: number
+  inject_max: number
+}
  
 /* ---------- workspace 文件下载 ---------- */
 

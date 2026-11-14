@@ -12,6 +12,7 @@ from . import db
 from .config import ROOT_DIR, llm_yaml_available, load_llm_settings
 from .logging_setup import setup_logging
 from .routers import auth, chat, me, media, sessions, skills, team, workspace_files
+from .routers import memory as memory_router
 from .a2a import router as a2a_router
 from .runtime import RuntimeHub, set_hub
 from .schemas import HealthOut
@@ -50,6 +51,13 @@ async def lifespan(app: FastAPI):
     from . import team_store
     await team_store.init_tables()
     await team_store.recover_stale_runtime("server restart")
+    # 记忆索引表（幂等）。正文永远在 backend/data/memories/<user_id>/private/*.md，
+    # 这里只建「列举 / 排序 / 命中统计」用的索引表。
+    try:
+        from . import memory_store
+        await memory_store.init_tables()
+    except Exception:
+        pass
     hub = RuntimeHub()
     await hub.startup()
     set_hub(hub)
@@ -75,6 +83,7 @@ app.include_router(me.router)
 app.include_router(sessions.router)
 app.include_router(chat.router)
 app.include_router(skills.router)
+app.include_router(memory_router.router)
 app.include_router(media.router)
 app.include_router(workspace_files.router)
 app.include_router(team.router)

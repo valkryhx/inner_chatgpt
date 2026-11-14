@@ -303,13 +303,21 @@ def build_builtin_tools(
     generation_id: str = "",
     team_id: str = "",
     agent_id: str = "root",
+    include_memory: bool = True,
 ) -> list[Tool]:
     """Create the built-in tool set bound to one user (closures capture user_id).
 
     ``write_root`` 可选：限定「写」类工具（file_write / file_patch / code_run）的根目录。
     subagent 用它把自己的产物隔离到 ``.subagents/<session>/<agent>`` 下，
     避免多个子代理并发写同一个 workspace 互相覆盖（设计文档 §7.2）。
+
+    ``include_memory``：是否装配 ``memory_list/read/write``。默认 True（root agent），
+    **子代理必须显式传 False** —— 记忆工具只给 root，子代理要记忆应由 root 给它上下文
+    （记忆方案 §5.2）。用参数而不是事后过滤，是为了让「子代理 registry 里根本没有它们」
+    这条边界在装配处就成立。
     """
+    from .memory_store import memory_enabled
+
     root = write_root or ""
     from .read_registry import ReadRegistry
 
@@ -393,8 +401,16 @@ def build_builtin_tools(
             str(args.get("args", "") or ""),
         )
 
-    return _build_tool_list(file_read, file_write, file_patch, list_files, code_run,
-                           load_skill, file_glob, file_grep)
+    tools = _build_tool_list(file_read, file_write, file_patch, list_files, code_run,
+                             load_skill, file_glob, file_grep)
+    if include_memory and memory_enabled():
+        try:
+            from .memory_tools import build_memory_tools
+            tools.extend(build_memory_tools(user_id))
+        except Exception:  # noqa: BLE001 - 记忆装配失败不该让整个工具面消失
+            import logging
+            logging.getLogger(__name__).warning("记忆工具装配失败，已跳过", exc_info=True)
+    return tools
 
 
 def _build_tool_list(file_read, file_write, file_patch, list_files, code_run, load_skill,

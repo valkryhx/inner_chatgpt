@@ -30,6 +30,15 @@ ORCHESTRATION_TOOLS = frozenset({
     "team_status",
 })
 
+# 记忆面：同样只给 root。理由与编排不同 —— 不是「越权递归」，而是隐私：
+# 子代理若需要记忆，应由 root 决定给它什么上下文，而不是让它自己翻用户的记忆
+# （记忆方案 §5.2）。注意写入子代理（后台提取器）是**专门派生**的，它拿的是
+# 写侧工具集，不经过这条裁剪 —— 两件事不要混。
+MEMORY_TOOLS = frozenset({"memory_list", "memory_read", "memory_write"})
+
+# 子代理一律拿不到的：编排 + 记忆。
+CHILD_EXCLUDED = ORCHESTRATION_TOOLS | MEMORY_TOOLS
+
 
 @dataclass(frozen=True)
 class CapabilityProfile:
@@ -45,13 +54,13 @@ class CapabilityProfile:
 
 
 def build_capability_profile(*, available_tools: list[str]) -> CapabilityProfile:
-    """子代理能力 = 父代理业务工具全集 - 编排工具。
+    """子代理能力 = 父代理业务工具全集 - 编排工具 - 记忆工具。
 
     不过滤 code_run / file_write / MCP / load_skill：
     它们和 root agent 一样受用户身份与 workspace 边界约束。
     """
     available = {str(t) for t in (available_tools or [])}
-    return CapabilityProfile(allowed=frozenset(available - ORCHESTRATION_TOOLS))
+    return CapabilityProfile(allowed=frozenset(available - CHILD_EXCLUDED))
 
 
 def build_child_registry(parent: ToolRegistry, profile: CapabilityProfile) -> ToolRegistry:

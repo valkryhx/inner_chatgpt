@@ -46,6 +46,36 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+# 注入块（记忆 / 平台提示）带这个键时**不落 session_history**。
+# 两个写入口 set() / append() 都过一遍 —— 它们是 session_history 表的全部
+# 运行期写出口（全仓 INSERT INTO session_history 只出现在本文件），
+# 所以在这里剥离能一次覆盖 agent_loop 的 3 处 set()、sse 的 1 处、compaction 的 3 处。
+_VOLATILE_KEY = "_volatile"
+
+
+def _strip_volatile(history: list[dict]) -> list[dict]:
+    """剥掉带 ``_volatile`` 的消息。
+
+    为什么在存储层而不是各调用点：调用点多且分散，逐个改是典型的
+    「改了新的忘了旧的」回归源（记忆方案 §6.1）。
+    为什么是剔除整条而不是只删标记：注入块的内容是「本轮的临时上下文」，
+    留着会在下一轮变成陈旧副本，让模型看到同一件事的多个版本。
+    """
+    if not history:
+        return history
+    out: list[dict] = []
+    for msg in history:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        if msg.get(_VOLATILE_KEY):
+            continue
+        if _VOLATILE_KEY in msg:
+            msg = {k: v for k, v in msg.items() if k != _VOLATILE_KEY}
+        out.append(msg)
+    return out
+
+
 class HistoryStore:
     async def init(self) -> None:
         async with aiosqlite.connect(DB_PATH) as conn:
@@ -107,7 +137,7 @@ class HistoryStore:
             owner, sid, payload = "", str(user_id), session_id_or_history
         else:
             owner, sid, payload = str(user_id), str(session_id_or_history), history
-        text = json.dumps(payload or [], ensure_ascii=False)
+        text = json.dumps(_strip_volatile(payload or []), ensure_ascii=False)
         async with _lock(owner, sid):
             async with aiosqlite.connect(DB_PATH) as conn:
                 await conn.execute("PRAGMA busy_timeout=5000;")
@@ -139,7 +169,7 @@ class HistoryStore:
                     history = []
                 if not isinstance(history, list):
                     history = []
-                history.extend(new_messages or [])
+                history.extend(_strip_volatile(new_messages or []))
                 await conn.execute(
                     "INSERT INTO session_history(user_id,session_id,history,updated_at) VALUES(?,?,?,?) "
                     "ON CONFLICT(user_id,session_id) DO UPDATE SET history=excluded.history, updated_at=excluded.updated_at",

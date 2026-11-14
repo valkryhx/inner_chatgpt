@@ -21,7 +21,11 @@ DEFAULT_POLICY = POLICY_FULL
 
 # read_only 只保留纯读取类内置工具。
 # MCP 工具的能力无法在本进程判定（可能是任意写操作），因此整组不进。
-READ_ONLY_TOOLS = frozenset({"file_read", "list_files", "load_skill"})
+# memory_list / memory_read 是纯读：外部调用者看**本 token 所属用户**的记忆不构成越权
+# （注入器与工具都按 token 绑定的 user_id 隔离），但 memory_write 是写，不进。
+READ_ONLY_TOOLS = frozenset({
+    "file_read", "list_files", "load_skill", "memory_list", "memory_read",
+})
 
 _ALIASES = {
     "": POLICY_FULL,
@@ -65,5 +69,6 @@ def describe(level: str) -> str:
     if level == POLICY_FULL:
         return "完整权限：内置文件/执行工具 + MCP + 子代理编排 + GA"
     if level == POLICY_READ_ONLY:
-        return "只读：file_read / list_files / load_skill；无写入、无执行、无 MCP、无编排、无 GA"
+        return ("只读：file_read / list_files / load_skill / memory_list / memory_read；"
+                "无写入、无执行、无 MCP、无编排、无 GA")
     return "纯对话：不注入任何工具"

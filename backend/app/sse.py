@@ -84,9 +84,33 @@ def _ensure_steer_injector(ur, user_id: str, session_id: str) -> None:
 
     team 路径的注入器已经会 drain 用户队列（见 subagent/session.py），
     这里靠 ``_steer_aware`` 标记跳过，避免同一条消息被注入两次。
+
+    ⚠️ **必须每代重装**（不能靠 ``_steer_aware`` 只装一次）。
+    ``ur`` 是 ``RuntimeHub`` 按 ``(user, model)`` 缓存的，同一个 loop 会跨
+    会话、跨 generation 复用；而注入器闭包捕获的是**本次** generation 的
+    队列键。装一次就锁死的话，第二代起插话全部进不来 ——
+    实测探针（2026-11-14）：gen1 收到，gen2 空。
+
+    但「每代重装」与「team 路径不许再装一个」是两件事，要分开表达：
+    用 ``_steer_owner`` 记录**谁在 drain 这个队列**。
+
+      - ``"plain"``：本函数装的，每代重装（闭包里的 generation 要更新）；
+      - ``"team"``：`subagent/session.py` 装的，本函数**必须让位**，
+        否则同一条插话会被两个注入器各取一次。
+
+    这里只写自己的槽位，由 ``memory_inject.rebuild_message_injector``
+    按固定顺序（记忆 -> steer -> 原始）重建 —— 各安装器自己记 baseline
+    会互相污染（记忆把第一代的 steer 记成 baseline，第二代又拼回去）。
     """
     loop = getattr(ur, "loop", None)
-    if loop is None or getattr(loop, "_steer_aware", False):
+    if loop is None:
+        return
+    # team 路径（或任何外部安装者）已经在 drain：让位。
+    # 兼容只有 ``_steer_aware`` 没有 ``_steer_owner`` 的旧路径（视为外部）。
+    owner = getattr(loop, "_steer_owner", "")
+    if owner and owner != "plain":
+        return
+    if not owner and getattr(loop, "_steer_aware", False):
         return
     generation_id = str(getattr(ur, "generation_id", "") or "")
     if not generation_id:
@@ -103,8 +127,44 @@ def _ensure_steer_injector(ur, user_id: str, session_id: str) -> None:
         except Exception:  # noqa: BLE001 - 插话读失败不能拖垮本轮
             return []
 
-    loop.message_injector = _inject
+    try:
+        from .memory_inject import rebuild_message_injector
+        loop._steer_injector = _inject
+        rebuild_message_injector(loop)
+    except Exception:  # noqa: BLE001 - 插话失效不该让整轮起不来
+        loop.message_injector = _inject
+    loop._steer_owner = "plain"
     loop._steer_aware = True
+
+
+def _install_memory_injector(ur, user_id: str, session_id: str, user_text: str) -> None:
+    """把记忆注入器**包在**现有注入器外面（不覆盖它）。
+
+    三件事都不能省：
+      1. 必须在 ``run_stream`` 之前装完 —— ``AgentLoop._injector_guard_now()``
+         按注入器对象身份惰性绑定 guard，轮中途换注入器会丢掉在飞的后台 task；
+      2. 不能因为 ``_steer_aware`` 为真就跳过 —— 那个标记的语义是
+         「已有注入器在 drain 用户插话队列」，不是「不许再装注入器」。
+         跳过只会导致「记忆永远不注入」；
+      3. 失败要吞掉 —— 记忆是增强，装不上不该让整轮起不来。
+    """
+    loop = getattr(ur, "loop", None)
+    if loop is None:
+        return
+    try:
+        from .memory_inject import install_memory_injector
+        # team 路径（subagent/session.py）已经装过记忆注入器。此时**不能**再装一个：
+        # 两个 MemoryInjector 各有自己的 _injected_slugs，同一批记忆会注入两遍。
+        # 只把本轮的检索线索补进去即可。
+        if getattr(loop, "_memory_aware", False):
+            existing = getattr(loop, "_memory_injector", None)
+            if existing is not None:
+                existing.set_query_hint(user_text)
+            return
+        install_memory_injector(loop, user_id, query_hint=user_text)
+    except Exception:  # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).warning("记忆注入器装配失败，本轮不注入", exc_info=True)
 
 
 async def run_agent_stream(
@@ -142,6 +202,10 @@ async def run_agent_stream(
             await store.set(session_id, history)
 
     _ensure_steer_injector(ur, user_id, session_id)
+    # 记忆放最后装：rebuild_message_injector 按固定顺序拼装
+    # （记忆 -> steer -> 原始），所以装配先后不影响结果顺序，
+    # 但要保证两边都写进槽位后 message_injector 是最终形态。
+    _install_memory_injector(ur, user_id, session_id, user_text)
 
     async for ev in ur.loop.run_stream(history, stop_event=stop_event, session_id=session_id):
         et = ev.get("type")

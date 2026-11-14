@@ -80,6 +80,7 @@ class SubagentRuntime:
             generation_id=self.ctx.generation_id,
             team_id=self.ctx.team_id,
             agent_id=self.ctx.agent_id,
+            include_memory=False,
         )
         # 用「带隔离根的 builtin」替换父 registry 里同名的 builtin 工具；
         # MCP 工具（非 builtin 名）保持父级裁剪结果。

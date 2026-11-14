@@ -620,6 +620,52 @@ textarea, input { caret-color: var(--clay); }
 .tag.tag-user { background: var(--clay-soft); color: var(--btn); }
 .tag.tag-ro { background: var(--surface-2); color: var(--muted); }
 .tag.tag-files { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+.tag.tag-kind { background: transparent; color: var(--ink-2); border: 1px solid var(--line-strong); }
+
+/* ===== 设置 → 我的记忆 =====
+   记忆是「跨会话的事实」，与 Skill（可复用流程）容易混淆，
+   所以这一块刻意用「条目 + 描述 + 元信息」的信息密度，不用卡片网格。 */
+.memory-status {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface);
+}
+.memory-status b { font-size: 15px; }
+.memory-budget { margin-left: 10px; font-size: 11px; color: var(--muted); }
+.memory-flags { display: flex; gap: 6px; flex-wrap: wrap; }
+.memory-flags .tag { margin-left: 0; }
+/* 「自动提取已关」这条必须显眼：它是唯一会自己长内容的机制，
+   用户有权知道当前它到底开没开。 */
+.memory-notice {
+  font-size: 12px; line-height: 1.65; color: var(--ink-2);
+  padding: 9px 12px; border-radius: var(--r-md);
+  background: var(--surface-2); border-left: 2px solid var(--line-strong);
+}
+.memory-notice code {
+  font-size: 11.5px; padding: 1px 4px; margin: 0 2px;
+  background: var(--surface); border-radius: var(--r-sm);
+}
+.memory-search { display: flex; gap: 8px; align-items: center; }
+.memory-search input { flex: 1; min-width: 0; }
+.memory-item { align-items: flex-start; }
+.memory-item-main { min-width: 0; flex: 1; }
+.memory-desc { margin-top: 3px; word-break: break-word; }
+.memory-meta { margin-top: 4px; font-size: 11px; color: var(--muted); }
+.memory-meta code {
+  font-size: 11px; padding: 0 3px; color: var(--ink-3);
+  background: var(--surface-2); border-radius: var(--r-sm);
+}
+.memory-more { align-self: flex-start; }
+.memory-total { text-align: center; }
+.memory-editor {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px 16px; border: 1px solid var(--line-strong);
+  border-radius: var(--r-md); background: var(--surface);
+}
+.memory-editor-head { display: flex; align-items: center; justify-content: space-between; }
+.memory-editor label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
+.memory-editor textarea { resize: vertical; font-family: inherit; line-height: 1.6; }
+.ghost-btn.danger { color: var(--danger); }
 
 .skill-readonly-note {
   margin: 10px 0 0; padding: 8px 12px; font-size: 12px; line-height: 1.6;
@@ -1666,6 +1712,22 @@ textarea, input { caret-color: var(--clay); }
   line-height: 1.6;
   color: var(--ink-2);
   white-space: pre-wrap;
+}
+/* 记忆块的条目清单：每条一行，悬停时可读，不抢正文注意力。 */
+.injected-note-body .memory-lines {
+  margin: 2px 0 0;
+  padding: 0 0 0 14px;
+  list-style: none;
+}
+.injected-note-body .memory-lines li {
+  position: relative;
+  padding: 1px 0;
+}
+.injected-note-body .memory-lines li::before {
+  content: '·';
+  position: absolute;
+  left: -10px;
+  color: var(--ink-3);
 }
 
 /* ===== 历史对话搜索（⌕ / Ctrl+Shift+K） ===== */

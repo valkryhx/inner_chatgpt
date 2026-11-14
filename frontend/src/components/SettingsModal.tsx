@@ -3,6 +3,7 @@ import type { MouseEvent as ReactMouseEvent } from 'react'
 import { api } from '../api'
 import type { LLMConfig, MCPServer, McpServerStatus, Skill } from '../types'
 import A2aSection from './A2aSection'
+import MemorySection from './MemorySection'
 
 interface Props {
   onClose: () => void
@@ -70,7 +71,7 @@ function formFromConfig(c: LLMConfig): LlmForm {
 
 
 export default function SettingsModal({ onClose, onLlmChanged }: Props) {
-  const [tab, setTab] = useState<'llm' | 'mcp' | 'skills' | 'a2a'>('llm')
+  const [tab, setTab] = useState<'llm' | 'mcp' | 'skills' | 'memory' | 'a2a'>('llm')
   // 只在“按下与松开都发生在遮罩本身”时关闭。
   // 仅监听 click 会出现：在 textarea 内拖选文本/拖动滚动条，按下在弹窗内，
   // 松开落到遮罩上，浏览器把 click 派发给共同祖先 modal-mask，导致输入中途弹窗被关闭。
@@ -110,6 +111,9 @@ export default function SettingsModal({ onClose, onLlmChanged }: Props) {
           <button className={tab === 'skills' ? 'active' : ''} onClick={() => setTab('skills')}>
             我的 Skills
           </button>
+          <button className={tab === 'memory' ? 'active' : ''} onClick={() => setTab('memory')}>
+            我的记忆
+          </button>
           <button className={tab === 'a2a' ? 'active' : ''} onClick={() => setTab('a2a')}>
             A2A 接入
           </button>
@@ -121,6 +125,8 @@ export default function SettingsModal({ onClose, onLlmChanged }: Props) {
             <McpSection />
           ) : tab === 'a2a' ? (
             <A2aSection />
+          ) : tab === 'memory' ? (
+            <MemorySection />
           ) : (
             <SkillsSection />
           )}

@@ -18,6 +18,10 @@ import type {
   StreamEvent,
   User,
   Skill,
+  MemoryEntry,
+  MemoryPage,
+  MemoryDetail,
+  MemoryStatus,
   TeamSnapshot,
   WorkspaceListing,
 } from './types'
@@ -338,6 +342,37 @@ export const api = {
     }),
   deleteSkill: (name: string) =>
     request<{ ok: boolean }>(`/me/skills/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  // me: memories（设置页「我的记忆」）
+  listMemories: (cursor = '', limit = 50, query = '') =>
+    request<MemoryPage>(
+      `/me/memories?limit=${limit}`
+      + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : '')
+      + (query ? `&query=${encodeURIComponent(query)}` : ''),
+    ),
+  getMemory: (slug: string) =>
+    request<MemoryDetail>(`/me/memories/${encodeURIComponent(slug)}`),
+  memoryStatus: () => request<MemoryStatus>('/me/memories/status'),
+  createMemory: (body: {
+    slug?: string; title?: string; description?: string
+    content?: string; kind?: string; tags?: string[]; if_version?: string
+  }) =>
+    request<MemoryEntry>('/me/memories', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  updateMemory: (slug: string, body: {
+    title?: string; description?: string; content?: string
+    kind?: string; tags?: string[]; if_version?: string
+  }) =>
+    request<MemoryEntry>(`/me/memories/${encodeURIComponent(slug)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  deleteMemory: (slug: string) =>
+    request<{ ok: boolean }>(`/me/memories/${encodeURIComponent(slug)}`, { method: 'DELETE' }),
 }
 
 
