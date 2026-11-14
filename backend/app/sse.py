@@ -227,10 +227,21 @@ async def _install_memory_prefetch(ur, user_id: str) -> None:
     不复用主模型：一个 10 步任务会让主模型多跑 10 次。
     client 每代新建，不缓存 —— 它是纯 HTTP 客户端，构造很便宜，
     而缓存会带来「用户改了配置要等重启」的问题。
+
+    档位闸：预取是记忆的**第二条读路径**（开选择器时关键词注入让位，
+    所以它实际上是唯一的那条）。M5 首版只关了关键词注入，``chat_only``
+    通过预取照样能拿到记忆 —— 两条读路径必须用同一个判据
+    （``allows_memory_read``），否则「关掉一条」只是把门换了个位置。
     """
     loop = getattr(ur, "loop", None)
     if loop is None:
         return
+    try:
+        from .tool_policy import allows_memory_read
+        if not allows_memory_read(getattr(ur, "tool_policy", "") or "full"):
+            return
+    except Exception:  # noqa: BLE001
+        pass
     try:
         from .memory_prefetch import install_prefetch, prefetch_enabled
         if not prefetch_enabled():

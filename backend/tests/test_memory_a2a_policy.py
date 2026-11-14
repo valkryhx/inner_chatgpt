@@ -235,3 +235,41 @@ def test_sse_injector_installer_respects_chat_only():
         ur = FakeUR(policy)
         _install_memory_injector(ur, "u1", "s1", "hi")
         assert (getattr(ur.loop, "_memory_injector", None) is not None) is expect, policy
+
+
+def test_sse_prefetch_installer_respects_chat_only(monkeypatch):
+    """选择器预取是**另一条**读路径，同样要吃档位闸。
+
+    M5 首版漏了这一处：关键词注入器按档位关了，但预取是它的互斥替代路径
+    （开了选择器时关键词让位），于是 ``chat_only`` 通过预取照样拿到了记忆。
+    两条读路径必须用同一个判据，否则「关掉了一条」只是把门换了个位置。
+    """
+    from app import sse
+    import app.memory_prefetch as mp
+
+    monkeypatch.setattr(mp, "prefetch_enabled", lambda: True)
+
+    async def fake_client_for(user_id):
+        return object()
+
+    monkeypatch.setattr(mp, "selector_client_for", fake_client_for)
+    installed: list[object] = []
+    monkeypatch.setattr(mp, "install_prefetch",
+                        lambda loop, client, uid: installed.append(loop))
+
+    class FakeLoop:
+        message_injector = None
+
+    class FakeUR:
+        def __init__(self, policy):
+            self.loop = FakeLoop()
+            self.user_id = "u1"
+            self.tool_policy = policy
+
+    for policy, expect in ((POLICY_FULL, True), (POLICY_READ_ONLY, True),
+                           (POLICY_CHAT_ONLY, False)):
+        installed.clear()
+        ur = FakeUR(policy)
+        run(sse._install_memory_prefetch(ur, "u1"))
+        assert bool(installed) is expect, (
+            f"{policy} 档的预取安装情况不对（期望 {expect}）")
