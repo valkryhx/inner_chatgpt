@@ -436,6 +436,81 @@
    "file": "m0591_0x11be624e.js",
    "line": 151565,
    "must_contain": "if (yield s, ++r === JGr) return"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 330,
+   "must_contain": "jt = 20000"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 938,
+   "must_contain": "Nt(messages_2, sinceUuid_2"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 950,
+   "must_contain": "if (!ur)"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 963,
+   "must_contain": "turns < every_n_turns"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 976,
+   "must_contain": "LGr(toolPermissionContext_3"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 997,
+   "must_contain": "V5() !== promptIndex_2"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 1001,
+   "must_contain": "o8e(toolPermissionContext_3)"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 1005,
+   "must_contain": "_e === \"skip\""
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 1016,
+   "must_contain": "config_2.firstLook"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 1034,
+   "must_contain": "H.verdict === \"no\""
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 1094,
+   "must_contain": "first look (shadow, the pass ran regardless)"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 458,
+   "must_contain": "maxRetries: 0"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 467,
+   "must_contain": "the pass is not skipped"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 92368,
+   "must_contain": "function fet(e)"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 2425,
+   "must_contain": "firstLook"
   }
  ]
 }
