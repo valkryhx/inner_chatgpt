@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .. import db
 from ..agent import with_effort
 from ..auth import get_current_user
+from .. import turn_job
 from ..runtime import (
     get_hub, register_generation, request_stop, unregister_generation,
     reserve_generation, release_generation_reservation, cancel_generation,
@@ -365,7 +366,8 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                         model_id: str = "", stop_event: asyncio.Event | None = None,
                         tool_policy: str = "full",
                         attachments: list[dict] | None = None,
-                        reasoning_effort: str = "") -> AsyncIterator[str]:
+                        reasoning_effort: str = "",
+                        job=None) -> AsyncIterator[str]:
     # 首帧前奏计时：从进入本生成器开始，到第一个 message_start 为止。
     # 只做 time.monotonic() 与一次汇总日志，不改任何行为（见 prelude_timing）。
     prelude = PreludeTimer(user_id, session_id, generation_id)
@@ -537,6 +539,11 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     # 消息块按「事件真实发生顺序」累积：文本增量并入当前文本块，
     # 工具/图表在出现的位置插入。这样刷新后顺序与流式时一致。
     blocks: list[dict[str, Any]] = []
+    # 把「读此刻 blocks」交给 job —— 续看时 sync 用它序列化最新状态。
+    # **传函数不传快照**：`_persist` 有 250ms 节流，快照必然落后于 blocks，
+    # 那样 sync 与重放缓冲之间会漏一段（见 turn_job 模块头）。
+    if job is not None:
+        job.set_blocks_provider(lambda: blocks)
     # 注意：`event_id` 与 `frame()` 已在首帧之前定义（P3 把首帧提前了）。
     persist_lock = asyncio.Lock()
     last_persist_at = 0.0
@@ -921,28 +928,122 @@ async def send_message(session_id: str, body: SendMessageIn, user: dict = Depend
     if count == 0 and sess["title"] in ("新会话", "", None):
         await db.update_session(session_id, user["id"], title=body.text.strip().replace("\n", " ")[:24])
     async def guarded_stream():
-        # Capture the task here, before the first await in _event_stream's
-        # prelude, so the stop endpoint can cancel even a long compaction/build.
-        stop_event = register_generation(user["id"], session_id, generation_id)
+        # 生成跑在独立 job 里，本生成器只是**订阅者**。
+        #
+        # 为什么必须这样：Starlette 的 StreamingResponse 在 ASGI spec < 2.4 下
+        # 把「发 body」和「听断开」放进同一个 task group，客户端一断就整组取消。
+        # 而下面那个 async for 拿到的就是生成本身 —— 于是刷新页面 = 掐死生成
+        # （实测请求 6000 字只产出 73 字，见 docs/20261115-…-持久化第三步.md §1）。
+        #
+        # 现在：断开只让本订阅者退出，job 继续跑到自然结束，结果照常落库。
+        job = turn_job.TurnJob(user["id"], session_id, generation_id, message_id)
+        sub = job.attach()
+        if sub is None:  # 同一 job 订阅者过多（正常不会发生：job 由本请求新建）
+            yield sse_frame("error", {"error": "too many subscribers"})
+            return
+
+        async def _run_job(j: turn_job.TurnJob) -> None:
+            # 必须在 **job 任务内部**登记：cancel_generation 读的是
+            # _generation_tasks[key]，只有登记成 job 任务，/stop 才能取消到
+            # 真正在跑的那个任务（登记成请求任务的话，请求一返回就取消不到了）。
+            stop_event = register_generation(user["id"], session_id, generation_id)
+            try:
+                async for chunk in _event_stream(
+                    user["id"], session_id, body.text, generation_id, message_id,
+                    sess.get("model_id", "") or "", stop_event=stop_event,
+                    attachments=attachments or None,
+                    reasoning_effort=(body.reasoning_effort if body.reasoning_effort is not None
+                                      else sess.get("reasoning_effort", "") or ""),
+                    job=j,
+                ):
+                    j.publish(chunk)
+            finally:
+                # _event_stream 正常情况下已在自己 finally 里 unregister；这里是
+                # 幂等兜底（早退、模型初始化失败等路径）。
+                unregister_generation(user["id"], session_id, generation_id)
+                release_generation_reservation(user["id"], session_id, generation_id)
+
+        # 先 attach 再 start：订阅者先就位，job 的第一帧才不会漏
+        # （task 在下一个 await 点之前不会运行）。
+        turn_job.start_job(job, _run_job)
         try:
-            async for chunk in _event_stream(
-                user["id"], session_id, body.text, generation_id, message_id,
-                sess.get("model_id", "") or "", stop_event=stop_event,
-                attachments=attachments or None,
-                reasoning_effort=(body.reasoning_effort if body.reasoning_effort is not None
-                                  else sess.get("reasoning_effort", "") or ""),
-            ):
+            async for chunk in sub.drain():
                 yield chunk
         finally:
-            # _event_stream normally unregisters in its own finally; this is an
-            # idempotent safety net for early returns (runtime unavailable,
-            # model init failure, or a client disconnect before first yield).
-            unregister_generation(user["id"], session_id, generation_id)
-            release_generation_reservation(user["id"], session_id, generation_id)
+            # 客户端断开 / 正常结束都走这里。**只管订阅，不管生成。**
+            job.detach(sub)
 
     return StreamingResponse(
         guarded_stream(),
         media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+@router.get("/sessions/{session_id}/stream", response_model=None)
+async def resume_stream(session_id: str, after: int = 0,
+                        user: dict = Depends(get_current_user)):
+    """断线续看：接上一个还在跑的 turn job，从 `after` 之后补事件。
+
+    为什么需要独立端点而不是「重新 POST」：POST 会抢 generation 租约、新建一条
+    assistant 消息 —— 那是新开一轮，不是续看。这里只订阅，不产生任何新状态。
+
+    `after` 的含义是「我已经看到 seq = after 了」。三种情况：
+
+    - `after` 在缓冲覆盖范围内 → 补发增量，然后接实时；
+    - `after` 太老 / 首次 → 先发一帧 `sync`（含**此刻**完整 blocks 与当前 seq），
+      客户端直接用它替换本地状态，然后接实时；
+    - job 已结束 → 检查消息是否已落终态，发 `done` 后关闭。
+
+    与 409 的关系：这个端点**不抢租约**，所以生成中也能调。
+    """
+    sess = await db.get_session(session_id, user["id"])
+    if not sess:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    job = turn_job.get_live_job_for_session(user["id"], session_id)
+    if job is None:
+        # 没有活着的 job：把库里的现状告诉调用方，然后干净关闭。
+        # 刷新页面时如果这一轮刚好跑完，走的就是这里 —— 不能返回 404，
+        # 否则前端会把「已完成」显示成「连接失败」。
+        async def _finished_stream():
+            try:
+                msgs = await db.list_messages(session_id)
+                last = next((m for m in reversed(msgs)
+                             if m.get("role") == "assistant"), None)
+                if last is not None:
+                    yield sse_frame("done", {"message_id": last["id"],
+                                             "status": last.get("status", "complete"),
+                                             "model": ""})
+            except Exception:  # noqa: BLE001
+                pass
+
+        return StreamingResponse(
+            _finished_stream(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    sub = job.attach()
+    if sub is None:
+        return JSONResponse(status_code=429, content={
+            "error": "too_many_subscribers",
+            "hint": "该轮次的观看连接过多，请关掉多余标签页后重试。",
+        })
+
+    backlog = job.sync_frames(after)
+
+    def _resume_stream():
+        async def _gen():
+            try:
+                for chunk in backlog:
+                    yield chunk
+                async for chunk in sub.drain():
+                    yield chunk
+            finally:
+                job.detach(sub)
+        return _gen()
+
+    return StreamingResponse(
+        _resume_stream(), media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
 

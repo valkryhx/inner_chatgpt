@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, getToken, setToken, streamMessage } from './api'
+import { api, getToken, setToken, streamMessage, resumeStream } from './api'
 import type { Attachment, ContextUsage, LlmModelOption, McpServerStatus, Message, MessageSearchHit, Session, StreamEvent, TeamEvent, TeamSnapshot, User } from './types'
 import Sidebar from './components/Sidebar'
 import MessageList from './components/MessageList'
@@ -166,6 +166,11 @@ export default function App() {
   const runTimesRef = useRef<Map<string, { started: number; finished?: number }>>(new Map())
   // 正在本端流式生成的会话 id；用于阻止历史加载覆盖乐观渲染的消息
   const streamSidRef = useRef<string | null>(null)
+  // 续看连接的取消器。同一时刻只允许一条，否则两个 effect 触发会重复接流。
+  const resumeAbortRef = useRef<AbortController | null>(null)
+  // 让回调拿到最新消息列表（effect 的闭包会捕获旧值）。
+  const messagesRef = useRef<Message[]>([])
+  useEffect(() => { messagesRef.current = messages }, [messages])
 
   // Restore the panel preference once the account is known, then persist it.
   // One effect keeps the restore from being overwritten by a premature write.
@@ -245,11 +250,11 @@ export default function App() {
     }
   }, [])
 
-  const loadMessages = useCallback(async (id: string) => {
+  const loadMessages = useCallback(async (id: string): Promise<Message[]> => {
     try {
       const d = await api.getSession(id)
       // 若该会话正在本端流式生成，勿用服务器历史覆盖乐观渲染的消息
-      if (streamSidRef.current === id) return
+      if (streamSidRef.current === id) return d.messages
       setMessages((prev) => {
         // 刚停止时服务端可能稍晚写入快照；若历史版本仍为空，而本地已有
         // 同一 message_id 的可见内容，就保留本地，避免“停止后内容消失”。
@@ -280,8 +285,10 @@ export default function App() {
             : merged
         })
       })
+      return d.messages
     } catch (e) {
       setError(String(e))
+      return []
     }
   }, [])
 
@@ -341,6 +348,96 @@ export default function App() {
     loadTeam(activeId)
   }, [user, activeId, loadTeam])
 
+  const resumeIfRunning = useCallback(async (sid: string, msgs?: Message[]) => {
+    // 页面刚加载 / 切回某个会话时，如果库里那一条 assistant 还是 streaming，
+    // 说明后端还有 turn job 在跑（刷新页面**不再**掐死生成，见
+    // docs/20261115-…-持久化第三步.md）。这里自动接上，用户看不到「停在半截」。
+    //
+    // 判据不能用「后端有 job」——那要额外一次请求；而且库里 streaming 就足够了：
+    // 没有 job 时会话已收敛，不会进入这个分支。
+    if (streamSidRef.current === sid) return          // 本端正在生成，别抢
+    if (resumeAbortRef.current) return                // 已经有一条续看连接
+
+    // ⚠️ 必须用调用方传进来的列表（就是刚 loadMessages 拿到的那份）。
+    // 第一版这里读 `messagesRef.current`，而它要等下一次 render 后才会更新 ——
+    // 于是 `loadMessages().then(resumeIfRunning)` 这个组合永远读到旧列表（空），
+    // 直接 return，**续看从未发生过**。UI 真机测试（U-1b）才暴露出来。
+    const list = msgs ?? messagesRef.current
+    const target = list.find(
+      (m) => m.session_id === sid && m.role === 'assistant' && m.status === 'streaming',
+    )
+    if (!target) return
+
+    const ctrl = new AbortController()
+    resumeAbortRef.current = ctrl
+    streamSidRef.current = sid
+    setStreaming(true)
+    setActiveStreamMsgId(target.id)
+
+    // 本轮拿到的最新游标。从 0 开始：让后端自行决定「增量」还是「sync 快照」——
+    // 它比前端更清楚缓冲覆盖范围。
+    let lastSeq = 0
+    let blocks: any[] = target.blocks || []
+    let current = target
+
+    const patch = (m: Message) => {
+      current = m
+      setMessages((prev) => prev.map((x) => (x.id === m.id ? { ...m } : x)))
+    }
+
+    const onEvent = (ev: StreamEvent) => {
+      if (ev.type === 'sync') {
+        // 快照重置：后端说「你落后太多，用这份完整状态替换」。
+        blocks = ev.blocks || []
+        const text = blocks
+          .filter((b: any) => b.type === 'text')
+          .map((b: any) => b.text)
+          .join('')
+        patch({ ...current, blocks: [...blocks], content: text, status: 'streaming' })
+      } else if (ev.type === 'text_delta') {
+        blocks = appendTextBlock(blocks, ev.text)
+        patch({ ...current, content: current.content + ev.text, blocks: [...blocks] })
+      } else if (ev.type === 'thinking_delta') {
+        // 思考块与文本块分开累积（沿用消息流里的 appendTextBlock 约定，
+        // 但块类型是 reasoning，见 MessageList 的渲染分支）。
+        const last = blocks[blocks.length - 1]
+        blocks = last && last.type === 'reasoning'
+          ? [...blocks.slice(0, -1), { ...last, text: last.text + ev.text }]
+          : [...blocks, { type: 'reasoning', text: ev.text }]
+        patch({ ...current, reasoning: current.reasoning + ev.text, blocks: [...blocks] })
+      } else if (ev.type === 'tool_start') {
+        blocks = appendBlock(blocks, { type: 'tool', id: ev.id, name: ev.name, input: ev.input })
+        patch({ ...current, blocks: [...blocks] })
+      } else if (ev.type === 'tool_result') {
+        blocks = blocks.map((b) =>
+          b.type === 'tool' && b.id === ev.id ? { ...b, result: ev.content } : b,
+        )
+        patch({ ...current, blocks: [...blocks] })
+      } else if (ev.type === 'done') {
+        const finishedAt = Date.now()
+        const status = ev.status === 'stopped' ? 'stopped' : ev.status === 'error' ? 'error' : 'complete'
+        patch({ ...current, status, run_finished_at: finishedAt })
+        setStreaming(false)
+        setActiveStreamMsgId(null)
+      } else if (ev.type === 'error') {
+        setError(ev.error)
+        patch({ ...current, status: 'error', run_finished_at: Date.now() })
+      }
+    }
+
+    try {
+      await resumeStream(sid, lastSeq, onEvent, ctrl.signal, (seq: number) => { lastSeq = seq })
+    } catch {
+      // 续看失败不该打扰用户：历史内容已经在界面上了，用户可以直接重发。
+    } finally {
+      if (resumeAbortRef.current === ctrl) resumeAbortRef.current = null
+      if (streamSidRef.current === sid) streamSidRef.current = null
+      setStreaming(false)
+      setActiveStreamMsgId(null)
+      loadMessages(sid)
+    }
+  }, [loadMessages])
+
   useEffect(() => {
     if (!user) return
     if (activeId) {
@@ -349,11 +446,14 @@ export default function App() {
       // 新会话首条消息：正在本端生成，跳过历史加载以免清空乐观消息
       if (streamSidRef.current === activeId) return
       loadMessages(activeId)
+        .then((msgs) => resumeIfRunning(activeId, msgs))
+        .catch(() => {})
     } else {
       setMessages([])
       setContextUsage(null)
     }
-  }, [user, activeId, loadMessages, loadContextUsage])
+  }, [user, activeId, loadMessages, loadContextUsage, resumeIfRunning])
+
 
   const doLogout = async () => {
     try {

@@ -380,12 +380,20 @@ export const api = {
 }
 
 
-function parseFrame(raw: string): { event: string; data: StreamEvent } | null {
+function parseFrame(raw: string): { event: string; data: StreamEvent; id?: number } | null {
   let event = 'message'
   let dataLine = ''
+  let id: number | undefined
   for (const line of raw.split('\n')) {
     if (line.startsWith('event:')) event = line.slice(6).trim()
     else if (line.startsWith('data:')) dataLine += line.slice(5).trim()
+    // `id:` 是续看游标（后端 turn_job 统一编号，单调递增）。
+    // 注意不是每帧都有：`healed` 与早退 error 走的是不带 id 的 sse_frame，
+    // 所以这里必须容忍缺失，不能假定每帧都有。
+    else if (line.startsWith('id:')) {
+      const n = Number(line.slice(3).trim())
+      if (Number.isFinite(n)) id = n
+    }
   }
   if (!dataLine) return null
   try {
@@ -398,6 +406,7 @@ function parseFrame(raw: string): { event: string; data: StreamEvent } | null {
       return {
         event,
         data: { type: 'team_event', event: data } as unknown as StreamEvent,
+        id,
       }
     }
     // 其余事件后端把类型放在 SSE 的 `event:` 行，data 里通常没有 type 字段。
@@ -405,7 +414,7 @@ function parseFrame(raw: string): { event: string; data: StreamEvent } | null {
     if (event && event !== 'message' && typeof data.type !== 'string') {
       data.type = event
     }
-    return { event, data: data as unknown as StreamEvent }
+    return { event, data: data as unknown as StreamEvent, id }
   } catch {
     return null
   }
@@ -432,6 +441,55 @@ export async function uploadImage(file: File): Promise<UploadedImage> {
   return (await res.json()) as UploadedImage
 }
 
+/**
+ * 读取 SSE 流并逐帧回调。返回最后一次看到的 `id:`（续看游标）。
+ *
+ * 抽成公用是因为 `streamMessage` 与 `resumeStream` 的读取逻辑完全一样，
+ * 只有「怎么建立连接」不同。分开写迟早会漂移（比如一边补了 id 解析另一边没补）。
+ */
+async function consumeSse(
+  res: Response,
+  onEvent: (ev: StreamEvent) => void,
+  onSeq?: (seq: number) => void,
+): Promise<void> {
+  const reader = res.body!.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  const handle = (raw: string) => {
+    const frame = parseFrame(raw)
+    if (!frame) return
+    if (frame.id !== undefined) onSeq?.(frame.id)
+    onEvent(frame.data)
+  }
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let idx = buf.indexOf('\n\n')
+    while (idx !== -1) {
+      const raw = buf.slice(0, idx)
+      buf = buf.slice(idx + 2)
+      handle(raw)
+      idx = buf.indexOf('\n\n')
+    }
+  }
+  if (buf.trim()) handle(buf)
+}
+
+function streamErrorBody(res: Response): Promise<string> {
+  return (async () => {
+    let msg = `stream failed (${res.status})`
+    try {
+      const b: unknown = await res.json()
+      const obj = b && typeof b === 'object' ? b as Record<string, unknown> : {}
+      msg = detailText(obj.detail ?? obj.error, msg)
+    } catch {
+      /* ignore */
+    }
+    return msg
+  })()
+}
+
 export async function streamMessage(
   sessionId: string,
   text: string,
@@ -440,6 +498,7 @@ export async function streamMessage(
   signal?: AbortSignal,
   attachments?: Attachment[],
   reasoningEffort?: string,
+  onSeq?: (seq: number) => void,
 ): Promise<void> {
   const res = await fetch(`${BASE}/sessions/${sessionId}/messages`, {
     method: 'POST',
@@ -458,35 +517,45 @@ export async function streamMessage(
       setToken('')
       window.dispatchEvent(new Event('auth:logout'))
     }
-    let msg = `stream failed (${res.status})`
-    try {
-      const b: unknown = await res.json()
-      const obj = b && typeof b === 'object' ? b as Record<string, unknown> : {}
-      msg = detailText(obj.detail ?? obj.error, msg)
-    } catch {
-      /* ignore */
-    }
-    onEvent({ type: 'error', error: msg })
+    onEvent({ type: 'error', error: await streamErrorBody(res) })
     return
   }
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buf += decoder.decode(value, { stream: true })
-    let idx = buf.indexOf('\n\n')
-    while (idx !== -1) {
-      const raw = buf.slice(0, idx)
-      buf = buf.slice(idx + 2)
-      const frame = parseFrame(raw)
-      if (frame) onEvent(frame.data)
-      idx = buf.indexOf('\n\n')
+  await consumeSse(res, onEvent, onSeq)
+}
+
+/**
+ * 断线续看：接上正在跑的那一轮，从 `after` 之后补事件。
+ *
+ * 与 `streamMessage` 的根本区别：**不发新消息、不抢 generation 租约**。
+ * 它只是订阅，所以刷新页面后调它是安全的，不会变成「又发了一遍」。
+ *
+ * 后端三种回应：
+ * - 增量/`sync` + 实时事件（job 还活着）；
+ * - 只有 `done`（这一轮已结束）；
+ * - 429（该轮观看连接过多）。
+ */
+export async function resumeStream(
+  sessionId: string,
+  after: number,
+  onEvent: (ev: StreamEvent) => void,
+  signal?: AbortSignal,
+  onSeq?: (seq: number) => void,
+): Promise<void> {
+  const res = await fetch(
+    `${BASE}/sessions/${sessionId}/stream?after=${encodeURIComponent(String(after))}`,
+    {
+      method: 'GET',
+      headers: authHeaders({ accept: 'text/event-stream' }),
+      signal,
+    },
+  )
+  if (!res.ok || !res.body) {
+    if (res.status === 401) {
+      setToken('')
+      window.dispatchEvent(new Event('auth:logout'))
     }
+    onEvent({ type: 'error', error: await streamErrorBody(res) })
+    return
   }
-  if (buf.trim()) {
-    const frame = parseFrame(buf)
-    if (frame) onEvent(frame.data)
-  }
+  await consumeSse(res, onEvent, onSeq)
 }

@@ -81,6 +81,14 @@ async def lifespan(app: FastAPI):
     finally:
         if dream_handle is not None:
             await dream_handle.stop()
+        # Turn jobs 先收：它们跑着生成，必须在 runtime 被拆掉之前停下来，
+        # 否则工具/子代理会在一个已被 close 的 runtime 上继续跑。
+        # 取消是**优雅**的：`_event_stream` 的 finally 会把消息收敛成 stopped。
+        try:
+            from . import turn_job
+            await turn_job.shutdown_all("server shutdown")
+        except Exception:
+            pass
         await hub.shutdown()
         set_hub(None)
 

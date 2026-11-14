@@ -283,6 +283,7 @@ export type StreamEvent =
   | { type: 'llm_retry'; attempt: number; limit: number; error: string }
   | { type: 'team_wait'; reason: string; grace_left: number }
   | { type: 'done'; message_id: string; status: 'complete' | 'stopped' | 'error' }
+  | { type: 'sync'; blocks: MessageBlock[]; seq: number }
   | { type: 'error'; error: string }
 
 
