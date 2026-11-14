@@ -266,8 +266,18 @@ def _clamp_sync_timeout(value: Any) -> Optional[float]:
     return min(seconds, SYNC_TIMEOUT_CAP_S)
 
 
+# 配额判定的临界区锁（进程内）。见 `_enforce_quota` 的说明。
+_QUOTA_LOCK = asyncio.Lock()
+
+
 async def _enforce_quota(identity: dict[str, Any]) -> None:
-    """并发配额：只拦新建任务，幂等重放不受影响。"""
+    """并发配额：只拦新建任务，幂等重放不受影响。
+
+    ⚠️ 调用方必须把它和「create_task」放进同一个临界区（``_QUOTA_LOCK``）：
+    光是「先 count 再 create」在并发下等于没有配额 —— 三个请求会同时读到
+    count=0 然后全部放行。2026-11-14 真机实测：串行第 3 个正确 429，
+    **并发 3 个全部 200**。这是典型的 TOCTOU，单测只验串行所以一直没暴露。
+    """
     mine, total = await store.count_active(identity["user_id"])
     limit_user = config.max_active_per_user()
     if mine >= limit_user:
@@ -294,7 +304,9 @@ async def _prepare_task(identity: dict[str, Any], params: dict[str, Any]) -> tup
         existing = await store.find_task_by_message(identity["agent_id"], session_id, message_id)
         if existing:
             return existing, True
-    await _enforce_quota(identity)
+    # 配额判定与建任务必须在**同一个**临界区里完成，否则并发下配额形同虚设
+    # （见 _enforce_quota 的说明）。临界区只包住「查数 → 建行」这两步，
+    # 不包含前面的会话创建与后面的 spawn —— 那两步不改变活跃计数。
     if not session_id:
         session_id = await _resolve_session(identity, message, text)
 
@@ -303,16 +315,18 @@ async def _prepare_task(identity: dict[str, Any], params: dict[str, Any]) -> tup
     task_id = store.new_id("task")
     generation_id = store.new_id("g_a2a")
     level = normalize_policy(identity.get("tool_policy"))
-    row = await store.create_task(
-        task_id=task_id,
-        context_id=session_id,
-        user_id=identity["user_id"],
-        agent_id=identity["agent_id"],
-        session_id=session_id,
-        message_id=message_id,
-        generation_id=generation_id,
-        tool_policy=level,
-    )
+    async with _QUOTA_LOCK:
+        await _enforce_quota(identity)
+        row = await store.create_task(
+            task_id=task_id,
+            context_id=session_id,
+            user_id=identity["user_id"],
+            agent_id=identity["agent_id"],
+            session_id=session_id,
+            message_id=message_id,
+            generation_id=generation_id,
+            tool_policy=level,
+        )
     _spawn(row, text, model_id, level)
     return row, False
 

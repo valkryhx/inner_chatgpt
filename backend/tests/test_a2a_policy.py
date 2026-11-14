@@ -278,3 +278,49 @@ def test_audit_log_records_jsonrpc_calls(isolated_db):
     assert latest["method"] == "GetTask"
     assert latest["outcome"] == "error"
     assert latest["task_id"] == "task_missing"
+
+
+def test_quota_holds_under_concurrent_submissions(isolated_db, monkeypatch):
+    """并发提交时配额必须仍然生效（TOCTOU 回归）。
+
+    之前的实现是「先 count_active 再 create_task」，中间隔着多个 await。
+    三个并发请求会**同时**读到 count=0，于是全部放行 —— 配额在并发下等于没有。
+
+    真机实测（2026-11-14）：串行提交第 3 个正确 429；并发提交 3 个全部 200。
+    单测只验串行，所以一直没暴露。
+
+    这里用确定性方式复现：monkeypatch 让 `count_active` 在第一次调用后
+    故意返回陈旧值（模拟两个请求都读到 0），再看配额能不能拦住。
+    """
+    from app.a2a import service, store
+    from app.a2a.errors import A2AError
+
+    agent = enabled_agent("u1")
+    monkeypatch.setenv("INNER_A2A_MAX_ACTIVE_TASKS_PER_USER", "1")
+
+    ident = {"user_id": "u1", "agent_id": agent["agent_id"], "tool_policy": "full"}
+
+    async def scenario():
+        results = []
+
+        async def submit(i):
+            try:
+                row, existing = await service._prepare_task(ident, {"message": {
+                    "messageId": f"race-{i}", "role": "ROLE_USER",
+                    "parts": [{"text": "hi"}]}})
+                # 立刻把它标成 WORKING，模拟「真的占用了槽位」
+                await store.update_task(row["task_id"], state="TASK_STATE_WORKING")
+                return ("ok", row["task_id"])
+            except A2AError as exc:
+                return ("rejected", exc.code)
+
+        # 三个并发，配额上限 1 —— 必须恰好只有一个成功
+        results = await asyncio.gather(*[submit(i) for i in range(3)])
+        return results
+
+    results = run(scenario())
+    ok = [r for r in results if r[0] == "ok"]
+    rejected = [r for r in results if r[0] == "rejected"]
+    assert len(ok) == 1, f"并发下配额失效：{len(ok)} 个被接受，期望 1。{results}"
+    assert len(rejected) == 2, results
+    assert all(r[1] == -32010 for r in rejected)
