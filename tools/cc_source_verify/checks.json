@@ -601,6 +601,96 @@
    "file": "m0194_0x11642aa3.js",
    "line": 10,
    "must_contain": "YF = 200"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 1278,
+   "must_contain": "tengu_passport_quail"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 1250,
+   "must_contain": "async function ir"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 1259,
+   "must_contain": "async function ar"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 1323,
+   "must_contain": "async function Pha"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 3829,
+   "must_contain": "async function* Jd"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 3852,
+   "must_contain": "executeExtractMemories"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 3859,
+   "must_contain": "PXs(G"
+  },
+  {
+   "file": "m0833_0x124cce31.js",
+   "line": 409,
+   "must_contain": "runner?.(e, r)"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 2576,
+   "must_contain": "function lSe"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 2577,
+   "must_contain": "tengu_moth_copse"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 2581,
+   "must_contain": "CLAUDE_MEMORY_STORES"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 2591,
+   "must_contain": "function V$t"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 2593,
+   "must_contain": "tengu_passport_quail"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 39396,
+   "must_contain": "function v(e, n)"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153926,
+   "must_contain": "fh() && lSe()"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153994,
+   "must_contain": "function Mvi"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 860,
+   "must_contain": "idleFlushSeconds"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 2419,
+   "must_contain": "idleFlushSeconds"
   }
  ]
 }
