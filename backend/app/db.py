@@ -173,10 +173,42 @@ async def init_db() -> None:
             await conn.execute("UPDATE users SET username=? WHERE id=?", (cand, uid))
         # 启动自愈：服务重启后，上一进程遗留的 assistant 消息会永远停在 streaming，
         # 前端会一直显示“正在思考”。进程刚启动时不可能有真实生成在跑，全部收敛为 stopped。
+        #
+        # ⚠️ 顺序至关重要（持久化第二步）：**先**把「有 streaming 消息的会话」
+        # 标成崩溃中断，**再**收敛。反过来的话，「这一轮没走完」的证据就被
+        # 抹掉了，之后就再也分不出「用户主动停止」和「进程崩溃」——
+        # 而这两者的正确处置完全不同（前者可以重放工具，后者绝不能）。
+        #
+        # 这一步放在 init_db 内部而不是 main.py 里，正是因为它必须夹在
+        # 这条 UPDATE 之前。
+        try:
+            await _mark_crashed_before_converge(conn)
+        except Exception:  # noqa: BLE001 - 标记失败不该阻止启动
+            import logging
+            logging.getLogger(__name__).warning("崩溃标记建立失败", exc_info=True)
         await conn.execute(
             "UPDATE messages SET status='stopped' WHERE role='assistant' AND status='streaming'"
         )
         await conn.commit()
+
+
+async def _mark_crashed_before_converge(conn) -> int:
+    """在把 streaming 收敛为 stopped **之前**，把这些会话标成崩溃中断。
+
+    只建表 + 写标记，不改 messages —— 收敛由调用方紧接着做。
+    返回标记的会话数（启动日志用）。
+    """
+    from . import turn_marker
+
+    await turn_marker.init_tables()   # 幂等
+    cur = await conn.execute(
+        "SELECT DISTINCT session_id FROM messages "
+        "WHERE role='assistant' AND status='streaming'"
+    )
+    sessions = [r[0] for r in await cur.fetchall()]
+    for sid in sessions:
+        await turn_marker.mark_crashed(sid)
+    return len(sessions)
 
 
 def _row_to_session(row: aiosqlite.Row) -> dict[str, Any]:

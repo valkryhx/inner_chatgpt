@@ -510,8 +510,21 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
 
     # 自愈：若上一轮因工具异常中断，checkpoint 可能残留「AI 已发 tool_calls 但无 tool 结果」
     # 的悬空状态，会导致本次请求被模型服务 400 拒绝并级联污染会话。这里先修复（补结果或截断）。
+    #
+    # ⚠️ 崩溃 vs 用户停止必须区别对待（持久化第二步）：
+    # `sanitize()` 在「尾部悬空 + 工具可解析」时会**真的重新执行一次**那个工具。
+    # 用户主动停止时这是对的（那一轮用户打断了，工具大概率没跑）；
+    # 但进程崩溃时那个 `code_run` 可能已经执行过 —— 重放 = 重复副作用。
+    # 所以先查崩溃标记：有标记就注入上下文，让 `sanitize()` 补一条
+    # 「执行状态未知」而不是重放。
     try:
         async with async_span(prelude, "sanitize"):
+            from .. import turn_marker
+            crash = await turn_marker.get_crash_marker(session_id)
+            if crash is not None:
+                ur.loop.set_crash_context(crash)
+                logger.info("[crash] 会话 %s 上一轮被崩溃中断，本轮修历史时不重放工具",
+                            session_id)
             healed = await ur.sanitize_pending_tool_calls(session_id)
         if healed:
             yield sse_frame("healed", {"repaired": True})
@@ -753,6 +766,16 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
         _finalize_sub_blocks(status)
         await _persist(status, force=True)
         yield frame("done", {"message_id": message_id, "status": status, "model": ur.model.model_name})
+
+        # 这一轮走到了正常出口（complete 或被用户停止）—— 崩溃标记该清了。
+        # 「用户停止」也算正常出口：那是显式动作，下一轮重放工具是安全的，
+        # 标记只代表「上一进程没走完就死了」，不代表「上一轮失败了」。
+        # 走不到这里（异常/进程死）时标记保留，正是我们要的。
+        try:
+            from .. import turn_marker as _tm
+            await _tm.clear_crash_marker(session_id)
+        except Exception:  # noqa: BLE001 - 清标记失败不影响本轮
+            pass
 
         # P4：赛后补压缩。**必须放在 done 之后**——用户看到「完成」就不该
         # 再等摘要那几秒。这里只登记后台任务，不 await。

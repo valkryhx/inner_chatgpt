@@ -113,6 +113,26 @@ def _llm_retry_notice(event: str, attempt: int, err: Exception) -> None:
         pass
 
 
+def _describe_unknown_tool_result(tool_name: str) -> str:
+    """崩溃中断后补进历史的「执行状态未知」说明。
+
+    为什么这是模块级函数而不是 import `turn_marker.describe_unknown_result`：
+    核心循环不 import 持久化模块（与 `on_turn_end` / `prefetch_factory` 同理）。
+    文案必须与 `turn_marker.describe_unknown_result` 保持一致 —— 两处都有测试
+    断言「未知」二字，改一处忘了另一处会被测出来。
+
+    刻意**不**标成 is_error：它不是工具的失败，是观测的缺失。模型看到
+    「错误」会倾向重试，看到「未知」才会先去看一眼产物。
+    """
+    name = tool_name or "该工具"
+    return (
+        f"[执行状态未知] {name} 在上一轮被进程中断，无法确定是否已执行完成。"
+        f"它**可能已经产生了实际影响**（文件写入、命令执行、外部调用）。"
+        f"重试前请先核对结果（例如读取目标文件、查看命令产物）；"
+        f"若已生效，不要再执行一次。"
+    )
+
+
 def _dump(obj: Any) -> str:
     if isinstance(obj, str):
         return obj
@@ -168,6 +188,18 @@ class AgentLoop:
         # 会让这一代的记忆永远注入不进来。
         self._memory_prefetch_state = None
         self._prefetch_handle = None
+        # 崩溃上下文（持久化第二步）。None = 没有崩溃，`sanitize()` 维持
+        # 既有行为（尾部悬空就重放）。非 None = 上一进程崩在这一轮，
+        # **绝不重放**，改为补一条「执行状态未知」的结果让模型先核对。
+        #
+        # 为什么由外部注入而不让 AgentLoop 自己查库：核心循环不该知道
+        # `turn_marker` 的存在（与 `on_turn_end` / `prefetch_factory` 同理），
+        # 且这样测试可以精确构造场景。
+        self._crash_context = None
+
+    def set_crash_context(self, marker) -> None:
+        """注入崩溃上下文；`None` 表示这一轮没有崩溃中断过。"""
+        self._crash_context = marker
 
     def _injector_guard_now(self) -> InjectorGuard:
         """按**当前** `message_injector` 返回 guard（惰性绑定）。
@@ -267,6 +299,29 @@ class AgentLoop:
                 if str(tc.get("id") or "") in missing
             )
             if not has_later_non_tool and can_replay:
+                # ⚠️ 崩溃中断时**不能重放**：那个工具可能已经执行过。
+                # `_crash_context` 非 None 说明上一进程没走完这一轮就死了，
+                # 我们原理上无法确定它执行到哪一步。
+                #
+                # 这里补一条**明确的「执行状态未知」**结果，而不是静默重放：
+                # 让模型据此决定要不要重试、要不要先核对产物。伪装成失败
+                # 会诱发盲目重试，伪装成成功会丢失工作 —— 只有如实说
+                # 「不知道」才是正确的。
+                if self._crash_context is not None:
+                    for tc in msg.get("tool_calls") or []:
+                        tid = str(tc.get("id") or "")
+                        if tid not in missing:
+                            continue
+                        name = (tc.get("function") or {}).get("name") or ""
+                        history.append({
+                            "role": "tool",
+                            "tool_call_id": tid,
+                            "name": name,
+                            "content": _describe_unknown_tool_result(name),
+                        })
+                    changed = True
+                    i = len(history)
+                    continue
                 for tc in msg.get("tool_calls") or []:
                     tid = str(tc.get("id") or "")
                     if tid not in missing:
