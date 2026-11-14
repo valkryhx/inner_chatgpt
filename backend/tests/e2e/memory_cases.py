@@ -321,7 +321,93 @@ async def _measure_injector_local(client: httpx.AsyncClient, token: str) -> dict
             "block_chars": len(text)}
 
 
-CASES = {"S-M1": case_sm1, "S-M2": case_sm2, "S-M3": case_sm3, "S-M5": case_sm5}
+async def case_sm4(client: httpx.AsyncClient, token: str, out: Path) -> dict:
+    """S-M4：**后台自动提取**兜底写记忆（M4 后半的真机验证）。
+
+    前置：后端必须以 ``HLZ_MEMORY_AUTO_WRITE=1`` 启动（默认是 0）。
+
+    测什么：**模型这一轮没有主动写记忆，但信息值得记**，后台能不能兜住。
+    这正是 M4 存在的理由 —— 补上模型自觉性的漏。
+
+    为什么 prompt 刻意「不诱导」：
+    第一版 prompt 里写了「以后跟我讨论问题时请都这样」，结果**模型当轮就自己
+    调了 ``memory_write``**（工具序列 ``memory_list → memory_write``），
+    于是闸 1（本区间已直写）正确地拦掉了后台提取 —— 断言「不许出现 memory_write」
+    反而变成了错的。那一轮证明了闸 1 在工作，但没有验证「兜底」这条路径。
+
+    现在改成：把偏好放在**顺带一提**的位置，不给「请记住」的指令，
+    让模型倾向直接回答而不是写工具。
+
+    后台提取是 fire-and-forget，SSE 结束不代表它跑完，所以要轮询等。
+    """
+    status = await client.get("/api/me/memories/status",
+                              headers={"Authorization": f"Bearer {token}"})
+    status.raise_for_status()
+    st = status.json()
+    if not st.get("auto_write"):
+        return {
+            "case": "S-M4",
+            "checks": [{"kind": "precondition", "ok": False,
+                        "detail": "后端未开启 HLZ_MEMORY_AUTO_WRITE=1，本场景前提不成立。"
+                                  "请用 HLZ_MEMORY_AUTO_WRITE=1 启动后端后重跑。"}],
+            "ok": False,
+        }
+
+    before = await _list_memories(client, token)
+    before_slugs = {e["slug"] for e in before.get("entries") or []}
+
+    sid = await new_session(client, token, "S-M4")
+    # 偏好夹在问题里「顺带提」，不写「请记住」。
+    prompt = (f"帮我解释一下 Python 的 GIL 是什么。"
+              f"对了说明一下背景：我是做后端的，团队里习惯先看压测数据再下结论，"
+              f"不太喜欢纯理论的说法。")
+    ev = await send_message(client, token, sid, prompt, 240)
+    summary = summarize(ev)
+
+    # 轮询等后台提取（最多 ~90s）
+    after = before
+    for _ in range(45):
+        await asyncio.sleep(2)
+        after = await _list_memories(client, token)
+        if len(after.get("entries") or []) > len(before_slugs):
+            break
+
+    after_slugs = {e["slug"] for e in after.get("entries") or []}
+    new_slugs = after_slugs - before_slugs
+
+    bodies = ""
+    for slug in new_slugs:
+        r = await client.get(f"/api/me/memories/{slug}",
+                             headers={"Authorization": f"Bearer {token}"})
+        if r.status_code == 200:
+            bodies += (r.json().get("content") or "") + (r.json().get("description") or "")
+
+    write_calls = [t for t in summary["tools"] if t == "memory_write"]
+
+    checks = [
+        {"kind": "auto_write_enabled", "ok": bool(st.get("auto_write")),
+         "detail": "后端已开启自动提取"},
+        {"kind": "model_did_not_write_directly", "ok": not write_calls,
+         "detail": f"工具序列：{summary['tools']}（本轮应由后台兜底，而不是模型自己写）"},
+        {"kind": "background_extraction_wrote", "ok": bool(new_slugs),
+         "detail": f"新增 slug：{sorted(new_slugs)}"},
+        {"kind": "done", "ok": (summary["done"] or {}).get("status") == "complete",
+         "detail": str(summary["done"])},
+    ]
+    return {
+        "case": "S-M4",
+        "session_id": sid,
+        "checks": checks,
+        "ok": all(c["ok"] for c in checks),
+        "answer": summary["text"][:400],
+        "tools": summary["tools"],
+        "new_slugs": sorted(new_slugs),
+        "new_bodies_preview": bodies[:500],
+    }
+
+
+CASES = {"S-M1": case_sm1, "S-M2": case_sm2, "S-M3": case_sm3,
+         "S-M4": case_sm4, "S-M5": case_sm5}
 
 
 async def main(argv: list[str]) -> int:

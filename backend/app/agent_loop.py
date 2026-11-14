@@ -125,7 +125,7 @@ def _dump(obj: Any) -> str:
 class AgentLoop:
     def __init__(self, client: LLMClient, registry: ToolRegistry, system_prompt: str,
                  max_turns: int = 300, history_store=None, *, user_id: str = "",
-                 message_injector=None, team_gate=None):
+                 message_injector=None, team_gate=None, on_turn_end=None):
         self.client = client
         self.registry = registry
         self.system_prompt = system_prompt
@@ -148,6 +148,14 @@ class AgentLoop:
         # 「还有团队工作在跑」并给出原因，循环据此续跑而不是结束。
         # Team 之外永远是 None，行为与历史完全一致。
         self.team_gate = team_gate
+        # 可选：轮次正常收尾时的侧边任务（记忆提取 / dream 等）。
+        # 语义对齐 CC 的 throughStopHooks 阶段——那个阶段里并挂着五件互不相关的
+        # 事，每件各自 try/except（m0848:3849-3876）。所以这里也是
+        # **逐件独立**：一个失败不能连累下一个。
+        #
+        # 只在「正常完成」这一条出口触发，不在 stopped / error / 超墙钟时触发：
+        # 半截对话提取出来的记忆往往是错的，而且用户已经明确中断了。
+        self.on_turn_end = on_turn_end
 
     def _injector_guard_now(self) -> InjectorGuard:
         """按**当前** `message_injector` 返回 guard（惰性绑定）。
@@ -303,6 +311,28 @@ class AgentLoop:
             await guard.flush()
         except BaseException:  # noqa: BLE001 - 收尾绝不能影响正常结束
             logger.warning("注入器收尾失败", exc_info=True)
+
+    async def _run_turn_end_hooks(self, history: list[dict]) -> None:
+        """轮次正常完成时跑侧边任务。**逐件独立**，一件失败不影响其他。
+
+        为什么逐件独立：CC 在同一个「轮次收尾」阶段里挂了五件互不相关的事
+        （post-turn summary / 记忆提取 / dream / prompt suggestion / brief 检查，
+        `m0848:3849-3876`），每件各自 try/catch。摘要失败不该拖累记忆提取。
+        做成「一个失败全跳过」是这类设计里最常见的错。
+
+        为什么只在正常完成时跑：stopped / error / 超墙钟都是「这一轮没跑完」，
+        半截对话提取出来的记忆往往是错的，而且用户已经明确中断了 ——
+        他不需要系统在背后继续消化他的中断。
+        """
+        hook = self.on_turn_end
+        if hook is None:
+            return
+        try:
+            result = hook(history)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001 - 收尾失败绝不能影响本轮成败
+            logger.warning("轮次收尾任务失败（不影响本轮结果）", exc_info=True)
 
     async def _run_stream_inner(
         self,
@@ -481,6 +511,11 @@ class AgentLoop:
                         yield {"type": "team_wait", "reason": str(pending),
                                "grace_left": mine}
                         continue
+                # 轮次正常收尾：跑侧边任务（记忆提取 / dream）。
+                # 必须在 yield done 之前跑完 —— 之后 SSE 就关了，后台任务
+                # 拿不到「本轮发生了什么」。这些函数内部各自判闸门，
+                # 不满足立即返回；异常各自吞掉，绝不影响本轮成败。
+                await self._run_turn_end_hooks(history)
                 yield {"type": "done", "status": "complete"}
                 return
 

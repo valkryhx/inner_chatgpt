@@ -238,6 +238,20 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
     from ..memory_inject import MemoryInjector, wrap_with_memory
     _memory_injector = MemoryInjector(team_ctx.user_id)
 
+    # 轮次收尾钩子（M4 后台记忆提取）。team 路径的 loop 是本轮新建的，
+    # 直接在这里挂；SSE 层的 _install_memory_turn_end 见到 _memory_aware
+    # 就不会重复挂（一个 loop 只能有一个钩子）。
+    from ..memory_extract import make_turn_end_hook as _make_turn_end_hook
+
+    class _TurnEndUR:
+        """钩子只需要 user_id 与 client，不需要完整的 UserRuntime。"""
+
+        def __init__(self, user_id: str, model: object) -> None:
+            self.user_id = user_id
+            self.model = model
+
+    _turn_end_ur = _TurnEndUR(team_ctx.user_id, base_runtime.model)
+
     def _lead_injector():
         """Lead 的注入点：团队收件箱 + 子代理结束通知。
 
@@ -307,6 +321,8 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
         message_injector=wrap_with_memory(_lead_injector, _memory_injector),
         # 收工前的团队闸：队友还在跑就别结束这一轮
         team_gate=_team_gate,
+        # 轮次正常收尾时的后台记忆提取（每件独立，失败不影响本轮）
+        on_turn_end=_make_turn_end_hook(_turn_end_ur),
     )
     # 标记：本注入器已经会 drain 用户插话队列。非 team 路径据此避免再装一个，
     # 否则同一条消息会被两个注入器各取一次（其中一次取到空，看起来没事，

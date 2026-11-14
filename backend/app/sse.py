@@ -167,6 +167,32 @@ def _install_memory_injector(ur, user_id: str, session_id: str, user_text: str) 
         logging.getLogger(__name__).warning("记忆注入器装配失败，本轮不注入", exc_info=True)
 
 
+def _install_memory_turn_end(ur, user_id: str) -> None:
+    """给本轮的 loop 挂「轮次收尾」钩子（后台记忆提取，M4）。
+
+    为什么挂在 loop 上而不是在 sse 里 yield done 之后调：
+    ``run_agent_stream`` 是 SSE 的生产者，它 yield ``done`` 之后整条流就关了，
+    之后再也拿不到「本轮到底发生了什么」（history 还在，但没有明确的收尾点）。
+    而 ``AgentLoop`` 内部知道「正常完成」这个出口在哪，且它已经持有 history。
+
+    为什么 ``AgentLoop`` 不直接知道记忆：钩子是它唯一知道的形态。
+    这样 agent_loop 不 import 记忆模块，记忆关了也不会在核心里留死代码。
+    """
+    loop = getattr(ur, "loop", None)
+    if loop is None:
+        return
+    # team 路径（subagent/session.py）已经在构造里挂了钩子。
+    # 一个 loop 只能有一个 on_turn_end，重复挂会顶掉前一个。
+    if getattr(loop, "_memory_aware", False):
+        return
+    try:
+        from .memory_extract import make_turn_end_hook
+        loop.on_turn_end = make_turn_end_hook(ur)
+    except Exception:  # noqa: BLE001 - 提取是增强，装不上不该让整轮起不来
+        import logging
+        logging.getLogger(__name__).warning("记忆提取钩子装配失败，本轮不提取", exc_info=True)
+
+
 async def run_agent_stream(
     ur,
     session_id: str,
@@ -206,6 +232,8 @@ async def run_agent_stream(
     # （记忆 -> steer -> 原始），所以装配先后不影响结果顺序，
     # 但要保证两边都写进槽位后 message_injector 是最终形态。
     _install_memory_injector(ur, user_id, session_id, user_text)
+    # 轮次收尾钩子（M4 后台提取）。同样必须在 run_stream 之前挂。
+    _install_memory_turn_end(ur, user_id)
 
     async for ev in ur.loop.run_stream(history, stop_event=stop_event, session_id=session_id):
         et = ev.get("type")
