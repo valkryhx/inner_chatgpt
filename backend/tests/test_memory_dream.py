@@ -190,6 +190,34 @@ def test_m17_hard_disabled_wins(env, monkeypatch):
     assert client.calls == [], "HLZ_MEMORY_DISABLED=1 时连模型都不该调"
 
 
+def test_m17_first_run_does_not_wait_min_hours(env, monkeypatch):
+    """`last_consolidated=0`（从没跑过）时**不**受 minHours 约束。
+
+    这是有意为之：`now - 0` 永远是巨大值，所以时间闸天然放行。
+    语义是「首次整理不需要等一天」—— 用户刚积累出几条记忆、几个会话，
+    就该整理一次，而不是等到明天。会话数闸仍然是硬门槛。
+
+    把它写成测试的理由：这个行为从代码上「碰巧成立」，容易被后来的人
+    当作 bug「修」成 `if not since: return`，那样新用户永远等不到首次整理。
+    """
+    monkeypatch.setenv("HLZ_MEMORY_DREAM_MIN_HOURS", "24")
+    monkeypatch.setenv("HLZ_MEMORY_DREAM_MIN_SESSIONS", "1")
+    _mem("a", "第一条")
+    _session()
+    assert run(md.get_state("u1"))["last_consolidated"] == 0
+    out = run(md.dream_once("u1", FakeClient([[]])))
+    assert out.ran is True, out.reason
+
+
+def test_m17_first_run_still_blocked_by_session_gate(env, monkeypatch):
+    """首次不受时间闸约束，但**仍受**会话数闸约束（不能一有记忆就整理）。"""
+    monkeypatch.setenv("HLZ_MEMORY_DREAM_MIN_HOURS", "24")
+    monkeypatch.setenv("HLZ_MEMORY_DREAM_MIN_SESSIONS", "5")
+    _mem("a", "第一条")
+    out = run(md.dream_once("u1", FakeClient([[]])))
+    assert out.ran is False and "会话数" in out.reason
+
+
 def test_m17_force_skips_time_gates(env, monkeypatch):
     """设置页「立即整理」跳过时间闸与会话数闸，但**不跳过**开关与锁。"""
     monkeypatch.setenv("HLZ_MEMORY_DREAM_MIN_HOURS", "999")
@@ -467,12 +495,19 @@ def test_m23_failed_run_with_writes_sets_index_pending(env, monkeypatch):
 
 # ---------------- 先写后删闸 ----------------
 def test_delete_refused_before_any_successful_write(env):
-    """一条都没写就删 -> 拒绝。prompt 说了顺序，但「内容真的丢了」不可逆。"""
+    """一条都没写就删 -> 拒绝。prompt 说了顺序，但「内容真的丢了」不可逆。
+
+    ⚠️ 必须先 ``memory_read``：否则这条测试会被**另一道闸**（先读后删）
+    拦下，于是无论「先写后删」闸在不在它都通过 —— 变异测试第一次就是这么
+    漏掉它的（见 `work/_dream_mutation.py`）。加 read 才能单独验这道闸。
+    """
     _mem("a", "第一条")
     _mem("b", "第二条")
     reg = md.build_dream_registry("u1")
+    run(reg.dispatch("memory_read", {"slug": "b"}))   # 过掉「先读后删」闸
     out = json.loads(run(reg.dispatch("memory_delete", {"slug": "b"})))
-    assert out["outcome"] == "refused"
+    assert out["outcome"] == "refused", out
+    assert "还没有任何成功写入" in out.get("note", ""), out
     assert run(ms.get_memory("u1", "b")) is not None, "被拒的删除不能真删"
 
 
@@ -480,10 +515,70 @@ def test_delete_allowed_after_successful_write(env):
     _mem("a", "第一条")
     _mem("b", "第二条")
     reg = md.build_dream_registry("u1")
+    # 必须**先读**再删（代码级闸，见 memory_dream._build_delete_tool 的闸 2）
+    run(reg.dispatch("memory_read", {"slug": "b"}))
     run(reg.dispatch("memory_write", {"slug": "a", "content": "合并正文",
                                       "description": "合并描述"}))
     out = json.loads(run(reg.dispatch("memory_delete", {"slug": "b"})))
     assert out["outcome"] == "deleted"
+    assert run(ms.get_memory("u1", "b")) is None
+
+
+def test_delete_refused_if_not_read_first(env):
+    """没 memory_read 过就删 -> 拒绝。
+
+    为什么这条重要：模型完全可能只看了 `memory_list` 的描述（`version` 在 list
+    里是空串，读不到版本）就决定「这条是重复的，删掉」。而描述只是索引，
+    正文里可能有 list 看不到的事实 —— 实测 C-2b 就是这么丢数据的。
+    """
+    _mem("a", "第一条")
+    _mem("b", "第二条")
+    reg = md.build_dream_registry("u1")
+    run(reg.dispatch("memory_write", {"slug": "a", "content": "x", "description": "x"}))
+    # 只 list 不 read
+    run(reg.dispatch("memory_list", {}))
+    out = json.loads(run(reg.dispatch("memory_delete", {"slug": "b"})))
+    assert out["outcome"] == "refused", out
+    assert run(ms.get_memory("u1", "b")) is not None
+
+
+def test_delete_refused_if_changed_after_read(env):
+    """读过之后被改动 -> 拒绝，并返回最新内容让模型重新判断。
+
+    这就是 C-2b 实测暴露的竞态：dream 按 Phase 1 的旧快照删，
+    提取器在 Phase 2 期间补了新事实，那些事实会跟着文件一起消失。
+    """
+    _mem("a", "第一条")
+    _mem("b", "第二条 v1", body="# v1\n\nOLD\n")
+    reg = md.build_dream_registry("u1")
+    run(reg.dispatch("memory_read", {"slug": "b"}))          # 读到 v1
+    run(reg.dispatch("memory_write", {"slug": "a", "content": "x", "description": "x"}))
+    # 模拟提取器在期间补了新事实
+    run(ms.write_memory("u1", slug="b", description="第二条 v2",
+                        body="# v2\n\nNEW_FACT_FROM_EXTRACT\n"))
+
+    out = json.loads(run(reg.dispatch("memory_delete", {"slug": "b"})))
+    assert out["outcome"] == "conflict", out
+    assert "NEW_FACT_FROM_EXTRACT" in (out.get("currentContent") or ""), \
+        "冲突响应必须带上最新内容，否则模型无法判断该不该继续删"
+    got = run(ms.get_memory("u1", "b"))
+    assert got is not None and "NEW_FACT_FROM_EXTRACT" in (got.body or "")
+
+
+def test_delete_allowed_after_reread(env):
+    """冲突后重读、确认内容已合并，就能删（闸不该变成死路）。"""
+    _mem("a", "第一条")
+    _mem("b", "第二条 v1", body="# v1\n\nOLD\n")
+    reg = md.build_dream_registry("u1")
+    run(reg.dispatch("memory_read", {"slug": "b"}))
+    run(reg.dispatch("memory_write", {"slug": "a", "content": "x", "description": "x"}))
+    run(ms.write_memory("u1", slug="b", description="v2", body="# v2\n\nOLD\n"))
+    first = json.loads(run(reg.dispatch("memory_delete", {"slug": "b"})))
+    assert first["outcome"] == "conflict"
+
+    run(reg.dispatch("memory_read", {"slug": "b"}))          # 重读拿新版本
+    second = json.loads(run(reg.dispatch("memory_delete", {"slug": "b"})))
+    assert second["outcome"] == "deleted", second
     assert run(ms.get_memory("u1", "b")) is None
 
 
@@ -492,6 +587,8 @@ def test_delete_budget_is_capped(env, monkeypatch):
     for i in range(5):
         _mem(f"m{i}", f"第 {i} 条")
     reg = md.build_dream_registry("u1")
+    for i in range(1, 5):
+        run(reg.dispatch("memory_read", {"slug": f"m{i}"}))
     run(reg.dispatch("memory_write", {"slug": "m0", "content": "x",
                                       "description": "x"}))
     results = [json.loads(run(reg.dispatch("memory_delete", {"slug": f"m{i}"})))
@@ -514,6 +611,7 @@ def test_dream_outcome_reports_written_and_deleted(env, monkeypatch):
     _mem("a", "第一条")
     _mem("b", "第二条")
     script = [[
+        _call("memory_read", {"slug": "b"}, "c0"),
         _call("memory_write", {"slug": "a", "content": "合并正文",
                                "description": "合并描述"}, "c1"),
         _call("memory_delete", {"slug": "b"}, "c2"),

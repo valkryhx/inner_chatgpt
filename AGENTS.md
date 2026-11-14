@@ -196,13 +196,28 @@
   只在 dream 的 registry 里；对外三件套契约不变**（`test_dream_registry_has_delete_but_root_does_not` 钉住）。
   「先写后删」是**代码级闸**（本次 dream 零成功写入时 delete 直接拒绝），不靠提示词。
   提示词按实际工具面重写（CC 的 Phase 1「列出目录」/Phase 4「更新 MEMORY.md」在 Hlaudz 没有对应工具）。
-- **M4.5 验证**：33 项新测（方案 M-17/M-18/M-19/M-21/M-22/M-23 全覆盖）+ **8 条变异全部被抓**
-  （`python work/_dream_mutation.py`），后端全量 **1007 passed**。
-  **S-M8 真机通过**（runId `1794648745-97b3`）：5 条重复记忆 → 1 条，正文保留「姓徐 /
-  不喜欢被叫全名 / 叫老徐」，「上周三」被消解，索引行数与实际一致，44.8s。
-  幂等（连点两次：第二次零写入零删除）、后台巡检自然跑到、启动收敛清新鲜锁三件事均实测。
-- **未完成：Web UI 视觉验证**（`MemorySection` 的 dream 区块只过了 `npm run build` + `tsc`，无 Playwright 截图）。
-- 详见 `docs/20261114-记忆系统M1-M3实施记录.md`（§11 是 M4.5 专章）；设计与分阶段计划见 `docs/20261112-Hlaudz记忆系统实施方案.md`。
+- **M4.5 验证**：38 项单测（方案 M-17/M-18/M-19/M-21/M-22/M-23 全覆盖）+ **11 条变异全部被抓**
+  （`cd backend && python ../tools/memory_verify/dream_mutation.py`），后端全量 **1012 passed**。
+  **S-M8 真机通过**（runId `1794648745-97b3` / 加闸后重跑 `1794653526-f593`）：
+  5 条重复记忆 → 1 条，正文保留「姓徐 / 不喜欢被叫全名 / 叫老徐」，「上周三」被消解，
+  索引行数与实际一致，44.8s。幂等（连点两次：第二次零写入零删除）、后台巡检自然跑到、
+  启动收敛清新鲜锁三件事均实测。
+- **三项未覆盖已补（2026-11-14），其中一项抓出真实数据丢失缺陷**（见
+  `docs/20261114-记忆系统三项未覆盖验证记录.md`，工具在 `tools/memory_verify/`）：
+  ① **Playwright UI 52/52**（设置页 dream 区块渲染、按钮在可视区内、原生 confirm
+  接管、落库核对、tab 往返不白屏、零 JS 错误），8 张截图；
+  ② **dream 与提取并发** —— **`memory_delete` 原本无版本保护**，dream 按 Phase 1
+  旧快照删除时会把提取器在 Phase 2 补写的新事实一起抹掉（100% 可复现，非理论风险）。
+  已加两道**代码级**闸：「先读后删」（`budget.seen` 记录 `memory_read` 读到的
+  version；`memory_list` 的 version 是空串，所以「只看描述」不算读过）+
+  「读后未变」（version 变了返回 conflict 并带最新内容）。修后 6/6 通过，
+  S-M8 真机重跑仍全绿（模型自然先读再删，没卡住）；
+  ③ **跨进程锁** —— 部署是单 worker，改为验证跨进程锁语义（这才是实质问题）：
+  4 进程持续重试 6 秒，33–35 次抢锁、**持锁窗口两两不重叠**（真串行）。
+- **未完成：真·多 worker（`workers=N`）实测**。若改多 worker 部署，需重跑
+  `multi_process_lock.py` 并验证 lifespan 里 `recover_dream_state()` 被多 worker 并发调用的行为。
+- 详见 `docs/20261114-记忆系统M1-M3实施记录.md`（§11 是 M4.5 专章）与
+  `docs/20261114-记忆系统三项未覆盖验证记录.md`；设计与分阶段计划见 `docs/20261112-Hlaudz记忆系统实施方案.md`。
 
 ### 0.2 必读文档（按顺序）
 
@@ -213,7 +228,8 @@
 | `docs/20261114-CC319记忆机制源码复核v3.md` | **CC 记忆机制复核（最新，权威，6 项疑似已清零）**：对 v2 逐条回源复核（63 个行号区间 + 55 条解释性结论），定案 6 处 v2 错误——① `MEMORY.md` 默认走 `instructions` attachment 而非 system prompt（`n0n()` 默认 true → announced）；② `memory_list` 定义在 `m0816:2988`（v2 指的 `m0591:75831` 是 `memory_read` 的 schema），有 `cursor`/默认页 50；③ 索引 cap 25000 是 UTF-16 code unit 不是字节（单文件召回 4096 才是真字节）；④ `Dl()` 非主拼装器（主路径是 `li`/`Ll`）且不含类型表/禁止清单；⑤ `aY()` 是 SDK 入口判定；⑥ 28 个环境变量里 2 个零读取、2 个只写不读。**另含 6 项 chunk 落地后的定论**（`Gn` 剥 `[1m]`、`Cae` 确含 `system-reminder`、`rr`=远端能力、`yIe` 恒 null 致账号记忆链死代码、`DISABLE_ORG_MEMORY` 拦组织同步、`n0n()` 默认 true）+ 6 条口径提醒 + **51 条可直接引用的白名单**。**另有落地时发现的第 7 处**：闸门适用模式划分不准（第 4 道权限闸仅文件模式、`first_look` 是 MCP 专属第 8 道，文件模式下 CC 无此闸）。复现脚本 `tools/cc_source_verify/`（`build_chunk_map.py` 1764 chunk 全命中、`verify_line_refs.py` 102 项行号断言）。**与 v2 冲突以此为准** |
 | `docs/20261113-CC319记忆机制源码核实v2.md` | **CC 记忆机制权威调研（已被 v3 复核）**：6 条读路径（含 `relevant_memories` 相关性选择器、`AutoMem` 索引注入、MCP 记忆库、账号记忆）/ 2 条写路径（`extractMemories` + `auto_dream` 合并）/ 四类记忆提示词全文 / 隔离与 28 个环境变量分类，逐条带行号证据。**方向与 51 条事实成立，但有 6 处错误见 v3 §1；§7 账号记忆时序在本 build 不会真的发生，见 v3 §4.4** |
 | `docs/20261114-CC319记忆触发时机核实.md` | **CC 记忆的触发时机（写/读/dream 三者何时发生）**：写侧不是常驻后台而是「每个用户轮次结束尝试一次」（`Jd` → `executeExtractMemories` → `ir` → `ar` → `Le`），文件模式下还有 `tengu_passport_quail` 一道默认 false 的外层闸（v2/v3 均未记录）；读侧 `AutoMem` 索引每次模型调用装配时读，`relevant_memories` 选择器受 `lSe()` 门控**默认不跑**；dream 与提取器同点触发但被 24h + 5 会话 + 10min 三道时间闸压成隔天级，且**不做**「从失败中学习」。**推翻方案 §3.7 的「读侧主路径」与「每 generation 一次」两处说法** |
-| `docs/20261114-记忆系统M1-M3实施记录.md` | **记忆 M1–M4.5 实施记录（最新，已落地，含 L3 真机 e2e）**：`memory_store.py`（文件即真相 + DB 索引 + `_reconcile` 自愈 + `cursor` 分页 + `if_version` CAS + 两套预算口径）/ `memory_tools.py`（三件套，子代理在装配处就被裁掉）/ `memory_inject.py`（`wrap_with_memory` 组合、slug 集合去重、`_volatile` 在 `HistoryStore` 统一剥离）/ `routers/memory.py` + 设置页「我的记忆」tab。**§11 是 M4.5 dream 专章**：巡检任务 + DB 行锁 + 启动收敛 + `index_pending` 可重入 + dream 专属 `memory_delete` + 「先写后删」代码级闸 + 提示词为何没有照抄 CC。**165 项测试 + 15 项反向确认 + 8 条变异 + L2 集成 + 6 个 L3 真机 e2e（S-M1~S-M5、S-M8）**；顺带修掉 steer 跨代失效与注入路径 O(文件内容) 两处既有缺陷 |
+| `docs/20261114-记忆系统三项未覆盖验证记录.md` | **记忆三项未覆盖验证（最新，其中一项抓出真缺陷）**：① Playwright UI **52/52**（`tools/memory_verify/ui_dream.py`，8 截图，含「按钮在可视区内」「原生 confirm 要显式接管」「落库核对不能用列表文本」三个只有真浏览器能发现的设计点，以及一次「截图残留」误报的排查记录）；② 进程内并发 6 场景（`concurrent_write.py`）—— **抓出 `memory_delete` 无版本保护导致的数据丢失（C-2b，100% 可复现）**，修法是「先读后删 + 读后未变」两道代码级闸，并解释为何不靠 prompt、不要求模型传 if_version；③ 跨进程锁 4 场景（`multi_process_lock.py`）—— 用两个真实进程而非 uvicorn --workers（后者在 `multiprocessing.spawn` 下要 `if __name__` 保护），33–35 次抢锁、持锁窗口两两不重叠。**另含 C-3 判据纠错**（索引并发期允许陈旧，因为 `MEMORY.md` 目前无运行期读取者；只验收敛性 + 无幽灵行），以及 `last_consolidated=0` 时首次不受时间闸约束这一「碰巧成立」语义的钉住 |
+| `docs/20261114-记忆系统M1-M3实施记录.md` | **记忆 M1–M4.5 实施记录（最新，已落地，含 L3 真机 e2e）**：`memory_store.py`（文件即真相 + DB 索引 + `_reconcile` 自愈 + `cursor` 分页 + `if_version` CAS + 两套预算口径）/ `memory_tools.py`（三件套，子代理在装配处就被裁掉）/ `memory_inject.py`（`wrap_with_memory` 组合、slug 集合去重、`_volatile` 在 `HistoryStore` 统一剥离）/ `routers/memory.py` + 设置页「我的记忆」tab。**§11 是 M4.5 dream 专章**：巡检任务 + DB 行锁 + 启动收敛 + `index_pending` 可重入 + dream 专属 `memory_delete` + 三道代码级闸 + 提示词为何没有照抄 CC。**168 项测试 + 15 项反向确认 + 11 条变异 + L2 集成 + 6 个 L3 真机 e2e（S-M1~S-M5、S-M8）**；顺带修掉 steer 跨代失效与注入路径 O(文件内容) 两处既有缺陷 |
 | `docs/20261112-Hlaudz记忆系统实施方案.md` | **记忆系统实施方案（设计；M1–M3 已按其落地）**：读侧复用 `message_injector` attachment 通道、写侧复用 subagent 后台运行时、`memories/<user_id>/private/` 物理隔离 + DB 行级隔离；M1–M5 分阶段（M1 含 `cursor` 分页 + `if_version` CAS）与 S-M1~S-M5 e2e 用例。**正文已于 2026-11-14 按 v2 §14.7 + v3 §6.2 全部修正完毕**（四类记忆与作用域默认值、文件模式四道闸门、三件套工具面、§3.5 索引注入走 attachment、§3.6 预算单位 code unit、§5.1 CAS、差异表 D-1~D-7）。**M4 及以后开工前读正文；M1–M3 的实际差异见实施记录 §7** |
 | `docs/20261112-CC319记忆系统源码调研.md` | **已被 `20261113-…核实v2.md` 取代**：方向（attachment 而非 hook）成立，但 `MEMORY.md` 注入方式与 `agent-memory*` 作用域含义有误，且漏掉 `relevant_memories` / MCP 记忆库 / `auto_dream` 三套机制。仅供追溯 |
 | `docs/20261111-Hlaudz对标GA-CC优化总纲.md` | **本轮优化总纲（最新）**：对标 GA main@f234d92 与 CC 319 的现状坐标、10 项差距矩阵、P0–P3 路线图、三层测试策略 |
@@ -271,7 +287,7 @@
 | `misc/` | **零碎、不那么重要的内容** | 放：参考材料、截图、临时说明、外部粘贴文本（如 `*.txt`）、他人项目笔记。可读但与主线弱相关。 |
 | `skill_assets/` | **Skill 交付包的本地目录（长期留存、不入库）** | 放：可导入的 `*.zip` 技能包，及其解包后的同名目录（作为可读的源）。**与 `work/` 的区别：这里的文件不会随时被清掉。** 整个目录已在 `.gitignore` 中排除（2026-11-11 决定）——技能包可能含业务数据或体积较大，不适合随仓库分发；需要分发时通过界面「导入技能包」传给对方。新增技能包时，可读源、zip、`backend/skills_shared/<name>/` 三处内容必须一致（`diff -r` 验证）。 |
 | `work/` | **临时测试产物的存放目录** | 放：一次性脚本（`_*.py`）、日志（`*.log`）、探针、构建监视脚本、临时 dump、调试快照。**可随时清理，不入正式交付。** |
-| `tools/` | **长期保留的运维/排查工具（入库）** | 放：需要反复使用的诊断脚本，如 `team_timeline.py`（从团队事件 JSONL 还原协作时间线）、`probe_chat_prelude.py` / `probe_soft_compact_blocking.py` / `probe_prelude_direct.py`（首帧串行阻塞三探针，见 `docs/20261112-Hlaudz首帧串行阻塞核实与优化设计.md` §5.3）、`cc_source_verify/`（CC 源码调研核验四件套：行号断言 / chunk→模块还原 / 符号反查 / 区间导出，见其 `README.md`）。与 `work/` 的区别：这里的东西**会一直用**，不是一次性脚本。 |
+| `tools/` | **长期保留的运维/排查工具（入库）** | 放：需要反复使用的诊断脚本，如 `team_timeline.py`（从团队事件 JSONL 还原协作时间线）、`probe_chat_prelude.py` / `probe_soft_compact_blocking.py` / `probe_prelude_direct.py`（首帧串行阻塞三探针，见 `docs/20261112-Hlaudz首帧串行阻塞核实与优化设计.md` §5.3）、`cc_source_verify/`（CC 源码调研核验四件套：行号断言 / chunk→模块还原 / 符号反查 / 区间导出，见其 `README.md`）、`memory_verify/`（记忆验证五件套：Playwright UI / 进程内并发 / 跨进程锁 / 变异测试 / 统一入口，见 `docs/20261114-记忆系统三项未覆盖验证记录.md`）。与 `work/` 的区别：这里的东西**会一直用**，不是一次性脚本。 |
 | `backend/` `frontend/` | 产品代码 | 只放能跑的实现代码与资源；不要把测试产物、日志、截图塞进去。 |
 
 > **Skill 三处存放的分工**（容易混淆，先说清）：

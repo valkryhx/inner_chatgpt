@@ -387,7 +387,19 @@ def build_dream_prompt(user_id: str) -> str:
 
 
 def _build_delete_tool(user_id: str, budget: "_DeleteBudget") -> Tool:
-    """dream 专用的 ``memory_delete``（不在 `MEMORY_TOOL_NAMES` 里，见模块 docstring）。"""
+    """dream 专用的 ``memory_delete``（不在 `MEMORY_TOOL_NAMES` 里，见模块 docstring）。
+
+    三道闸，**全部在代码里**，不靠提示词：
+
+    1. **先写后删**：本次 dream 一条都没写成功就删 —— 几乎必然是模型跳过了
+       合并直接清理。内容真丢了不可逆。
+    2. **先读后删 + 读后未变**（``budget.seen``）：只允许删除「模型读过、且读完之后
+       没有被改动过」的条目。这一条针对的是**提取器并发写**的真实竞态 ——
+       实测（`tools/memory_verify/concurrent_write.py` C-2b）确认：dream 在 Phase 1
+       读到旧版、Phase 2 期间提取器补了新事实、dream 按旧快照删除，新事实就丢了。
+       没有 delete 的版本保护时它是 100% 可复现的。
+    3. **删除配额**：防模型「大扫除」。
+    """
 
     async def memory_delete(args: dict) -> str:
         slug = str(args.get("slug") or args.get("name") or "").strip()
@@ -396,15 +408,34 @@ def _build_delete_tool(user_id: str, budget: "_DeleteBudget") -> Tool:
         if slug in budget.deleted:
             return json.dumps({"outcome": "noop", "slug": slug,
                                "note": "本次 dream 已经删过这条"}, ensure_ascii=False)
-        # **代码级「先写后删」闸**：本次 dream 一条都没写成功就删，几乎必然是
-        # 模型跳过了 Phase 2（读到一半就开始清理）。prompt 已经写明顺序，但
-        # 「内容真的丢了」是不可逆的，所以这里不能只靠 prompt。
         if budget.writes == 0:
             return json.dumps({
                 "outcome": "refused", "slug": slug,
                 "note": "本次 dream 还没有任何成功写入。先 memory_write 把内容合并进"
                         "保留的那条（确认 outcome == ok），再删被并掉的那些。",
             }, ensure_ascii=False)
+
+        # 闸 2：必须读过，且读过的版本与当前磁盘一致
+        current = await ms.get_memory(user_id, slug)
+        if current is None:
+            return json.dumps({"outcome": "not_found", "slug": slug},
+                              ensure_ascii=False)
+        seen = budget.seen.get(slug)
+        if seen is None:
+            return json.dumps({
+                "outcome": "refused", "slug": slug,
+                "note": "你没有读过这条就删它。先 memory_read 确认它的内容确实已经"
+                        "合并进保留者，再删。",
+            }, ensure_ascii=False)
+        if seen != current.version:
+            return json.dumps({
+                "outcome": "conflict", "slug": slug,
+                "current_version": current.version,
+                "currentContent": current.body or "",
+                "note": "这条在你读过之后被改动过（可能刚写入新事实）。"
+                        "重新 memory_read，确认新内容也已被合并，再删。",
+            }, ensure_ascii=False)
+
         if len(budget.deleted) >= budget.limit:
             return json.dumps({
                 "outcome": "refused", "slug": slug,
@@ -421,7 +452,8 @@ def _build_delete_tool(user_id: str, budget: "_DeleteBudget") -> Tool:
     return Tool(
         "memory_delete",
         "删除一条记忆。**只在本条已被成功合并进另一个 slug 之后使用**，"
-        "或用于删掉被明确证伪的条目。删之前先 memory_read 确认内容已经进了别处。"
+        "或用于删掉被明确证伪的条目。删之前必须先 memory_read 读过它，"
+        "且读过之后它不能又被改过（否则返回 conflict，需要重读确认）。"
         "本次 dream 还没有任何成功写入时它会被拒绝。",
         {
             "type": "object",
@@ -440,6 +472,50 @@ class _DeleteBudget:
     deleted: list[str] = field(default_factory=list)
     # 本次 dream 成功写入的次数 —— 「先写后删」闸的唯一依据
     writes: int = 0
+    # 模型读过的 slug -> 读到的 version。delete 的「读后未变」闸用它。
+    seen: dict[str, str] = field(default_factory=dict)
+
+
+def _wrap_seen_tracker(tools: list[Tool], budget: "_DeleteBudget") -> list[Tool]:
+    """包一层 ``memory_read`` / ``memory_list``，记下模型读到过哪些版本。
+
+    为什么要记录而不是让模型传 ``if_version``：模型经常忘记传（提示词说了也忘），
+    而这里可以**确定性地**知道它读过什么。少一个需要模型配合的约定，
+    就少一种「模型没照做 → 数据丢了」的失败路径。
+    """
+    out: list[Tool] = []
+    for tool in tools:
+        if tool.name not in ("memory_read", "memory_list"):
+            out.append(tool)
+            continue
+        original = tool.call
+
+        async def _call(args: dict, _orig=original, _name=tool.name) -> str:
+            result = await _orig(args)
+            try:
+                payload = json.loads(result)
+            except Exception:  # noqa: BLE001 - 非 JSON（错误文本）就不记
+                return result
+            try:
+                if _name == "memory_read":
+                    slug = str(payload.get("slug") or "")
+                    ver = str(payload.get("version") or "")
+                    if slug and ver:
+                        budget.seen[slug] = ver
+                elif _name == "memory_list":
+                    for entry in payload.get("entries") or []:
+                        slug = str(entry.get("slug") or "")
+                        ver = str(entry.get("version") or "")
+                        if slug and ver:
+                            budget.seen[slug] = ver
+            except Exception:  # noqa: BLE001
+                pass
+            return result
+
+        out.append(Tool(name=tool.name, description=tool.description,
+                        input_schema=tool.input_schema, call=_call,
+                        source=tool.source))
+    return out
 
 
 def _wrap_write_counter(tools: list[Tool], budget: "_DeleteBudget") -> list[Tool]:
@@ -477,7 +553,12 @@ def build_dream_registry(user_id: str, *, delete_limit: int = 0) -> ToolRegistry
     from .memory_tools import build_memory_tools
 
     budget = _DeleteBudget(limit=delete_limit if delete_limit else max_deletes())
-    tools = _wrap_write_counter(list(build_memory_tools(user_id)), budget)
+    tools = list(build_memory_tools(user_id))
+    # 顺序有讲究：先记「读过什么版本」，再记「写了什么」。
+    # 两者都包 memory_write 的同类工具，但 tracker 只关心 read/list，
+    # counter 只关心 write，互不干扰。
+    tools = _wrap_seen_tracker(tools, budget)
+    tools = _wrap_write_counter(tools, budget)
     tools.append(_build_delete_tool(user_id, budget))
     reg = ToolRegistry(tools)
     # 把配额挂在 registry 上，方便调用方在结束后读「删了哪些」
@@ -609,6 +690,10 @@ async def dream_once(user_id: str, client, *, force: bool = False,
 
     since = int(state.get("last_consolidated") or 0)
     if not force:
+        # since=0（从没跑过）时 `now - 0` 是巨大值，时间闸天然放行。
+        # 这是**有意**的：首次整理不该等满 24 小时 —— 用户刚积累出几条记忆、
+        # 几个会话就该整理一次。会话数闸仍是硬门槛，所以不会「一有记忆就跑」。
+        # 别把它「修」成 `if not since: return`，那会让新用户永远等不到首次整理。
         if now - since < min_hours() * 3600 * 1000:
             return DreamOutcome(
                 ran=False, user_id=user_id,
