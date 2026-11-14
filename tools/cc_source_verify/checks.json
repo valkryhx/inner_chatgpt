@@ -1,0 +1,441 @@
+{
+ "note": "每条 = 文档里的一处行号引用。must_contain 用子串匹配，'re:' 前缀走正则。",
+ "source": "docs/20261114-CC319记忆机制源码复核v3.md 与 v2 的引用清单",
+ "checks": [
+  {
+   "file": "m0084_0x112b080a.js",
+   "line": 25,
+   "must_contain": "function Gn(e)"
+  },
+  {
+   "file": "m0084_0x112b080a.js",
+   "line": 26,
+   "must_contain": "(1|2)m"
+  },
+  {
+   "file": "m0084_0x112b080a.js",
+   "line": 8,
+   "must_contain": "sonnet[1m]"
+  },
+  {
+   "file": "m0094_0x112cc57f.js",
+   "line": 10862,
+   "must_contain": "Context-size tags such as [1m] are ignored"
+  },
+  {
+   "file": "m0051_0x1126c209.js",
+   "line": 119,
+   "must_contain": "fwt = ["
+  },
+  {
+   "file": "m0051_0x1126c209.js",
+   "line": 120,
+   "must_contain": "Cae = ["
+  },
+  {
+   "file": "m0051_0x1126c209.js",
+   "line": 120,
+   "must_contain": "system-reminder"
+  },
+  {
+   "file": "m0182_0x11544ca2.js",
+   "line": 45,
+   "must_contain": "function j()"
+  },
+  {
+   "file": "m0182_0x11544ca2.js",
+   "line": 58,
+   "must_contain": "function Yx(e)"
+  },
+  {
+   "file": "m0095_0x1134b2dc.js",
+   "line": 56,
+   "must_contain": "function rr()"
+  },
+  {
+   "file": "m0095_0x1134b2dc.js",
+   "line": 57,
+   "must_contain": "FN().remote"
+  },
+  {
+   "file": "m0040_0x11239205.js",
+   "line": 6289,
+   "must_contain": "function FN()"
+  },
+  {
+   "file": "m0040_0x11239205.js",
+   "line": 6290,
+   "must_contain": "surfaceCapabilities.caps()"
+  },
+  {
+   "file": "m0040_0x11239205.js",
+   "line": 1964,
+   "must_contain": "caps()"
+  },
+  {
+   "file": "m0040_0x11239205.js",
+   "line": 1881,
+   "must_contain": "var Ne = {"
+  },
+  {
+   "file": "m0040_0x11239205.js",
+   "line": 1886,
+   "must_contain": "remote: null"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 151656,
+   "must_contain": "var yIe = null"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153927,
+   "must_contain": "isAccountRecallOn"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153938,
+   "must_contain": "startAccountRecall"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153848,
+   "must_contain": "ne?.listing()"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153850,
+   "must_contain": "let Re = ke &&"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153852,
+   "must_contain": "if (!Re && xe === void 0) return []"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 433,
+   "must_contain": "CLAUDE_CODE_DISABLE_ORG_MEMORY"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 432,
+   "must_contain": "function $s()"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 420,
+   "must_contain": "if (!$s()) return \"closed\""
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 426,
+   "must_contain": "function Wn()"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 430,
+   "must_contain": "$s() && wE()"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 663,
+   "must_contain": "orgMemoryRead"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 2874,
+   "must_contain": "if (!Wn()) return !1"
+  },
+  {
+   "file": "m0477_0x11b1de8e.js",
+   "line": 16,
+   "must_contain": "function n0n()"
+  },
+  {
+   "file": "m0477_0x11b1de8e.js",
+   "line": 15,
+   "must_contain": "[\"announced\", \"inline\"]"
+  },
+  {
+   "file": "m0477_0x11b1de8e.js",
+   "line": 17,
+   "must_contain": "return su()"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 16353,
+   "must_contain": "function su()"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 16354,
+   "must_contain": "tengu_foamy_spring"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 16365,
+   "must_contain": "function SPs(e)"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 16367,
+   "must_contain": "if (!reader_4) return !0"
+  },
+  {
+   "file": "m0191_0x1155a4cc.js",
+   "line": 16369,
+   "must_contain": "!== !1"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 1181,
+   "must_contain": "function SUo(e)"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 1189,
+   "must_contain": "function gm(e)"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 1227,
+   "must_contain": "SUo(s.messages) ?? gm(s.messages)"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 1228,
+   "must_contain": "if (E === \"inline\") return gl(S)"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 1286,
+   "must_contain": "delete I.claudeMd"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 1446,
+   "must_contain": "Wr(n.instructions"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 1197,
+   "must_contain": "function gl(e)"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 229034,
+   "must_contain": "instructions: (e)"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 10977,
+   "must_contain": "function kAt(e)"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 10978,
+   "must_contain": "if (!e.changed) return WQe(e.files)"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 151564,
+   "must_contain": "Gn(s) !== Gn(e)"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 1855,
+   "must_contain": "Gn(rt(r)).toLowerCase()"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 71375,
+   "must_contain": "function DV(e, n)"
+  },
+  {
+   "file": "m0816_0x124876ec.js",
+   "line": 2988,
+   "must_contain": "var gr = dn({"
+  },
+  {
+   "file": "m0816_0x124876ec.js",
+   "line": 2956,
+   "must_contain": "var Hi = 50"
+  },
+  {
+   "file": "m0816_0x124876ec.js",
+   "line": 2959,
+   "must_contain": "path_prefix"
+  },
+  {
+   "file": "m0816_0x124876ec.js",
+   "line": 2960,
+   "must_contain": "cursor"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 75850,
+   "must_contain": "var qQr = dn({"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 75831,
+   "must_contain": "var rJo = p(() => He({"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 4478,
+   "must_contain": "characters of line 1 was cut off"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 74473,
+   "must_contain": "async function ave(e, n)"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 74508,
+   "must_contain": "> Ibe"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 4200,
+   "must_contain": "function Dl(e)"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 4396,
+   "must_contain": "function Ll(e"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 4569,
+   "must_contain": "function li(e, n, r)"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 4406,
+   "must_contain": "function jl(e, n, r, s = !1)"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 4784,
+   "must_contain": "if (h) {"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 4778,
+   "must_contain": "return await lt(we)"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 4776,
+   "must_contain": "jl(Ce.map(ve)"
+  },
+  {
+   "file": "m0293_0x1177df9f.js",
+   "line": 4742,
+   "must_contain": "Dl({"
+  },
+  {
+   "file": "m0066_0x11292832.js",
+   "line": 190,
+   "must_contain": "function aY()"
+  },
+  {
+   "file": "m0066_0x11292832.js",
+   "line": 192,
+   "must_contain": "sdk-ts"
+  },
+  {
+   "file": "m0064_0x1127ecf0.js",
+   "line": 881,
+   "must_contain": "CLAUDE_CODE_FORCE_EVALUATE_MEMORY"
+  },
+  {
+   "file": "m0064_0x1127ecf0.js",
+   "line": 883,
+   "must_contain": "CLAUDE_CODE_FORCE_MEMORY_SURVEY"
+  },
+  {
+   "file": "m0064_0x1127ecf0.js",
+   "line": 765,
+   "must_contain": "CLAUDE_BG_AUTO_MEMORY_OFF"
+  },
+  {
+   "file": "m0722_0x1232bf34.js",
+   "line": 1149,
+   "must_contain": "CLAUDE_BG_AUTO_MEMORY_OFF"
+  },
+  {
+   "file": "m0659_0x121cb23d.js",
+   "line": 566,
+   "must_contain": "delete e.CLAUDE_BG_AUTO_MEMORY_OFF"
+  },
+  {
+   "file": "m0935_0x126163a7.js",
+   "line": 360,
+   "must_contain": "CLAUDE_BG_MEMORY_TOGGLED_OFF"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153186,
+   "must_contain": "K3e(ke, Y)"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153870,
+   "must_contain": "slice(0, 5)"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153852,
+   "must_contain": "return []"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 113593,
+   "must_contain": "lrt(\"chromeNoteLast\")"
+  },
+  {
+   "file": "m1908_0x1323c1ff.js",
+   "line": 4163,
+   "must_contain": "tool_2.name === dt"
+  },
+  {
+   "file": "m1908_0x1323c1ff.js",
+   "line": 5266,
+   "must_contain": "readProbeSlot.pending"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 212934,
+   "must_contain": "async function Ojs(e, n, r)"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 73918,
+   "must_contain": "async function r7o({"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 996,
+   "must_contain": "if (config_2)"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 1049,
+   "must_contain": "}"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 151556,
+   "must_contain": "function* ZGr()"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 151565,
+   "must_contain": "if (yield s, ++r === JGr) return"
+  }
+ ]
+}
