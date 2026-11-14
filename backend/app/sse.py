@@ -193,6 +193,34 @@ def _install_memory_turn_end(ur, user_id: str) -> None:
         logging.getLogger(__name__).warning("记忆提取钩子装配失败，本轮不提取", exc_info=True)
 
 
+async def _install_memory_prefetch(ur, user_id: str) -> None:
+    """给本轮的 loop 装记忆预取（M3.5）。默认关闭时什么都不做。
+
+    为什么在这里装而不是在 `MemoryInjector` 里：
+    预取要「先启动、稍后消费」，而注入器是「每轮开头同步返回」的形态 ——
+    合进注入器就退化成同步等待，选择器 300-2000ms 会直接进 TTFT。
+
+    选择器 client 是**独立**的小模型（`HLZ_MEMORY_SELECTOR_MODEL`），
+    不复用主模型：一个 10 步任务会让主模型多跑 10 次。
+    client 每代新建，不缓存 —— 它是纯 HTTP 客户端，构造很便宜，
+    而缓存会带来「用户改了配置要等重启」的问题。
+    """
+    loop = getattr(ur, "loop", None)
+    if loop is None:
+        return
+    try:
+        from .memory_prefetch import install_prefetch, prefetch_enabled
+        if not prefetch_enabled():
+            return
+        from .memory_prefetch import selector_client_for
+        client = await selector_client_for(user_id)
+        install_prefetch(loop, client, user_id)
+    except Exception:  # noqa: BLE001 - 预取是增强，装不上不该让整轮起不来
+        import logging
+        logging.getLogger(__name__).warning(
+            "记忆预取装配失败，本轮走关键词排序", exc_info=True)
+
+
 async def run_agent_stream(
     ur,
     session_id: str,
@@ -234,6 +262,9 @@ async def run_agent_stream(
     _install_memory_injector(ur, user_id, session_id, user_text)
     # 轮次收尾钩子（M4 后台提取）。同样必须在 run_stream 之前挂。
     _install_memory_turn_end(ur, user_id)
+    # 记忆预取（M3.5）。必须在 run_stream 之前装，且**在**注入器之后 ——
+    # 它要在「模型调用前」就被 AgentLoop 看到。
+    await _install_memory_prefetch(ur, user_id)
 
     async for ev in ur.loop.run_stream(history, stop_event=stop_event, session_id=session_id):
         et = ev.get("type")

@@ -10,8 +10,10 @@
 | `ui_dream.py` | **L3（用户能看到）** | 设置页「我的记忆」tab 的渲染、交互、不白屏 | ~90s |
 | `concurrent_write.py` | **L2.5（进程内并发）** | dream 与提取同时写同一批文件时数据会不会丢 | ~5s |
 | `multi_process_lock.py` | **L2.5（跨进程）** | DB 行锁在真跨进程下真的互斥 | ~25s |
-| `dream_mutation.py` | **L1.5（变异）** | 把关键机制逐个改坏，验证有测试真的盯着它 | ~2min |
-| `run_all.py` | — | 依次跑前三个（变异较慢，单独跑） | ~2min |
+| `selector_bench.py` | **L3（真模型收益）** | 选择器相对关键词的命中率与首帧开销（S-M6 / S-M7） | ~3min |
+| `dream_mutation.py` | **L1.5（变异）** | 把 dream 的关键机制逐个改坏，验证有测试真的盯着它 | ~2min |
+| `prefetch_mutation.py` | **L1.5（变异）** | 同上，对象是 M3.5 预取的 13 条机制 | ~2min |
+| `run_all.py` | — | 依次跑前三个（变异/基准较慢，单独跑） | ~2min |
 
 ## 为什么这三件事必须单独测（变异测试见 `dream_mutation.py`）
 

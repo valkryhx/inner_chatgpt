@@ -125,7 +125,8 @@ def _dump(obj: Any) -> str:
 class AgentLoop:
     def __init__(self, client: LLMClient, registry: ToolRegistry, system_prompt: str,
                  max_turns: int = 300, history_store=None, *, user_id: str = "",
-                 message_injector=None, team_gate=None, on_turn_end=None):
+                 message_injector=None, team_gate=None, on_turn_end=None,
+                 prefetch_factory=None):
         self.client = client
         self.registry = registry
         self.system_prompt = system_prompt
@@ -156,6 +157,17 @@ class AgentLoop:
         # 只在「正常完成」这一条出口触发，不在 stopped / error / 超墙钟时触发：
         # 半截对话提取出来的记忆往往是错的，而且用户已经明确中断了。
         self.on_turn_end = on_turn_end
+        # 可选：记忆预取（M3.5）。只有「选择器开启 + 指定了独立小模型」时才非 None。
+        # 形态见 `memory_prefetch.py`：模型调用前只**启动**，工具步骤后才尝试消费，
+        # 这样选择器算得慢也不会挡住首 token。
+        # 这里是回调而不是直接 import `memory_prefetch` —— 与 `on_turn_end` 同理：
+        # 核心循环不该知道记忆模块存在，记忆关掉时也不在核心里留死代码。
+        self.prefetch_factory = prefetch_factory
+        # 本代的预取状态（slug 去重集合 / 调用计数 / 会话字节预算）。
+        # `loop` 跨 generation 复用，所以**每代必须重置**，否则上一代的去重集合
+        # 会让这一代的记忆永远注入不进来。
+        self._memory_prefetch_state = None
+        self._prefetch_handle = None
 
     def _injector_guard_now(self) -> InjectorGuard:
         """按**当前** `message_injector` 返回 guard（惰性绑定）。
@@ -300,6 +312,9 @@ class AgentLoop:
             async for ev in self._run_stream_inner(history, stop_event, session_id):
                 yield ev
         finally:
+            # 预取可能还在飞（本轮没赶上消费点）。不取消会让它挂到超时，
+            # 而且下一轮 `_start_prefetch` 覆盖句柄后它就成了孤儿 task。
+            self._cancel_prefetch()
             await self._flush_injector()
 
     async def _flush_injector(self) -> None:
@@ -311,6 +326,46 @@ class AgentLoop:
             await guard.flush()
         except BaseException:  # noqa: BLE001 - 收尾绝不能影响正常结束
             logger.warning("注入器收尾失败", exc_info=True)
+
+    # ---------- 记忆预取（M3.5）：启动与消费 ----------
+    #
+    # 形态对齐 CC 的两个挂点（`m0848:7294` 启动 / `:10602` 消费）：
+    # 模型调用之前只**启动**，工具步骤之后才尝试**消费**。
+    # 为什么不能合到一个点：合在「模型调用前」就退化成同步等待（选择器
+    # 300-2000ms 会直接进 TTFT）；合在「工具步骤后」则第一轮永远拿不到。
+    #
+    # 这里只是转发到 `prefetch_factory`，核心循环不 import 记忆模块 ——
+    # 与 `on_turn_end` 同样的理由：记忆关掉时核心里不该留死代码。
+
+    def _start_prefetch(self, history: list[dict]) -> None:
+        factory = self.prefetch_factory
+        if factory is None:
+            return
+        try:
+            self._prefetch_handle = factory(self, history)
+        except Exception:  # noqa: BLE001 - 预取是增强，启动失败不该影响本轮
+            logger.warning("记忆预取启动失败，本轮走关键词路径", exc_info=True)
+            self._prefetch_handle = None
+
+    async def _take_prefetch(self, turn: int) -> list[dict]:
+        handle = self._prefetch_handle
+        if handle is None:
+            return []
+        try:
+            return await handle.take(turn)
+        except Exception:  # noqa: BLE001
+            logger.warning("记忆预取消费失败，本轮不注入", exc_info=True)
+            return []
+
+    def _cancel_prefetch(self) -> None:
+        handle = self._prefetch_handle
+        self._prefetch_handle = None
+        if handle is None:
+            return
+        try:
+            handle.cancel()
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _run_turn_end_hooks(self, history: list[dict]) -> None:
         """轮次正常完成时跑侧边任务。**逐件独立**，一件失败不影响其他。
@@ -364,6 +419,9 @@ class AgentLoop:
         team_grace_left = _team_grace_from_env()
         # 墙钟起点：max_turns 限次数，这一条限时间。0 = 不限。
         started_at = time.monotonic()
+        # 记忆预取（M3.5）：**在首轮模型调用之前只启动，不等待**。
+        # 与下面的「工具步骤之后消费」配对，才是 CC 的完整语义（m0848:7294/:10602）。
+        self._start_prefetch(history)
         while turn < self.max_turns:
             if stopped():
                 yield {"type": "done", "status": "stopped"}
@@ -549,6 +607,14 @@ class AgentLoop:
                             await self.history_store.set(self.user_id, session_id, history)
                         else:
                             await self.history_store.set(session_id, history)
+
+            # 记忆预取的消费点：**工具步骤之后**（对齐 CC 的 m0848:10602）。
+            # 三个条件缺一不可：已 settle、还没消费过、在工具步骤之后。
+            # 若选择器此刻还没算完，这一轮就不注入 —— 这正是「不拖慢首 token」
+            # 的实现方式：慢的预取自动让位，留到下一轮再看。
+            for msg in await self._take_prefetch(turn):
+                history.append(msg)
+                yield {"type": "message_injected", "text": msg.get("content", "")}
 
         yield {"type": "error", "error": f"达到最大轮数 {self.max_turns}，已停止"}
 

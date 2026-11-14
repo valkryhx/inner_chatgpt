@@ -51,6 +51,35 @@ def memory_injection_enabled() -> bool:
     return ms.memory_enabled()
 
 
+def keyword_injection_enabled() -> bool:
+    """**关键词注入路径**是否生效。
+
+    选择器开启时它**不生效** —— 两者互斥，不是叠加。依据是方案 §3.7 的原文：
+
+    > 选择器是「工具存储 / MCP 记忆库」形态的配套，与 `AutoMem` **互斥**
+
+    为什么必须互斥（这是真机实测出来的，不是照抄）：
+
+    关键词注入器在**首轮模型调用之前**同步跑，选择器预取要到工具步骤之后
+    才消费。若两条路径同时开，关键词必定先抢走 slug，选择器算完发现全被
+    占用了 —— 白跑一次模型调用，S-M6 量出的命中率优势在生产链路上
+    一次也体现不出来（2026-11-14 真机实测：`injected_count=1`，走的全是
+    关键词路径，选择器调用纯浪费）。
+
+    互斥的代价是「选择器失败/超时的那一轮没有记忆」，可接受：它是显式开启的
+    增强功能，用户选的就是「用 LLM 判断相关性」；而一个 10 步任务里选择器
+    最多跑 3 次，第二轮起就能拿到。退一步说，宁可那一轮没有记忆，也不该
+    「悄悄退化成关键词」—— 那会让用户以为选择器在起作用。
+    """
+    if not memory_injection_enabled():
+        return False
+    try:
+        from .memory_prefetch import prefetch_enabled
+        return not prefetch_enabled()
+    except Exception:  # noqa: BLE001 - 预取模块有问题就退回关键词路径
+        return True
+
+
 def combine(fns: Iterable[Optional[Callable[[], Any]]]) -> Callable[[], Any]:
     """按顺序跑多个注入器，结果拼接。任一失败不影响其他。
 
@@ -110,13 +139,19 @@ class MemoryInjector:
     """
 
     def __init__(self, user_id: str, *, scope: str = ms.SCOPE_PRIVATE,
-                 query_provider: Optional[Callable[[], str]] = None) -> None:
+                 query_provider: Optional[Callable[[], str]] = None,
+                 injected_slugs: Optional[set[str]] = None) -> None:
         self.user_id = str(user_id)
         self.scope = scope
         # query_hint 用来做关键词加权（用户本轮说了什么）。由调用方提供，
         # 拿不到就退化成「按 kind 优先级 + 最近更新」。
         self._query_provider = query_provider
-        self._injected_slugs: set[str] = set()
+        # 去重集合可以**共享**：M3.5 的选择器预取走另一条管线（AgentLoop 的
+        # 工具步骤之后），如果两边各记一份，同一条记忆会既以 ``[记忆]``
+        # 又以 ``[记忆·相关]`` 出现两遍（2026-11-14 真机实测发现）。
+        # 会话级共享由 ``install_memory_injector`` 通过 ``loop`` 上的集合传入。
+        self._injected_slugs: set[str] = (
+            injected_slugs if injected_slugs is not None else set())
         self._last_query: str = ""
 
     def set_query_hint(self, text: str) -> None:
@@ -131,7 +166,8 @@ class MemoryInjector:
         return self._last_query
 
     async def __call__(self) -> list[dict[str, Any]]:
-        if not memory_injection_enabled():
+        if not keyword_injection_enabled():
+            # 选择器开着时本路径让位（见 `keyword_injection_enabled` 的说明）。
             return []
         try:
             candidates, extra_withheld = await ms.select_with_stats(
@@ -214,12 +250,23 @@ def install_memory_injector(loop, user_id: str, *,
     ``loop`` 跨轮复用，所以这里每次都新建 ``MemoryInjector`` 并覆盖槽位，
     而不是往上一轮的组合结果上再包一层（那会让包装链无限增长，
     且每一层都做一次完整的记忆查询）。
+
+    但**同一个 generation 内**，这个集合要与选择器预取共用（见
+    ``shared_slugs`` 参数）—— 否则同一条记忆会以 ``[记忆]`` 和
+    ``[记忆·相关]`` 两种形态各注入一次。
     """
     if loop is None:
         return None
     if not memory_injection_enabled():
         return None
-    injector = MemoryInjector(user_id, scope=scope)
+    # 每代重建共享集合：`loop` 是跨 generation 复用的，沿用上一代的集合
+    # 会让这一代的记忆永远注入不进来。
+    shared: set[str] = set()
+    try:
+        loop._memory_injected_slugs = shared
+    except Exception:  # noqa: BLE001
+        pass
+    injector = MemoryInjector(user_id, scope=scope, injected_slugs=shared)
     injector.set_query_hint(query_hint)
     try:
         loop._memory_injector = injector

@@ -235,8 +235,14 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
     # 记忆注入器：包在 _lead_injector **外面**（背景知识先于本轮新发生的事）。
     # 注意它读的是 team_ctx.user_id（闭包），不从请求参数反查 —— A2A / 子代理
     # 路径上反查会取到错误的主体（记忆方案 §2.3 第三条保证）。
+    #
+    # ⚠️ 共享去重集合挂到 loop 上（`_memory_injected_slugs`）：M3.5 的选择器
+    # 预取走另一条管线（AgentLoop 的工具步骤之后），若两边各记一份，同一条
+    # 记忆会既以 `[记忆]` 又以 `[记忆·相关]` 注入两遍 —— 2026-11-14 真机实测
+    # 就是 `injected_count=2` 且内容完全相同。集合必须**同一个对象**。
     from ..memory_inject import MemoryInjector, wrap_with_memory
-    _memory_injector = MemoryInjector(team_ctx.user_id)
+    _shared_slugs: set[str] = set()
+    _memory_injector = MemoryInjector(team_ctx.user_id, injected_slugs=_shared_slugs)
 
     # 轮次收尾钩子（M4 后台记忆提取）。team 路径的 loop 是本轮新建的，
     # 直接在这里挂；SSE 层的 _install_memory_turn_end 见到 _memory_aware
@@ -337,6 +343,8 @@ async def build_turn_runtime(base_runtime, ctx: AgentContext,
     # 直接在构造时组合一次更直观。
     loop._memory_aware = True
     loop._memory_injector = _memory_injector
+    # 本代的共享去重集合，供 M3.5 的预取复用（见上面 MemoryInjector 的注释）。
+    loop._memory_injected_slugs = _shared_slugs
     return TurnRuntime(
         loop=loop,
         host=host,

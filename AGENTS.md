@@ -156,7 +156,7 @@
   临时 MCP server 重启复现），全部 0 失败，含反向确认。
 - 详见 `docs/20261110-MCP与Hlaudz全链路测试与缺陷修复.md`。
 
-**P9：记忆系统 —— M1/M2/M3/M4/M4.5 已完成（2026-11-14），M3.5/M5 未开工。**
+**P9：记忆系统 —— M1/M2/M3/M3.5/M4/M4.5 已完成（2026-11-14），M5 未开工。**
 
 - 最小可用集已跑通：**手工记忆（模型调 `memory_write` 或用户手写 `.md`）+ 关键词/类型排序注入 +
   每用户隔离 + 设置页可审计可删除**。自动提取（`HLZ_MEMORY_AUTO_WRITE`）按方案保持**默认关闭**。
@@ -214,9 +214,28 @@
   S-M8 真机重跑仍全绿（模型自然先读再删，没卡住）；
   ③ **跨进程锁** —— 部署是单 worker，改为验证跨进程锁语义（这才是实质问题）：
   4 进程持续重试 6 秒，33–35 次抢锁、**持锁窗口两两不重叠**（真串行）。
+- **M3.5（LLM 相关性选择器 + 并发预取）已完成，默认关闭**：关键词排序的根本盲点是
+  「它不知道用户在问什么」。`memory_prefetch.py`（约 560 行）把「记忆清单 + 本轮查询」
+  送一次小模型判相关性，**预取句柄 `PrefetchHandle` 只启动不等待** —— 对齐 CC 的 `Ivi`
+  （`m0591:153923`）与两个挂点（`m0848:7294` 启动 / `:10602` 工具步骤后消费）。
+  合到一个点必然坏：合在模型调用前 = 183ms 直接进 TTFT；合在工具后 = 第一轮永远拿不到。
+  **实测收益**：S-M6（44 条记忆 / 8 条与反例**无字面重合**的查询）关键词 top5 命中
+  **62.5%** vs 选择器 **100%（+37.5pt）**；S-M7 预取启动上限 **4.9ms**、选择器 settle
+  中位 **183ms**（全在后台）。**十二项构造上的坑**：六道入口闸（总开关含「必须指定独立
+  小模型」/ 防自激 `NO_SELF_TRIGGER` / 会话字节预算 61440 / 本代调用上限 3 / 查询可用性 /
+  有 client）、slug 集合去重（与关键词路径**共用同一个对象**）、解析必须过滤模型编造的
+  slug、`selector_client_for` 三级兜底（用户配置 → 全局 `llm.yaml` → 显式 fallback，
+  **不自动回落主模型**）、注入块带「仅为**可能**相关」免责首句与 `_volatile`。
+  **真机 e2e 抓到两个缺陷**：① 同一条记忆以 `[记忆]` 和 `[记忆·相关]` 各注入一次
+  （`subagent/session.py` 造的注入器没传共享集合，而 `build_turn_runtime` 普通会话也走）；
+  ② 修完重复后**选择器一次都没被用过** —— 关键词注入器在首轮模型调用前同步跑，
+  必定先抢走 slug。按方案 §3.7「选择器与 AutoMem 互斥」改为 `keyword_injection_enabled()`
+  让位，**不叠加**（叠加等于让这个功能白做，还会让用户误以为选择器在起作用）。
+  验证：**41 项新测 + 13 条变异全部被抓 + 全量 1053 passed**。
 - **未完成：真·多 worker（`workers=N`）实测**。若改多 worker 部署，需重跑
   `multi_process_lock.py` 并验证 lifespan 里 `recover_dream_state()` 被多 worker 并发调用的行为。
-- 详见 `docs/20261114-记忆系统M1-M3实施记录.md`（§11 是 M4.5 专章）与
+- 详见 `docs/20261114-记忆系统M3.5选择性召回实施记录.md`、
+  `docs/20261114-记忆系统M1-M3实施记录.md`（§11 是 M4.5 专章）与
   `docs/20261114-记忆系统三项未覆盖验证记录.md`；设计与分阶段计划见 `docs/20261112-Hlaudz记忆系统实施方案.md`。
 
 ### 0.2 必读文档（按顺序）
@@ -228,6 +247,7 @@
 | `docs/20261114-CC319记忆机制源码复核v3.md` | **CC 记忆机制复核（最新，权威，6 项疑似已清零）**：对 v2 逐条回源复核（63 个行号区间 + 55 条解释性结论），定案 6 处 v2 错误——① `MEMORY.md` 默认走 `instructions` attachment 而非 system prompt（`n0n()` 默认 true → announced）；② `memory_list` 定义在 `m0816:2988`（v2 指的 `m0591:75831` 是 `memory_read` 的 schema），有 `cursor`/默认页 50；③ 索引 cap 25000 是 UTF-16 code unit 不是字节（单文件召回 4096 才是真字节）；④ `Dl()` 非主拼装器（主路径是 `li`/`Ll`）且不含类型表/禁止清单；⑤ `aY()` 是 SDK 入口判定；⑥ 28 个环境变量里 2 个零读取、2 个只写不读。**另含 6 项 chunk 落地后的定论**（`Gn` 剥 `[1m]`、`Cae` 确含 `system-reminder`、`rr`=远端能力、`yIe` 恒 null 致账号记忆链死代码、`DISABLE_ORG_MEMORY` 拦组织同步、`n0n()` 默认 true）+ 6 条口径提醒 + **51 条可直接引用的白名单**。**另有落地时发现的第 7 处**：闸门适用模式划分不准（第 4 道权限闸仅文件模式、`first_look` 是 MCP 专属第 8 道，文件模式下 CC 无此闸）。复现脚本 `tools/cc_source_verify/`（`build_chunk_map.py` 1764 chunk 全命中、`verify_line_refs.py` 102 项行号断言）。**与 v2 冲突以此为准** |
 | `docs/20261113-CC319记忆机制源码核实v2.md` | **CC 记忆机制权威调研（已被 v3 复核）**：6 条读路径（含 `relevant_memories` 相关性选择器、`AutoMem` 索引注入、MCP 记忆库、账号记忆）/ 2 条写路径（`extractMemories` + `auto_dream` 合并）/ 四类记忆提示词全文 / 隔离与 28 个环境变量分类，逐条带行号证据。**方向与 51 条事实成立，但有 6 处错误见 v3 §1；§7 账号记忆时序在本 build 不会真的发生，见 v3 §4.4** |
 | `docs/20261114-CC319记忆触发时机核实.md` | **CC 记忆的触发时机（写/读/dream 三者何时发生）**：写侧不是常驻后台而是「每个用户轮次结束尝试一次」（`Jd` → `executeExtractMemories` → `ir` → `ar` → `Le`），文件模式下还有 `tengu_passport_quail` 一道默认 false 的外层闸（v2/v3 均未记录）；读侧 `AutoMem` 索引每次模型调用装配时读，`relevant_memories` 选择器受 `lSe()` 门控**默认不跑**；dream 与提取器同点触发但被 24h + 5 会话 + 10min 三道时间闸压成隔天级，且**不做**「从失败中学习」。**推翻方案 §3.7 的「读侧主路径」与「每 generation 一次」两处说法** |
+| `docs/20261114-记忆系统M3.5选择性召回实施记录.md` | **M3.5 选择性召回（最新，已落地，默认关闭）**：`memory_prefetch.py` 的 `PrefetchHandle`（promise / settled_at / consumed_on_iteration，对齐 CC 的 `Ivi`）+ 六道入口闸 + slug 集合去重 + 会话字节预算 + 独立小模型 client。**两个挂点**（启动在轮循环前、消费在工具步骤后）为何不能合一。**S-M6 实测 62.5% → 100%（44 条记忆 / 8 条无字面重合查询）、S-M7 启动 4.9ms / settle 中位 183ms**。**真机抓到的两个缺陷**：① 共享去重集合缺失导致同一条记忆注入两遍；② 关键词路径抢 slug 致选择器白跑 → 改为互斥。41 项单测 + 13 条变异 + 全量 1053 passed。§6 顺带用 9.9μs 实测回答「`AgentLoop` 为何必须每轮新建」 |
 | `docs/20261114-记忆系统三项未覆盖验证记录.md` | **记忆三项未覆盖验证（最新，其中一项抓出真缺陷）**：① Playwright UI **52/52**（`tools/memory_verify/ui_dream.py`，8 截图，含「按钮在可视区内」「原生 confirm 要显式接管」「落库核对不能用列表文本」三个只有真浏览器能发现的设计点，以及一次「截图残留」误报的排查记录）；② 进程内并发 6 场景（`concurrent_write.py`）—— **抓出 `memory_delete` 无版本保护导致的数据丢失（C-2b，100% 可复现）**，修法是「先读后删 + 读后未变」两道代码级闸，并解释为何不靠 prompt、不要求模型传 if_version；③ 跨进程锁 4 场景（`multi_process_lock.py`）—— 用两个真实进程而非 uvicorn --workers（后者在 `multiprocessing.spawn` 下要 `if __name__` 保护），33–35 次抢锁、持锁窗口两两不重叠。**另含 C-3 判据纠错**（索引并发期允许陈旧，因为 `MEMORY.md` 目前无运行期读取者；只验收敛性 + 无幽灵行），以及 `last_consolidated=0` 时首次不受时间闸约束这一「碰巧成立」语义的钉住 |
 | `docs/20261114-记忆系统M1-M3实施记录.md` | **记忆 M1–M4.5 实施记录（最新，已落地，含 L3 真机 e2e）**：`memory_store.py`（文件即真相 + DB 索引 + `_reconcile` 自愈 + `cursor` 分页 + `if_version` CAS + 两套预算口径）/ `memory_tools.py`（三件套，子代理在装配处就被裁掉）/ `memory_inject.py`（`wrap_with_memory` 组合、slug 集合去重、`_volatile` 在 `HistoryStore` 统一剥离）/ `routers/memory.py` + 设置页「我的记忆」tab。**§11 是 M4.5 dream 专章**：巡检任务 + DB 行锁 + 启动收敛 + `index_pending` 可重入 + dream 专属 `memory_delete` + 三道代码级闸 + 提示词为何没有照抄 CC。**168 项测试 + 15 项反向确认 + 11 条变异 + L2 集成 + 6 个 L3 真机 e2e（S-M1~S-M5、S-M8）**；顺带修掉 steer 跨代失效与注入路径 O(文件内容) 两处既有缺陷 |
 | `docs/20261112-Hlaudz记忆系统实施方案.md` | **记忆系统实施方案（设计；M1–M3 已按其落地）**：读侧复用 `message_injector` attachment 通道、写侧复用 subagent 后台运行时、`memories/<user_id>/private/` 物理隔离 + DB 行级隔离；M1–M5 分阶段（M1 含 `cursor` 分页 + `if_version` CAS）与 S-M1~S-M5 e2e 用例。**正文已于 2026-11-14 按 v2 §14.7 + v3 §6.2 全部修正完毕**（四类记忆与作用域默认值、文件模式四道闸门、三件套工具面、§3.5 索引注入走 attachment、§3.6 预算单位 code unit、§5.1 CAS、差异表 D-1~D-7）。**M4 及以后开工前读正文；M1–M3 的实际差异见实施记录 §7** |
@@ -287,7 +307,7 @@
 | `misc/` | **零碎、不那么重要的内容** | 放：参考材料、截图、临时说明、外部粘贴文本（如 `*.txt`）、他人项目笔记。可读但与主线弱相关。 |
 | `skill_assets/` | **Skill 交付包的本地目录（长期留存、不入库）** | 放：可导入的 `*.zip` 技能包，及其解包后的同名目录（作为可读的源）。**与 `work/` 的区别：这里的文件不会随时被清掉。** 整个目录已在 `.gitignore` 中排除（2026-11-11 决定）——技能包可能含业务数据或体积较大，不适合随仓库分发；需要分发时通过界面「导入技能包」传给对方。新增技能包时，可读源、zip、`backend/skills_shared/<name>/` 三处内容必须一致（`diff -r` 验证）。 |
 | `work/` | **临时测试产物的存放目录** | 放：一次性脚本（`_*.py`）、日志（`*.log`）、探针、构建监视脚本、临时 dump、调试快照。**可随时清理，不入正式交付。** |
-| `tools/` | **长期保留的运维/排查工具（入库）** | 放：需要反复使用的诊断脚本，如 `team_timeline.py`（从团队事件 JSONL 还原协作时间线）、`probe_chat_prelude.py` / `probe_soft_compact_blocking.py` / `probe_prelude_direct.py`（首帧串行阻塞三探针，见 `docs/20261112-Hlaudz首帧串行阻塞核实与优化设计.md` §5.3）、`cc_source_verify/`（CC 源码调研核验四件套：行号断言 / chunk→模块还原 / 符号反查 / 区间导出，见其 `README.md`）、`memory_verify/`（记忆验证五件套：Playwright UI / 进程内并发 / 跨进程锁 / 变异测试 / 统一入口，见 `docs/20261114-记忆系统三项未覆盖验证记录.md`）。与 `work/` 的区别：这里的东西**会一直用**，不是一次性脚本。 |
+| `tools/` | **长期保留的运维/排查工具（入库）** | 放：需要反复使用的诊断脚本，如 `team_timeline.py`（从团队事件 JSONL 还原协作时间线）、`probe_chat_prelude.py` / `probe_soft_compact_blocking.py` / `probe_prelude_direct.py`（首帧串行阻塞三探针，见 `docs/20261112-Hlaudz首帧串行阻塞核实与优化设计.md` §5.3）、`cc_source_verify/`（CC 源码调研核验四件套：行号断言 / chunk→模块还原 / 符号反查 / 区间导出，见其 `README.md`）、`memory_verify/`（记忆验证七件套：Playwright UI / 进程内并发 / 跨进程锁 / 变异测试 ×2 dream+预取 / 选择器基准 / 统一入口，见 `docs/20261114-记忆系统三项未覆盖验证记录.md` 与 `docs/20261114-记忆系统M3.5选择性召回实施记录.md`）。与 `work/` 的区别：这里的东西**会一直用**，不是一次性脚本。 |
 | `backend/` `frontend/` | 产品代码 | 只放能跑的实现代码与资源；不要把测试产物、日志、截图塞进去。 |
 
 > **Skill 三处存放的分工**（容易混淆，先说清）：
