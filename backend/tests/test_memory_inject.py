@@ -382,3 +382,55 @@ def test_each_generation_reinjects_same_memory(store):
     second = run(loop.message_injector())
     assert any("aaa" in (m.get("content") or "") for m in second), \
         "新一代必须重新注入同一批记忆"
+
+
+# ---------------- 性能（首帧预算） ----------------
+def test_injector_cost_bounded_with_many_memories(store):
+    """300 条记忆时注入器必须仍远低于 100ms 首帧预算。
+
+    这条是**真实踩过的坑**的回归锁：第一版 ``_reconcile`` 对每个文件读全文
+    算 sha256、``_row_to_spec`` 也为每行读全文算 version，实测 300 条 **366ms**，
+    远超 100ms。改法：``(mtime, size)`` 存进 DB 做快速比对，只有变化的文件才读；
+    ``version`` 只在真要 CAS 时算。
+
+    阈值取 150ms（本机稳定态约 16ms，留足 CI/慢盘余量）。它不测「很快」，
+    只测「没有退化成 O(文件内容)」。
+    """
+    import time as _t
+
+    for i in range(300):
+        run(ms.write_memory("u1", slug=f"m{i:04d}", title=f"记忆 {i}",
+                            description=f"第 {i} 条压测描述文字", body="正文内容",
+                            kind="user"))
+    # 预热：首次会做全量 reconcile
+    run(ms.select_with_stats("u1", query_hint="测试"))
+
+    # 稳定态取多次中位数（单次测抖动大）
+    samples = []
+    for _ in range(5):
+        t0 = _t.monotonic()
+        specs, withheld = run(ms.select_with_stats("u1", query_hint="测试"))
+        ms.format_memory_block(specs, withheld=withheld)
+        samples.append((_t.monotonic() - t0) * 1000)
+    samples.sort()
+    median = samples[len(samples) // 2]
+    assert median < 150, f"300 条记忆注入耗时 {median:.1f}ms，疑似退回逐文件读全文"
+
+
+def test_reconcile_does_not_reread_unchanged_files(store, monkeypatch):
+    """未变化的文件在第二次 reconcile 时不该被读全文（性能设计的直接断言）。"""
+    for i in range(10):
+        run(ms.write_memory("u1", slug=f"m{i}", title=f"t{i}",
+                            description=f"d{i}", body="x", kind="user"))
+    run(ms.select_with_stats("u1"))  # 第一次：建索引
+
+    reads = {"n": 0}
+    real_parse = ms._parse_memory_file
+
+    def counting_parse(*a, **kw):
+        reads["n"] += 1
+        return real_parse(*a, **kw)
+
+    monkeypatch.setattr(ms, "_parse_memory_file", counting_parse)
+    run(ms.select_with_stats("u1"))  # 第二次：文件都没变
+    assert reads["n"] == 0, f"未变化的文件被重读了 {reads['n']} 次"

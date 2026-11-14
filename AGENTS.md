@@ -164,11 +164,23 @@
   `if_version` CAS + 两套预算口径）、`memory_tools.py`（三件套，**无 delete**，子代理在装配处被裁掉）、
   `memory_inject.py`（`wrap_with_memory` 组合、slug 集合去重、`_volatile` 在 `HistoryStore` 统一剥离）、
   `routers/memory.py` + 设置页「我的记忆」tab。
-- 验证：**88 项新测全部通过**（L1 单测 + L2 真 `AgentLoop` 集成），7 项反向确认逐条变红，
-  前端 `npm run build` 通过，真实后端冒烟（状态/写入/列举）通过。
-- **未完成：真 LLM e2e（S-M1/S-M2/S-M3/S-M5）—— 本机 `user_llm_configs` 0 条、无 `llm.yaml`、
-  无 API key，一项都没跑。** 按 AGENTS.md §2.4 判据，目前只能说「机制已实现 / 已触发」（L1/L2），
-  **不能说「用户能看到记忆生效」**。开工 M4 前必须先补 S-M1 + S-M3。
+- 验证：**113 项新测全部通过**（L1 单测 + L2 真 `AgentLoop` 集成），10 项反向确认逐条变红，
+  全量 955 passed，前端 `npm run build` 通过。
+- **真机 e2e 四个场景全绿（L3）**：S-M1 跨 generation 记住「老徐」+ 哨兵、S-M2 中文触发写入
+  （工具序列 `memory_list → memory_read → memory_write → memory_read`）、S-M3 跨用户不串
+  （负对照：B 回答「查了记忆库，你这边是空的 0 条」）、S-M5 首帧开销（注入器 43ms < 100ms）。
+  跑法：`cd backend && python -m tests.e2e.memory_cases`。
+- 顺带抓出并修掉两处**既有**问题：
+  ① **steer 注入器跨代失效（高）**：`_steer_aware` 让注入器只装一次，而 `ur.loop` 是
+     `RuntimeHub` 缓存的，闭包锁死第一代 `generation_id` 后第二代起插话全部丢失。
+     干净 HEAD 复现确认非本次引入。改为「槽位 + 单一重建函数」+ `_steer_owner` 区分
+     plain（每代重装）/ team（让位）。
+  ② **注入路径 O(文件内容)**：`_reconcile` 逐文件读全文、`_row_to_spec` 逐行算 sha256、
+     `_upsert_row` 每条开一个 SQLite 连接 —— 300 条记忆时 366ms，e2e 实测 496ms，
+     打穿 100ms 首帧预算。改为 `(mtime, size)` 存 DB 做快速比对 + 批量 executemany，
+     稳定态降到 9-16ms。
+- **未完成：Web UI 视觉验证**（`MemorySection` 只过了 `npm run build`，无 Playwright 截图）；
+  **M4 后半**（后台提取子代理的编排 —— 闸门纯函数已就绪但无调用点）。
 - 详见 `docs/20261114-记忆系统M1-M3实施记录.md`；设计与分阶段计划见 `docs/20261112-Hlaudz记忆系统实施方案.md`。
 
 ### 0.2 必读文档（按顺序）
@@ -180,7 +192,7 @@
 | `docs/20261114-CC319记忆机制源码复核v3.md` | **CC 记忆机制复核（最新，权威，6 项疑似已清零）**：对 v2 逐条回源复核（63 个行号区间 + 55 条解释性结论），定案 6 处 v2 错误——① `MEMORY.md` 默认走 `instructions` attachment 而非 system prompt（`n0n()` 默认 true → announced）；② `memory_list` 定义在 `m0816:2988`（v2 指的 `m0591:75831` 是 `memory_read` 的 schema），有 `cursor`/默认页 50；③ 索引 cap 25000 是 UTF-16 code unit 不是字节（单文件召回 4096 才是真字节）；④ `Dl()` 非主拼装器（主路径是 `li`/`Ll`）且不含类型表/禁止清单；⑤ `aY()` 是 SDK 入口判定；⑥ 28 个环境变量里 2 个零读取、2 个只写不读。**另含 6 项 chunk 落地后的定论**（`Gn` 剥 `[1m]`、`Cae` 确含 `system-reminder`、`rr`=远端能力、`yIe` 恒 null 致账号记忆链死代码、`DISABLE_ORG_MEMORY` 拦组织同步、`n0n()` 默认 true）+ 6 条口径提醒 + **51 条可直接引用的白名单**。**另有落地时发现的第 7 处**：闸门适用模式划分不准（第 4 道权限闸仅文件模式、`first_look` 是 MCP 专属第 8 道，文件模式下 CC 无此闸）。复现脚本 `tools/cc_source_verify/`（`build_chunk_map.py` 1764 chunk 全命中、`verify_line_refs.py` 102 项行号断言）。**与 v2 冲突以此为准** |
 | `docs/20261113-CC319记忆机制源码核实v2.md` | **CC 记忆机制权威调研（已被 v3 复核）**：6 条读路径（含 `relevant_memories` 相关性选择器、`AutoMem` 索引注入、MCP 记忆库、账号记忆）/ 2 条写路径（`extractMemories` + `auto_dream` 合并）/ 四类记忆提示词全文 / 隔离与 28 个环境变量分类，逐条带行号证据。**方向与 51 条事实成立，但有 6 处错误见 v3 §1；§7 账号记忆时序在本 build 不会真的发生，见 v3 §4.4** |
 | `docs/20261114-CC319记忆触发时机核实.md` | **CC 记忆的触发时机（写/读/dream 三者何时发生）**：写侧不是常驻后台而是「每个用户轮次结束尝试一次」（`Jd` → `executeExtractMemories` → `ir` → `ar` → `Le`），文件模式下还有 `tengu_passport_quail` 一道默认 false 的外层闸（v2/v3 均未记录）；读侧 `AutoMem` 索引每次模型调用装配时读，`relevant_memories` 选择器受 `lSe()` 门控**默认不跑**；dream 与提取器同点触发但被 24h + 5 会话 + 10min 三道时间闸压成隔天级，且**不做**「从失败中学习」。**推翻方案 §3.7 的「读侧主路径」与「每 generation 一次」两处说法** |
-| `docs/20261114-记忆系统M1-M3实施记录.md` | **记忆 M1–M3 实施记录（最新，已落地）**：`memory_store.py`（文件即真相 + DB 索引 + `_reconcile` 自愈 + `cursor` 分页 + `if_version` CAS + 两套预算口径）/ `memory_tools.py`（三件套，无 delete，子代理在装配处就被裁掉）/ `memory_inject.py`（`wrap_with_memory` 组合、slug 集合去重、`_volatile` 在 `HistoryStore` 统一剥离）/ `routers/memory.py` + 设置页「我的记忆」tab。**88 项测试 + 7 项反向确认 + L2 真 `AgentLoop` 集成**；自动提取仍默认关闭；**真 LLM e2e（S-M1/S-M2/S-M3）因本机无可用 key 未跑** |
+| `docs/20261114-记忆系统M1-M3实施记录.md` | **记忆 M1–M3 实施记录（最新，已落地，含 L3 真机 e2e）**：`memory_store.py`（文件即真相 + DB 索引 + `_reconcile` 自愈 + `cursor` 分页 + `if_version` CAS + 两套预算口径）/ `memory_tools.py`（三件套，无 delete，子代理在装配处就被裁掉）/ `memory_inject.py`（`wrap_with_memory` 组合、slug 集合去重、`_volatile` 在 `HistoryStore` 统一剥离）/ `routers/memory.py` + 设置页「我的记忆」tab。**113 项测试 + 10 项反向确认 + L2 集成 + 4 个 L3 真机 e2e（S-M1/S-M2/S-M3/S-M5）**；自动提取仍默认关闭；顺带修掉 steer 跨代失效与注入路径 O(文件内容) 两处既有缺陷 |
 | `docs/20261112-Hlaudz记忆系统实施方案.md` | **记忆系统实施方案（设计；M1–M3 已按其落地）**：读侧复用 `message_injector` attachment 通道、写侧复用 subagent 后台运行时、`memories/<user_id>/private/` 物理隔离 + DB 行级隔离；M1–M5 分阶段（M1 含 `cursor` 分页 + `if_version` CAS）与 S-M1~S-M5 e2e 用例。**正文已于 2026-11-14 按 v2 §14.7 + v3 §6.2 全部修正完毕**（四类记忆与作用域默认值、文件模式四道闸门、三件套工具面、§3.5 索引注入走 attachment、§3.6 预算单位 code unit、§5.1 CAS、差异表 D-1~D-7）。**M4 及以后开工前读正文；M1–M3 的实际差异见实施记录 §7** |
 | `docs/20261112-CC319记忆系统源码调研.md` | **已被 `20261113-…核实v2.md` 取代**：方向（attachment 而非 hook）成立，但 `MEMORY.md` 注入方式与 `agent-memory*` 作用域含义有误，且漏掉 `relevant_memories` / MCP 记忆库 / `auto_dream` 三套机制。仅供追溯 |
 | `docs/20261111-Hlaudz对标GA-CC优化总纲.md` | **本轮优化总纲（最新）**：对标 GA main@f234d92 与 CC 319 的现状坐标、10 项差距矩阵、P0–P3 路线图、三层测试策略 |
