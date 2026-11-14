@@ -155,6 +155,29 @@ async def _run_task(row: dict[str, Any], text: str, model_id: str,
     error_text = ""
     done_status = ""
     terminal_state: Optional[str] = None
+    # ---- 中断现场（2026-11-14）----
+    # 每次工具边界写一次 DB，这样进程被 kill -9 也能留下「跑到第几步」。
+    # 为什么不每个 token 都写：正文已经由 messages 表按 250ms 落库，
+    # 这里只补「进度」这个 messages 表没有的维度，写太频纯属浪费。
+    snap_steps = 0
+    snap_tools = 0
+    snap_last_tool = ""
+    snap_dirty = False
+
+    async def _flush_snapshot() -> None:
+        nonlocal snap_dirty
+        if not snap_dirty:
+            return
+        snap_dirty = False
+        try:
+            await store.update_snapshot(
+                task_id, steps=snap_steps, tools_run=snap_tools,
+                last_tool=snap_last_tool,
+                partial_chars=sum(len(p) for p in text_parts),
+            )
+        except Exception:  # noqa: BLE001 - 现场记录失败不能影响主任务
+            pass
+
     try:
         acquired = await team_store.acquire_generation(
             row["user_id"], row["session_id"], row["generation_id"]
@@ -180,13 +203,23 @@ async def _run_task(row: dict[str, Any], text: str, model_id: str,
                 events.publish(task_id, {"type": "thinking_delta",
                                          "text": str(payload.get("text") or "")})
             elif event == "tool_start":
+                name = str(payload.get("name") or "")
+                snap_steps += 1
+                snap_last_tool = name
+                snap_dirty = True
+                await _flush_snapshot()
                 events.publish(task_id, {"type": "tool_start",
                                          "id": payload.get("id"),
-                                         "name": payload.get("name") or ""})
+                                         "name": name})
             elif event == "tool_result":
+                name = str(payload.get("name") or "")
+                if not bool(payload.get("is_error")):
+                    snap_tools += 1
+                    snap_dirty = True
+                    await _flush_snapshot()
                 events.publish(task_id, {"type": "tool_result",
                                          "id": payload.get("id"),
-                                         "name": payload.get("name") or "",
+                                         "name": name,
                                          "is_error": bool(payload.get("is_error"))})
             elif event == "error":
                 error_text = str(payload.get("error") or "unknown error")
@@ -203,6 +236,12 @@ async def _run_task(row: dict[str, Any], text: str, model_id: str,
             release_generation_reservation(
                 row["user_id"], row["session_id"], row["generation_id"]
             )
+        # 收尾再写一次现场：工具边界那次算的 partial_chars 是**当时**的，
+        # 之后的正文增量还没算进去。异常退出时这一次尤其重要 —— 它就是
+        # 重启后（或本次 error 报告里）能说出「已生成多少」的唯一依据。
+        # 注意此刻不要因为「任务已经结束」就跳过：结束不等于成功。
+        snap_dirty = True
+        await _flush_snapshot()
         content = "".join(text_parts)
         try:
             msg = await db.get_message(row["message_id"])

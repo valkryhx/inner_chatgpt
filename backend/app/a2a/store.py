@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS a2a_tasks (
     state         TEXT NOT NULL,
     artifacts     TEXT NOT NULL DEFAULT '[]',
     error         TEXT NOT NULL DEFAULT '',
+    snapshot      TEXT NOT NULL DEFAULT '{}',
     created_at    INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );
@@ -99,12 +100,17 @@ async def init_tables() -> None:
                 await conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN tool_policy TEXT NOT NULL DEFAULT 'full'"
                 )
-        await conn.execute(
-            "UPDATE a2a_tasks SET state='TASK_STATE_FAILED', error='server restart', updated_at=? "
-            "WHERE state IN ('TASK_STATE_SUBMITTED','TASK_STATE_WORKING')",
-            (now_ms(),),
-        )
+        # 中断现场（2026-11-14）。重启后不能只说「server restart」——
+        # 调用方需要知道「跑到第几步、最后在做什么、已生成多少」才能判断
+        # 该重试还是该放弃。这一列存的是**可序列化的进度**，不是活对象。
+        cur = await conn.execute("PRAGMA table_info(a2a_tasks)")
+        if "snapshot" not in {r[1] for r in await cur.fetchall()}:
+            await conn.execute(
+                "ALTER TABLE a2a_tasks ADD COLUMN snapshot TEXT NOT NULL DEFAULT '{}'"
+            )
         await conn.commit()
+    # 收敛上一进程遗留的未完成任务。放在事务外：它要先读 snapshot 再拼说明。
+    await mark_interrupted_tasks("server restart")
 
 
 def _row_to_agent(row: aiosqlite.Row) -> dict[str, Any]:
@@ -286,6 +292,94 @@ async def update_task(task_id: str, **fields: Any) -> Optional[dict[str, Any]]:
         cur = await conn.execute("SELECT * FROM a2a_tasks WHERE task_id=?", (task_id,))
         row = await cur.fetchone()
     return _row_to_task(row) if row else None
+
+
+async def update_snapshot(task_id: str, *, steps: int = 0, tools_run: int = 0,
+                          last_tool: str = "", partial_chars: int = 0) -> None:
+    """把「跑到哪了」写进 DB。**这是重启后唯一能说清情况的依据**。
+
+    为什么存这几个字段，而不是存整条事件流：
+      - ``steps``        跑了几个模型轮次（决定「重跑要多少钱」）
+      - ``tools_run``    成功执行了几个工具（决定「有多少副作用已经发生了」）
+      - ``last_tool``    最后一个工具名（告诉人「断在哪一步」）
+      - ``partial_chars`` 已经产出的正文字数（告诉人「已有多少可救」）
+
+    不存每一条文本增量：正文本身已经在 ``messages`` 表里按 250ms 落了库，
+    这里重复存只会让表膨胀，且重启后没有额外价值。
+
+    **写得要便宜**：这个函数在工具边界被调用，不能在热路径上做重活。
+    单条 UPDATE。
+    """
+    snap = {
+        "steps": int(steps),
+        "tools_run": int(tools_run),
+        "last_tool": str(last_tool or ""),
+        "partial_chars": int(partial_chars),
+        "at": now_ms(),
+    }
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "UPDATE a2a_tasks SET snapshot=?, updated_at=? WHERE task_id=?",
+            (json.dumps(snap, ensure_ascii=False), now_ms(), task_id),
+        )
+        await conn.commit()
+
+
+def _describe_interruption(snap: dict[str, Any], reason: str) -> str:
+    """把现场翻成一句人话。没有现场时**必须如实说没有**，不许编。"""
+    if not snap:
+        return (f"任务被中断（{reason}）：没有进展记录。"
+                "无法确定已执行到哪一步，建议重新提交；"
+                "如果上次可能已产生写入，请先自行核对结果。")
+    steps = int(snap.get("steps") or 0)
+    tools = int(snap.get("tools_run") or 0)
+    last = str(snap.get("last_tool") or "")
+    chars = int(snap.get("partial_chars") or 0)
+    parts = [f"任务被中断（{reason}）：第 {steps} 步"]
+    if last:
+        parts.append(f"，最后执行的是 {last}")
+    parts.append(f"，已成功执行 {tools} 个工具，已生成 {chars} 字")
+    if tools:
+        parts.append("。注意：中断前执行的工具可能已经产生了实际影响"
+                     "（文件写入、命令执行），重新提交前请先核对")
+    parts.append("。可以用同一 contextId 重新提交以继续。")
+    return "".join(parts)
+
+
+async def mark_interrupted_tasks(reason: str = "server restart") -> int:
+    """把上一进程遗留的未完成任务收敛为 FAILED，**并写清中断现场**。
+
+    与「一律写 server restart」的差别：调用方据此能判断该重试、该核对、
+    还是该放弃。没有信息的中断说明等于让调用方自己去猜。
+
+    只动 SUBMITTED / WORKING：已终态的任务不属于「被中断」。
+    返回受影响行数（测试与启动日志用）。
+    """
+    ts = now_ms()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA busy_timeout=5000;")
+        cur = await conn.execute(
+            "SELECT task_id, snapshot FROM a2a_tasks "
+            "WHERE state IN ('TASK_STATE_SUBMITTED','TASK_STATE_WORKING')"
+        )
+        rows = await cur.fetchall()
+        if not rows:
+            return 0
+        updates: list[tuple[str, int, str]] = []
+        for row in rows:
+            try:
+                snap = json.loads(row["snapshot"] or "{}")
+            except (TypeError, ValueError):
+                snap = {}
+            updates.append((_describe_interruption(snap, reason), ts, row["task_id"]))
+        await conn.executemany(
+            "UPDATE a2a_tasks SET state='TASK_STATE_FAILED', error=?, updated_at=? "
+            "WHERE task_id=?",
+            updates,
+        )
+        await conn.commit()
+    return len(updates)
 
 
 async def list_tasks(user_id: str, agent_id: str, *, context_id: str = "",
