@@ -374,3 +374,149 @@ def test_disabled_endpoint_is_404(isolated_db, monkeypatch):
         assert client.get(
             f"/a2a/{agent['agent_id']}/.well-known/agent-card.json"
         ).status_code == 404
+
+
+# --------------------------------------------------------------------------
+# 同步窗口超时：必须让调用方看出「还在跑」+ 知道去哪取进度
+# --------------------------------------------------------------------------
+
+def _slow_stream(delay_s=3.0, text="late answer"):
+    """比同步窗口慢的 stream：用于制造「超时时任务仍在跑」。"""
+    from app.sse import sse_frame
+
+    async def stream(user_id, session_id, text_in, generation_id, message_id,
+                     model_id="", stop_event=None, tool_policy="full"):
+        yield sse_frame("message_start", {"message_id": message_id})
+        await asyncio.sleep(delay_s)
+        yield sse_frame("text_delta", {"text": text})
+        yield sse_frame("done", {"message_id": message_id, "status": "complete",
+                                 "model": "fake"})
+
+    return stream
+
+
+def test_sync_timeout_reports_still_running_and_where_to_poll(isolated_db, monkeypatch):
+    """超时返回的 body 必须自解释：**还在跑**，以及怎么取进度。
+
+    没有这条，调用方拿到一个 ``TASK_STATE_WORKING`` 只能猜是「慢」还是「死了」，
+    也不知道下一步该调哪个方法 —— 这正是「显得无能」的那种体验。
+    """
+    from app.a2a import service
+    from app.routers import chat
+
+    agent = enabled_agent("u1")
+    monkeypatch.setattr(chat, "_event_stream", _slow_stream(delay_s=3.0))
+
+    task = run(service.send_message(
+        identity_for(agent),
+        {"message": {"messageId": "slow1", "role": "ROLE_USER",
+                     "parts": [{"text": "do something long"}]}},
+        sync_timeout=0.5,
+    ))
+
+    status = task["status"]
+    assert status["state"] == "TASK_STATE_WORKING"
+    # 机器可读的「还在跑」标志，调用方不必解析自然语言
+    assert task.get("stillRunning") is True
+    assert task.get("poll") == {"method": "GetTask", "params": {"id": task["id"]}}
+    assert task.get("subscribe") == {"method": "SubscribeToTask",
+                                     "params": {"id": task["id"]}}
+    # 人读的说明：必须点出「仍在运行，不是失败」
+    msg = (status.get("message") or {}).get("parts") or []
+    assert msg and "仍在运行" in msg[0]["text"]
+    assert task["id"]                     # 任务 id 必须在，否则无从恢复
+    assert task["artifacts"] == []         # 此时还没有产物
+
+
+def test_sync_completion_has_no_still_running_marker(isolated_db, monkeypatch):
+    """正常完成的返回不该带「还在跑」标志 —— 否则调用方会白等。"""
+    from app.a2a import service
+    from app.routers import chat
+
+    agent = enabled_agent("u1")
+    monkeypatch.setattr(chat, "_event_stream", _fake_stream("done fast"))
+
+    task = run(service.send_message(
+        identity_for(agent),
+        {"message": {"messageId": "fast1", "role": "ROLE_USER",
+                     "parts": [{"text": "hi"}]}},
+        sync_timeout=5.0,
+    ))
+    assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert "stillRunning" not in task
+    assert "poll" not in task
+    assert task["artifacts"][0]["parts"][0]["text"] == "done fast"
+
+
+def test_return_immediately_also_reports_where_to_poll(isolated_db, monkeypatch):
+    """``returnImmediately`` 是主动选择异步，同样要给出进度入口。"""
+    from app.a2a import service
+    from app.routers import chat
+
+    agent = enabled_agent("u1")
+    monkeypatch.setattr(chat, "_event_stream", _slow_stream(delay_s=0.2))
+
+    task = run(service.send_message(
+        identity_for(agent),
+        {"message": {"messageId": "async1", "role": "ROLE_USER",
+                     "parts": [{"text": "hi"}]}},
+        return_immediately=True,
+    ))
+    assert task.get("stillRunning") is True
+    assert task.get("poll", {}).get("params", {}).get("id") == task["id"]
+
+
+def test_get_task_does_not_claim_still_running(isolated_db, monkeypatch):
+    """GetTask 的返回保持原样：这是**查询**，不是「提交后还在等」。
+
+    若给 GetTask 也加 stillRunning，调用方每次查询都要多判断一次，
+    而且语义会变成「查到的任务还在跑」这种反直觉的说法 ——
+    state 本身已经说清楚了。
+    """
+    from app.a2a import service
+    from app.routers import chat
+
+    agent = enabled_agent("u1")
+    monkeypatch.setattr(chat, "_event_stream", _fake_stream("hello"))
+    task = run(service.send_message(
+        identity_for(agent),
+        {"message": {"messageId": "g1", "role": "ROLE_USER",
+                     "parts": [{"text": "hi"}]}},
+        sync_timeout=5.0,
+    ))
+    got = run(service.get_task(identity_for(agent), task["id"]))
+    assert got["status"]["state"] == "TASK_STATE_COMPLETED"
+    assert "stillRunning" not in got
+
+
+def test_sync_timeout_from_client_configuration(isolated_db, monkeypatch):
+    """调用方可以在 ``configuration.syncTimeoutS`` 指定本次同步窗口。"""
+    from app.a2a import service
+    from app.routers import chat
+
+    agent = enabled_agent("u1")
+    monkeypatch.setattr(chat, "_event_stream", _slow_stream(delay_s=3.0))
+
+    task = run(service.handle_method(
+        identity_for(agent), "SendMessage",
+        {"message": {"messageId": "cfg1", "role": "ROLE_USER",
+                     "parts": [{"text": "hi"}]},
+         "configuration": {"syncTimeoutS": 0.5}},
+    ))
+    assert task["status"]["state"] == "TASK_STATE_WORKING"
+    assert task.get("stillRunning") is True
+
+
+def test_sync_timeout_is_clamped_to_cap():
+    """同步窗口有硬上限：等待远超代理空闲超时只会让调用方连 task id 都拿不到。"""
+    from app.a2a.service import SYNC_TIMEOUT_CAP_S, _clamp_sync_timeout
+
+    assert _clamp_sync_timeout(None) is None
+    assert _clamp_sync_timeout("") is None
+    assert _clamp_sync_timeout("abc") is None
+    assert _clamp_sync_timeout(0) is None
+    assert _clamp_sync_timeout(-5) is None
+    assert _clamp_sync_timeout(float("nan")) is None
+    assert _clamp_sync_timeout(5) == 5.0
+    assert _clamp_sync_timeout("5") == 5.0
+    assert _clamp_sync_timeout(99999) == SYNC_TIMEOUT_CAP_S

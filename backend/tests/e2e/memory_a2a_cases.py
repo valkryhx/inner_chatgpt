@@ -289,8 +289,93 @@ async def case_sm3(client: httpx.AsyncClient, out: Path) -> dict:
             "checks": checks}
 
 
+async def case_sm6(client: httpx.AsyncClient, out: Path) -> dict:
+    """S-M6：同步窗口用完时，调用方拿到的是**可恢复的「还在跑」**而不是死掉。
+
+    这是 A2A 长任务体验的核心断言。用一个必然超过同步窗口的任务
+    （让模型跑几次工具）：
+
+      1. 返回 `state == TASK_STATE_WORKING`（不是错误、不是空答复）；
+      2. 带 `stillRunning: true` + `poll` / `subscribe` 两个操作入口；
+      3. `status.message` 里明说「仍在运行」，人一眼能看出不是失败；
+      4. **同一 task id 用 GetTask 能续取**，最终真的到终态且有产物。
+
+    第 4 条是关键：前三条只证明「回答里写了字」，第 4 条才证明
+    「照着那个提示做，真的能拿到结果」。
+    """
+    rid = _now_run_id()
+    token = await ensure_user(client, f"m5s6_{rid}".replace("-", "_"))
+    await ensure_zhanlu(client, token)
+    agent = await _enable_agent(client, token)
+    tk = await _make_token(client, token, "full", f"s6-{rid}")
+    agent_path = f"/a2a/{agent['agent_id']}"
+
+    # 刻意让它干活：跑一次 code_run 必然超过 60s 同步窗口吗？不一定 ——
+    # 所以这里不赌运气，直接给一个**极短**的同步窗口（客户端侧指定），
+    # 保证超时分支一定被触发，再验续取能拿到真实结果。
+    msg = {
+        "messageId": f"m_{uuid.uuid4().hex[:12]}",
+        "role": "ROLE_USER",
+        "parts": [{"text": f"用 code_run 跑 python -c \"print(6*7)\"，"
+                           f"然后原样复述输出，最后输出 {SENTINEL}"}],
+    }
+    first = await _rpc(client, agent_path, tk["token"], "SendMessage",
+                       {"message": msg, "configuration": {"syncTimeoutS": 0.5}},
+                       timeout_s=120)
+    task = (first.get("result") or {}).get("task") or {}
+    state1 = (task.get("status") or {}).get("state", "")
+    task_id = task.get("id", "")
+    msg_text = ""
+    for part in ((task.get("status") or {}).get("message") or {}).get("parts") or []:
+        if isinstance(part, dict):
+            msg_text += str(part.get("text") or "")
+
+    # 照它给的提示续取
+    final_text = ""
+    final_state = ""
+    if task_id:
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            got = await _rpc(client, agent_path, tk["token"], "GetTask", {"id": task_id},
+                             timeout_s=60)
+            t = (got.get("result") or {})
+            final_state = (t.get("status") or {}).get("state", "")
+            if final_state in ("TASK_STATE_COMPLETED", "TASK_STATE_FAILED",
+                               "TASK_STATE_CANCELED"):
+                # GetTask 返回的是 task 本身（result 层），不是 SendMessage 的
+                # {"task": {...}} 包装 —— 别用 _artifact_text 那个按
+                # result.task 取产物的辅助函数。
+                final_text = "".join(
+                    str(part.get("text") or "")
+                    for art in (t.get("artifacts") or [])
+                    for part in (art.get("parts") or [])
+                    if isinstance(part, dict)
+                )
+                break
+            await asyncio.sleep(3)
+
+    checks = [
+        {"kind": "first_is_working", "name": state1, "ok": state1 == "TASK_STATE_WORKING"},
+        {"kind": "still_running_flag", "name": str(task.get("stillRunning")),
+         "ok": task.get("stillRunning") is True},
+        {"kind": "has_poll", "name": str((task.get("poll") or {}).get("method")),
+         "ok": (task.get("poll") or {}).get("method") == "GetTask"},
+        {"kind": "has_subscribe", "name": str((task.get("subscribe") or {}).get("method")),
+         "ok": (task.get("subscribe") or {}).get("method") == "SubscribeToTask"},
+        {"kind": "message_says_running", "name": msg_text[:40],
+         "ok": "仍在运行" in msg_text},
+        {"kind": "recoverable_to_terminal", "name": final_state,
+         "ok": final_state == "TASK_STATE_COMPLETED"},
+        {"kind": "recovered_has_sentinel", "name": SENTINEL,
+         "ok": SENTINEL in final_text},
+    ]
+    return {"case": "S-M6", "run_id": rid, "first_state": state1, "task_id": task_id,
+            "status_message": msg_text, "final_state": final_state,
+            "final_text": final_text, "text": final_text, "checks": checks}
+
+
 CASES = {"S-M4a": case_sm4a, "S-M4b": case_sm4b, "S-M4c": case_sm4c,
-         "S-M3": case_sm3}
+         "S-M3": case_sm3, "S-M6": case_sm6}
 
 
 def _report(name: str, rid: str, body: dict, out: Path) -> dict:

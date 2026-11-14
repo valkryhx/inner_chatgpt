@@ -116,6 +116,18 @@
 - 并发配额（`INNER_A2A_MAX_ACTIVE_TASKS_PER_USER` / `..._GLOBAL`，超限 429 + `-32010`）与审计表 `a2a_audit`（最近 2 万行）已生效。
 - 终态任务可 `SubscribeToTask`：发 `task` → 最终 artifact → 终态 status 后关流；重启被标 `FAILED` 的任务同样可见原因。
 - 验证：`backend/tests/test_a2a_mvp.py`（13）+ `backend/tests/test_a2a_policy.py`（12），后端全量 271 passed；真实 A2A CLI v0.4.0 E2E（同步/流式/订阅/取消/幂等/配额/档位）。
+- **长任务语义（2026-11-14 补）**：同步窗口默认 60s，而**实测多步任务 105s 级** ——
+  大多数像样的任务都会走到超时分支。所以超时**不是失败**：任务由 `asyncio.create_task`
+  独立运行，返回里带 `stillRunning: true` + `poll`（GetTask）+ `subscribe`
+  （SubscribeToTask）+ 中文说明「仍在运行，不是失败，不要重发」。**刻意不把默认窗口拉长**：
+  前面通常有 nginx/网关空闲超时（多为 60–100s），等太久代理先断 → 调用方连 task id
+  都拿不到，任务还在后台跑并占配额 = 真失控；而且长任务天花板是子代理/ACP 的 1800s，
+  拉长治不了病。调用方可用 `configuration.syncTimeoutS` 调，但被
+  `SYNC_TIMEOUT_CAP_S=280` 夹住。`GetTask` 与「同步已完成」两条返回**不带**
+  `stillRunning`（查询不需要、完成时带了会让调用方白等）。
+  验证：6 项新单测 + **S-M6 真机 7/7**（runId `1794661186-7fe1`：`WORKING` →
+  照 `poll` 续取 → `COMPLETED` + `42` + 哨兵）。
+  详见 `docs/20261114-A2A长任务同步窗口与可恢复语义.md`。
 - 详见 `docs/20261110-A2A使用文档.md`、`docs/20261110-A2A-MVP实施记录.md`；协议调研见 `docs/20261109-A2A协议接入调研与设计.md`。
 
 **P7：图片上传与视觉输入 —— 已完成（2026-11-10）。**
@@ -272,6 +284,7 @@
 | `docs/20261114-CC319记忆机制源码复核v3.md` | **CC 记忆机制复核（最新，权威，6 项疑似已清零）**：对 v2 逐条回源复核（63 个行号区间 + 55 条解释性结论），定案 6 处 v2 错误——① `MEMORY.md` 默认走 `instructions` attachment 而非 system prompt（`n0n()` 默认 true → announced）；② `memory_list` 定义在 `m0816:2988`（v2 指的 `m0591:75831` 是 `memory_read` 的 schema），有 `cursor`/默认页 50；③ 索引 cap 25000 是 UTF-16 code unit 不是字节（单文件召回 4096 才是真字节）；④ `Dl()` 非主拼装器（主路径是 `li`/`Ll`）且不含类型表/禁止清单；⑤ `aY()` 是 SDK 入口判定；⑥ 28 个环境变量里 2 个零读取、2 个只写不读。**另含 6 项 chunk 落地后的定论**（`Gn` 剥 `[1m]`、`Cae` 确含 `system-reminder`、`rr`=远端能力、`yIe` 恒 null 致账号记忆链死代码、`DISABLE_ORG_MEMORY` 拦组织同步、`n0n()` 默认 true）+ 6 条口径提醒 + **51 条可直接引用的白名单**。**另有落地时发现的第 7 处**：闸门适用模式划分不准（第 4 道权限闸仅文件模式、`first_look` 是 MCP 专属第 8 道，文件模式下 CC 无此闸）。复现脚本 `tools/cc_source_verify/`（`build_chunk_map.py` 1764 chunk 全命中、`verify_line_refs.py` 102 项行号断言）。**与 v2 冲突以此为准** |
 | `docs/20261113-CC319记忆机制源码核实v2.md` | **CC 记忆机制权威调研（已被 v3 复核）**：6 条读路径（含 `relevant_memories` 相关性选择器、`AutoMem` 索引注入、MCP 记忆库、账号记忆）/ 2 条写路径（`extractMemories` + `auto_dream` 合并）/ 四类记忆提示词全文 / 隔离与 28 个环境变量分类，逐条带行号证据。**方向与 51 条事实成立，但有 6 处错误见 v3 §1；§7 账号记忆时序在本 build 不会真的发生，见 v3 §4.4** |
 | `docs/20261114-CC319记忆触发时机核实.md` | **CC 记忆的触发时机（写/读/dream 三者何时发生）**：写侧不是常驻后台而是「每个用户轮次结束尝试一次」（`Jd` → `executeExtractMemories` → `ir` → `ar` → `Le`），文件模式下还有 `tengu_passport_quail` 一道默认 false 的外层闸（v2/v3 均未记录）；读侧 `AutoMem` 索引每次模型调用装配时读，`relevant_memories` 选择器受 `lSe()` 门控**默认不跑**；dream 与提取器同点触发但被 24h + 5 会话 + 10min 三道时间闸压成隔天级，且**不做**「从失败中学习」。**推翻方案 §3.7 的「读侧主路径」与「每 generation 一次」两处说法** |
+| `docs/20261114-A2A长任务同步窗口与可恢复语义.md` | **A2A 长任务语义（最新）**：同步窗口默认 60s 而实测多步任务 105s 级 → 超时是**正常中间态**不是失败。选型理由（为什么**不**把默认窗口拉长：代理先断会连 task id 都拿不到，且天花板是 1800s 治不了病）。`stillRunning` / `poll` / `subscribe` / 中文说明四件套，哪些返回带哪些不带（`GetTask` 与「同步已完成」刻意不带）。顺带补上 `configuration.syncTimeoutS`（原本根本没被读取）与 `SYNC_TIMEOUT_CAP_S=280` 夹上限。6 项新单测 + S-M6 真机 7/7 |
 | `docs/20261114-记忆系统M5-A2A档位与跨用户隔离.md` | **M5 A2A 档位（最新，已落地，抓出真实越权缺陷）**：`tool_policy` 只兜住 registry 那一条通道，记忆的**读侧注入与写侧后台提取都不走 registry** → `read_only`/`chat_only` 仍会写记忆（写进去的内容还会在下一个会话被当事实注入）。修法是 `allows_memory_read()` / `allows_memory_write()` 判据集中一处 + 三个安装点问一句 + `_TurnUR` 透传档位。**三档定为严格包含的阶梯**（chat_only 连读也掐，否则最严一档反而最能看到私人记忆）。17 项单测 + 3 条反向确认 + **4 个真机场景含正向对照**（S-M4b 零写入 0→0 必须配 S-M4c full token 0→1，否则是空断言） |
 | `docs/20261114-记忆系统M3.5选择性召回实施记录.md` | **M3.5 选择性召回（最新，已落地，默认关闭）**：`memory_prefetch.py` 的 `PrefetchHandle`（promise / settled_at / consumed_on_iteration，对齐 CC 的 `Ivi`）+ 六道入口闸 + slug 集合去重 + 会话字节预算 + 独立小模型 client。**两个挂点**（启动在轮循环前、消费在工具步骤后）为何不能合一。**S-M6 实测 62.5% → 100%（44 条记忆 / 8 条无字面重合查询）、S-M7 启动 4.9ms / settle 中位 183ms**。**真机抓到的两个缺陷**：① 共享去重集合缺失导致同一条记忆注入两遍；② 关键词路径抢 slug 致选择器白跑 → 改为互斥。41 项单测 + 13 条变异 + 全量 1053 passed。§6 顺带用 9.9μs 实测回答「`AgentLoop` 为何必须每轮新建」 |
 | `docs/20261114-记忆系统三项未覆盖验证记录.md` | **记忆三项未覆盖验证（最新，其中一项抓出真缺陷）**：① Playwright UI **52/52**（`tools/memory_verify/ui_dream.py`，8 截图，含「按钮在可视区内」「原生 confirm 要显式接管」「落库核对不能用列表文本」三个只有真浏览器能发现的设计点，以及一次「截图残留」误报的排查记录）；② 进程内并发 6 场景（`concurrent_write.py`）—— **抓出 `memory_delete` 无版本保护导致的数据丢失（C-2b，100% 可复现）**，修法是「先读后删 + 读后未变」两道代码级闸，并解释为何不靠 prompt、不要求模型传 if_version；③ 跨进程锁 4 场景（`multi_process_lock.py`）—— 用两个真实进程而非 uvicorn --workers（后者在 `multiprocessing.spawn` 下要 `if __name__` 保护），33–35 次抢锁、持锁窗口两两不重叠。**另含 C-3 判据纠错**（索引并发期允许陈旧，因为 `MEMORY.md` 目前无运行期读取者；只验收敛性 + 无幽灵行），以及 `last_consolidated=0` 时首次不受时间闸约束这一「碰巧成立」语义的钉住 |

@@ -21,6 +21,9 @@ _TERMINAL = {
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 _TASK_HANDLES: dict[str, asyncio.Task] = {}
 
+# 调用方可指定的同步窗口硬上限（秒）。见 `_clamp_sync_timeout`。
+SYNC_TIMEOUT_CAP_S = 280.0
+
 
 def _now_iso(ms: Optional[int] = None) -> str:
     ts = (ms if ms is not None else int(time.time() * 1000)) / 1000.0
@@ -76,6 +79,43 @@ def _to_a2a(row: dict[str, Any], history_length: int = 0) -> dict[str, Any]:
     if history_length > 0:
         task["history"] = []  # filled by get_task when messages are available
     return task
+
+
+# 同步窗口用完时给调用方的说明。必须同时满足三件事：
+#   1. 说清「还在跑，不是失败」—— 否则调用方会以为 Hlaudz 死了；
+#   2. 说清去哪取进度（机器可读的 poll/subscribe + 人读的文案都要）；
+#   3. 说清**不要重发**—— 重发会命中 messageId 幂等，拿回同一个任务，
+#      但调用方若换了 messageId 就会真的跑第二遍，白烧一遍 token。
+_STILL_RUNNING_TEXT = (
+    "任务仍在运行，不是失败。同步窗口已到（INNER_A2A_SYNC_TIMEOUT_S），"
+    "后台任务继续执行。"
+    "用 GetTask(id) 查询当前状态，或用 SubscribeToTask(id) 订阅事件流直到终态。"
+    "不要重新发送同一条消息。"
+)
+
+
+def _with_still_running(task: dict[str, Any]) -> dict[str, Any]:
+    """给「提交了但还没结束」的返回补上可恢复指示。
+
+    只在**提交语义**的返回上加（SendMessage / returnImmediately），
+    不加在 GetTask 上：查询本身不需要「还在跑」这种提示，``state`` 已经说清了。
+    """
+    task_id = task["id"]
+    status = dict(task.get("status") or {})
+    if not status.get("message"):
+        status["message"] = {
+            "messageId": f"running_{task_id}",
+            "role": "ROLE_AGENT",
+            "parts": [{"text": _STILL_RUNNING_TEXT}],
+        }
+    return {
+        **task,
+        "status": status,
+        # 机器可读：调用方不必解析自然语言
+        "stillRunning": True,
+        "poll": {"method": "GetTask", "params": {"id": task_id}},
+        "subscribe": {"method": "SubscribeToTask", "params": {"id": task_id}},
+    }
 
 
 def _extract_text(params: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -204,6 +244,28 @@ def _spawn(row: dict[str, Any], text: str, model_id: str,
     return task
 
 
+def _clamp_sync_timeout(value: Any) -> Optional[float]:
+    """调用方可指定本次请求的同步等待窗口，但有硬上限。
+
+    **为什么必须夹上限**：同步等待会一直占着这条 HTTP 连接。前面通常还有
+    nginx / 网关 / 客户端自己的空闲超时（多为 60–100 秒），等待远超那个值
+    只会让代理先断开 —— 调用方连 task id 都拿不到，而任务还在后台跑并占着
+    配额，那才是真正的失控。所以默认值就短（60s），调用方也只能在
+    ``SYNC_TIMEOUT_CAP_S`` 以内调，超出就夹到上限。
+
+    ``None`` / 无法解析 → 返回 ``None``，表示「用服务端默认」。
+    """
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds != seconds or seconds <= 0:      # NaN / 非正数
+        return None
+    return min(seconds, SYNC_TIMEOUT_CAP_S)
+
+
 async def _enforce_quota(identity: dict[str, Any]) -> None:
     """并发配额：只拦新建任务，幂等重放不受影响。"""
     mine, total = await store.count_active(identity["user_id"])
@@ -259,8 +321,13 @@ async def send_message(identity: dict[str, Any], params: dict[str, Any], *,
                        sync_timeout: Optional[float] = None,
                        return_immediately: bool = False) -> dict[str, Any]:
     row, existing = await _prepare_task(identity, params)
-    if existing or return_immediately:
-        return _to_a2a(row)
+    if existing:
+        # 幂等重放：拿回的是已存在的任务。若它还没结束，同样要告诉调用方
+        # 「还在跑、去哪取」—— 重放路径上尤其容易让人以为「没反应」。
+        task = _to_a2a(row)
+        return task if row["state"] in _TERMINAL else _with_still_running(task)
+    if return_immediately:
+        return _with_still_running(_to_a2a(row))
 
     timeout = config.sync_timeout_s() if sync_timeout is None else max(0.1, sync_timeout)
     deadline = asyncio.get_running_loop().time() + timeout
@@ -269,7 +336,8 @@ async def send_message(identity: dict[str, Any], params: dict[str, Any], *,
         if current and current["state"] in _TERMINAL:
             return _to_a2a(current)
         if asyncio.get_running_loop().time() >= deadline:
-            return _to_a2a(current or row)
+            # 超时不是失败：任务在后台继续跑，返回里带上 task id 与进度入口。
+            return _with_still_running(_to_a2a(current or row))
         await asyncio.sleep(0.05)
 
 
@@ -395,9 +463,12 @@ async def handle_method(identity: dict[str, Any], method: str,
                         params: dict[str, Any]) -> dict[str, Any]:
     if method == "SendMessage":
         cfg = params.get("configuration") or {}
+        # 调用方可以在本次请求上指定同步窗口（配置键沿用 A2A 的
+        # ``configuration`` 惯用法）。不传就用服务端默认；上限见 _clamp_sync_timeout。
         return await send_message(
             identity, params,
             return_immediately=bool(cfg.get("returnImmediately")),
+            sync_timeout=_clamp_sync_timeout(cfg.get("syncTimeoutS")),
         )
     if method == "GetTask":
         task_id = str(params.get("id") or "")
