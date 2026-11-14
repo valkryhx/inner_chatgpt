@@ -511,6 +511,96 @@
    "file": "m0191_0x1155a4cc.js",
    "line": 2425,
    "must_contain": "firstLook"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 151688,
+   "must_contain": "MAX_SESSION_BYTES: 61440"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153923,
+   "must_contain": "function Ivi"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 153878,
+   "must_contain": "function jzr"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 151404,
+   "must_contain": "KGr"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 151472,
+   "must_contain": "function QGr"
+  },
+  {
+   "file": "m0591_0x11be624e.js",
+   "line": 229587,
+   "must_contain": "Retrieved for possible relevance"
+  },
+  {
+   "file": "m0848_0x124d7ee6.js",
+   "line": 7294,
+   "must_contain": "using xt = Ivi"
+  },
+  {
+   "file": "m0833_0x124cce31.js",
+   "line": 54,
+   "must_contain": "function Q(e, r, o"
+  },
+  {
+   "file": "m0833_0x124cce31.js",
+   "line": 177,
+   "must_contain": "minHours: 24"
+  },
+  {
+   "file": "m0833_0x124cce31.js",
+   "line": 178,
+   "must_contain": "minSessions: 5"
+  },
+  {
+   "file": "m0833_0x124cce31.js",
+   "line": 174,
+   "must_contain": "ce = 600000"
+  },
+  {
+   "file": "m0833_0x124cce31.js",
+   "line": 187,
+   "must_contain": "function he()"
+  },
+  {
+   "file": "m0833_0x124cce31.js",
+   "line": 197,
+   "must_contain": "function xXs"
+  },
+  {
+   "file": "m0833_0x124cce31.js",
+   "line": 334,
+   "must_contain": "dreamWrote"
+  },
+  {
+   "file": "m0833_0x124cce31.js",
+   "line": 356,
+   "must_contain": "Improved"
+  },
+  {
+   "file": "m0832_0x124c3af6.js",
+   "line": 616,
+   "must_contain": "function NGr"
+  },
+  {
+   "file": "m0194_0x11642aa3.js",
+   "line": 9,
+   "must_contain": "lm = \"MEMORY.md\""
+  },
+  {
+   "file": "m0194_0x11642aa3.js",
+   "line": 10,
+   "must_contain": "YF = 200"
   }
  ]
 }
