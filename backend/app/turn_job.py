@@ -62,6 +62,7 @@ sync 时序列化的是「此刻的全部状态」，`seq` 也是此刻的值 �
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import os
@@ -90,11 +91,32 @@ REPLAY_MAX_BYTES = int(os.environ.get("HLZ_TURNJOB_REPLAY_BYTES", str(2 * 1024 *
 # 队列里的「没有更多了」标记。用独立哨兵而不是 None，避免和空帧混淆。
 _STREAM_END = object()
 
+# SSE 心跳：静默满这么久就往订阅者队列里塞一帧注释行。
+#
+# **静默计时而不是固定 ticker**（与 LibreChat `stream/keepalive.ts` 同思路）：
+# 固定间隔在高速输出时是纯浪费 —— 我们一轮几千帧，25s 内根本不会安静，心跳一帧
+# 都不需要发。只在「真的没东西可写」时才补一帧，让代理看到字节。
+#
+# 为什么需要它：实测直连 uvicorn 能撑过 36s 空闲，但一旦前面挂 nginx
+# （`proxy_read_timeout` 默认 60s）或 Cloudflare（100s 无字节即断），一次长
+# `code_run` 的空档就会把**续看连接**切掉，用户看到内容停住。Aivory 把它做成
+# 默认开启就是因为不该赌部署形态（`messages_handlers.go:2009` §6.2）。
+#
+# 0 或负数表示关闭。用注释行（`:` 开头）而非事件：SSE 客户端按规范必须跳过，
+# 不会触发任何 onEvent 分支，也不会占用 seq。
+HEARTBEAT_IDLE_S = float(os.environ.get("HLZ_TURNJOB_HEARTBEAT_IDLE_S", "15"))
+
+# 心跳注释帧。**不带 id:** —— 它不是真事件，不该推进续看游标。
+_HEARTBEAT_FRAME = ": keep-alive\n\n"
+
 # 进程内的 job 表。key = (user_id, session_id, generation_id)。
 _JOBS: dict[tuple[str, str, str], "TurnJob"] = {}
 
 # 持有 job task 的强引用：否则任务对象可能被 GC 掉，正在跑的生成会静默消失。
 _JOB_TASKS: set[asyncio.Task] = set()
+
+# 建号序（job 的 started_at）。模块级计数器，跨事件循环也不会撞号。
+_START_SEQ = itertools.count(1)
 
 
 def _key(user_id: str, session_id: str, generation_id: str) -> tuple[str, str, str]:
@@ -133,9 +155,29 @@ class Subscriber:
         self.queue.put_nowait(_STREAM_END)
 
     async def drain(self) -> AsyncIterator[str]:
-        """产出帧直到 job 结束或本订阅者溢出。"""
+        """产出帧直到 job 结束或本订阅者溢出。
+
+        空闲超过 `HEARTBEAT_IDLE_S` 就补一帧注释行（心跳），让中间的代理看到字节。
+        **只在真的没东西可写时才发** —— 有帧在流动时不发，这是「静默计时」而不是
+        固定 ticker，与 LibreChat 的 `keepalive.ts` 同思路。
+
+        心跳不经过 `publish()`，所以既**不占 seq**、也**不进重放缓冲**：它不是真事件，
+        续看游标不该被它推进，客户端也不该重放它。
+        """
+        idle: Optional[float] = HEARTBEAT_IDLE_S if HEARTBEAT_IDLE_S > 0 else None
         while True:
-            item = await self.queue.get()
+            if idle is None:
+                item = await self.queue.get()
+            else:
+                try:
+                    item = await asyncio.wait_for(self.queue.get(), idle)
+                except asyncio.TimeoutError:
+                    # 队列等待被取消，但队列项仍留在原位（CPython 3.13 实测：不丢帧），
+                    # 所以这里补一帧心跳再继续等，不会跳过任何真实事件。
+                    if self.overflow:
+                        return
+                    yield _HEARTBEAT_FRAME
+                    continue
             if item is _STREAM_END:
                 return
             self.queued_bytes -= len(item)
@@ -156,6 +198,10 @@ class TurnJob:
         self.subscribers: list[Subscriber] = []
         self.finished = False
         self.task: Optional[asyncio.Task] = None
+        # 单调递增的建号序，用于「同一会话出现两个未 finish 的 job 时挑最新的」。
+        # 不能用 generation_id 字符串比大小（随机 id 不可比），也不用挂钟
+        # （同一毫秒内可能建两个）。见 get_live_job_for_session。
+        self.started_at = next(_START_SEQ)
         # 单调递增的事件序号 = 客户端续看游标。由 job 拥有并重写每帧的 id:。
         self.seq = 0
         # 重放缓冲：[(seq, frame)]，seq 连续递增，丢最老的。
@@ -264,7 +310,12 @@ class TurnJob:
         self.blocks_provider = provider
 
     def finish(self) -> None:
-        """job 结束：通知所有订阅者之后不会再有帧，并把自己从表里摘掉。"""
+        """job 结束：通知所有订阅者之后不会再有帧，并把自己从表里摘掉。
+
+        幂等且是**唯一收口**：正常路径由 `_wrapped` 的 finally 调，异常路径（任务
+        还没开始执行就被 cancel、或 create_task 本身失败）由 `start_job` 里注册的
+        done_callback 兜底。两处都调不会出问题。
+        """
         if self.finished:
             return
         self.finished = True
@@ -284,11 +335,26 @@ def get_job(user_id: str, session_id: str, generation_id: str) -> Optional[TurnJ
 
 
 def get_live_job_for_session(user_id: str, session_id: str) -> Optional[TurnJob]:
-    """该会话当前活着的 job（用于「刷新后自动接上」，阶段 3 用）。"""
+    """该会话当前活着的 job（用于「刷新后自动接上」）。
+
+    **同一会话可能短暂有两个未 finish 的 job**：旧 job 的 `_event_stream` 在 finally
+    里先 `await release_generation()` 释放 DB 租约，然后 `_wrapped` 的 finally 才
+    `job.finish()` 摘表。中间那段 await 里新请求已经能抢到租约并建新 job
+    （`tools/turn_job_verify/lifecycle_probes.py` 的 P5 实测复现）。
+
+    所以这里必须挑**代际最新**的那个，而不是「第一个扫到的」：`_JOBS` 是 dict 且
+    旧键先插入，`for ... return` 会稳定返回正要收尾的旧 job，于是刷新页面接到一个
+    不会再产出任何帧的流，表现为「一直在转圈、内容不动」。
+
+    用 `started_at`（单调序）而不是字符串比 generation_id：后者是随机 id 不可比。
+    """
+    best: Optional[TurnJob] = None
     for (uid, sid, _gid), job in list(_JOBS.items()):
-        if uid == str(user_id) and sid == str(session_id) and not job.finished:
-            return job
-    return None
+        if uid != str(user_id) or sid != str(session_id) or job.finished:
+            continue
+        if best is None or job.started_at > best.started_at:
+            best = job
+    return best
 
 
 def live_job_count() -> int:
@@ -319,6 +385,19 @@ def start_job(job: TurnJob,
     job.task = task
     _JOB_TASKS.add(task)
     task.add_done_callback(_JOB_TASKS.discard)
+    # 兜底收口：`_wrapped` 的 finally 只在「协程真的开始执行过」时才跑。
+    # 实测（`tools/turn_job_verify/lifecycle_probes.py` 的 P1）任务建好后、第一个 await 点之前
+    # 就被 cancel 的话，协程体一行都不执行，finally 也就不会跑 —— job 会永远留在
+    # `_JOBS` 里，`live_job_count()` 不降，续看端拿到一个永远不会产出帧的 job 并挂死
+    # （同脚本 P3 复现）。
+    #
+    # done_callback 在这种情形下**仍然触发**（同脚本 P2 验证），
+    # 所以把它作为与执行路径无关的唯一兜底。`finish()` 幂等，两条路径都调无害。
+    def _reap(_t: asyncio.Task, _job: "TurnJob" = job) -> None:
+        _job.finish()
+        _job.task = None   # 断开 job <-> task 的引用环，不然要靠 gc 回收
+
+    task.add_done_callback(_reap)
     return job
 
 

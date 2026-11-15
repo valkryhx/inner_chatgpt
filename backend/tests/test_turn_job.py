@@ -443,3 +443,254 @@ def test_shutdown_all_cancels_live_jobs():
         assert turn_job.live_job_count() == 0
 
     run(main())
+
+
+# --------------------------------------------- 阶段 4：心跳与生命周期收口
+
+def test_heartbeat_fires_when_idle(monkeypatch):
+    """静默满阈值就补一帧注释行，让代理看到字节。
+
+    真机实测直连 uvicorn 能撑 36s 空闲，但前挂 nginx（默认 60s）或 Cloudflare
+    （100s 无字节）时，一次长 `code_run` 的空档就会切断连接。Aivory 把它做成
+    默认开启（`messages_handlers.go:2009` §6.2），理由是该赌部署形态不如直接发。
+    """
+    async def main():
+        monkeypatch.setattr(turn_job, "HEARTBEAT_IDLE_S", 0.05)
+        job = turn_job.TurnJob("u1", "s1", "g1")
+        sub = job.attach()
+        assert sub is not None
+
+        got: list[str] = []
+
+        async def consume():
+            async for chunk in sub.drain():
+                got.append(chunk)
+                if len(got) >= 2:
+                    return
+
+        await asyncio.wait_for(consume(), timeout=3.0)
+        assert all(g == turn_job._HEARTBEAT_FRAME for g in got), f"只该是心跳帧：{got}"
+
+    run(main())
+
+
+def test_heartbeat_silent_while_busy(monkeypatch):
+    """有帧在流动时一帧心跳都不发 —— 这是「静默计时」而非固定 ticker。
+
+    固定 ticker 在高速输出时会白发一堆（我们一轮几千帧），静默计时的
+    价值就在这里。LibreChat 的 `keepalive.ts:122` 是同一做法。
+    """
+    async def main():
+        monkeypatch.setattr(turn_job, "HEARTBEAT_IDLE_S", 0.5)
+        job = turn_job.TurnJob("u1", "s1", "g1")
+        sub = job.attach()
+        assert sub is not None
+        got: list[str] = []
+
+        async def produce():
+            for i in range(20):
+                job.publish(f"event: text_delta\ndata: {i}\n\n")
+                await asyncio.sleep(0.01)   # 远快于 0.5s 空闲阈值
+
+        async def consume():
+            async for chunk in sub.drain():
+                got.append(chunk)
+                if len(got) >= 20:
+                    return
+
+        await asyncio.wait_for(asyncio.gather(produce(), consume()), timeout=5.0)
+        heartbeats = [g for g in got if g == turn_job._HEARTBEAT_FRAME]
+        assert heartbeats == [], f"繁忙时不该发心跳，实际发了 {len(heartbeats)} 帧"
+
+    run(main())
+
+
+def test_heartbeat_does_not_advance_seq_or_enter_replay(monkeypatch):
+    """心跳确实从 drain 流出，但 job 的 seq 与重放缓冲只数真实事件。
+
+    ⚠️ 这条一开始写成「只发心跳、然后断言 seq==0」，**那是恒真的**：
+    `Subscriber.__slots__` 里没有 job 反向引用，drain 内部根本碰不到 job.seq，
+    任何实现下 seq 都是 0（变异测试 H3 漏网才发现）。所以必须先 `publish`
+    真实帧，再断言「seq 与缓冲只反映真实帧」—— 这样「心跳走了 publish」才会变红。
+    """
+    async def main():
+        monkeypatch.setattr(turn_job, "HEARTBEAT_IDLE_S", 0.05)
+        job = turn_job.TurnJob("u1", "s1", "g1")
+        sub = job.attach()
+        assert sub is not None
+        seen: list[str] = []
+
+        async def produce():
+            for i in range(2):
+                await asyncio.sleep(0.25)      # 间隔 > 心跳阈值，中间会插心跳
+                job.publish(f"event: text_delta\ndata: {i}\n\n")
+            # 再静一会儿让心跳发出来，然后结束
+            await asyncio.sleep(0.25)
+            job.finish()
+
+        async def consume():
+            async for chunk in sub.drain():
+                seen.append(chunk)
+
+        await asyncio.wait_for(asyncio.gather(produce(), consume()), timeout=5.0)
+
+        heartbeats = [c for c in seen if c == turn_job._HEARTBEAT_FRAME]
+        real = [c for c in seen if c != turn_job._HEARTBEAT_FRAME]
+        assert len(heartbeats) >= 1, "前提：这段空闲里确实发过心跳"
+        assert len(real) == 2, f"真实帧 2 条，实际 {len(real)}"
+        assert job.seq == 2, f"seq 只该数真实事件，实际 {job.seq}（心跳占了就是 bug）"
+        assert len(job.replay) == 2, f"重放缓冲只该有真实帧，实际 {len(job.replay)}"
+        assert all(turn_job._HEARTBEAT_FRAME not in f for _s, f in job.replay), \
+            "心跳不得进入重放缓冲"
+
+        # 线上协议：心跳必须是**纯注释行**。若它带上 `id:`，前端 parseFrame 会把
+        # 那个号当成续看游标（`api.ts` 的 onSeq），于是客户端下次从 after=999 回来
+        # 就会跳过中间所有真实事件。后端结构上抓不到这一点（心跳不经 publish，
+        # 不碰 seq / 缓冲），只能在这里直接断言帧形状。
+        hb = turn_job._HEARTBEAT_FRAME
+        assert hb.startswith(":"), f"心跳必须是注释行，实际 {hb!r}"
+        for forbidden in ("id:", "data:", "event:"):
+            assert forbidden not in hb, \
+                f"心跳帧不得含 {forbidden!r}（会污染游标或触发 onEvent），实际 {hb!r}"
+
+    run(main())
+
+
+def test_heartbeat_interleaved_does_not_lose_real_frames(monkeypatch):
+    """心跳插入到真实帧之间时，真实帧一条都不能丢、顺序不能乱。
+
+    `drain()` 用 `wait_for(queue.get(), idle)` 实现心跳：超时只取消**等待**，
+    队列项留在原位。这条测试钉住这一点不被改坏。
+    """
+    async def main():
+        monkeypatch.setattr(turn_job, "HEARTBEAT_IDLE_S", 0.05)
+        job = turn_job.TurnJob("u1", "s1", "g1")
+        sub = job.attach()
+        assert sub is not None
+        seen: list[str] = []
+
+        async def produce():
+            for i in range(3):
+                await asyncio.sleep(0.2)     # 每帧间隔远大于心跳阈值
+                job.publish(f"event: text_delta\ndata: {{\"n\":{i}}}\n\n")
+            sub.end()
+
+        async def consume():
+            async for chunk in sub.drain():
+                seen.append(chunk)
+
+        await asyncio.wait_for(asyncio.gather(produce(), consume()), timeout=8.0)
+        real = [s for s in seen if s != turn_job._HEARTBEAT_FRAME]
+        assert len(real) == 3, f"真实帧不能丢，实际 {len(real)}"
+        assert [r.split('"n":')[1][0] for r in real] == ["0", "1", "2"], "顺序不能乱"
+        assert job.seq == 3, f"seq 应只数真实事件，实际 {job.seq}"
+
+    run(main())
+
+
+def test_heartbeat_can_be_disabled(monkeypatch):
+    """`HEARTBEAT_IDLE_S <= 0` 时退化为「一直等」，不装定时器。
+
+    关得掉是部署需要：若前面是直连 uvicorn（无代理空闲超时），心跳只是噪音。
+    """
+    async def main():
+        monkeypatch.setattr(turn_job, "HEARTBEAT_IDLE_S", 0)
+        job = turn_job.TurnJob("u1", "s1", "g1")
+        sub = job.attach()
+        assert sub is not None
+        seen: list[str] = []
+
+        async def consume():
+            async for chunk in sub.drain():
+                seen.append(chunk)
+
+        async def produce():
+            await asyncio.sleep(0.3)
+            job.publish("event: only\ndata: 1\n\n")
+            job.finish()
+
+        await asyncio.wait_for(asyncio.gather(produce(), consume()), timeout=5.0)
+        assert [s for s in seen if s == turn_job._HEARTBEAT_FRAME] == [], "关闭后不该发心跳"
+        assert len(seen) == 1
+
+    run(main())
+
+
+def test_job_finishes_even_if_cancelled_before_first_await():
+    """任务在**第一个 await 点之前**被取消，job 也必须从表里摘掉。
+
+    这是真 bug，不是假想：实测（`tools/turn_job_verify/lifecycle_probes.py` 的 P1/P3）
+    协程体一行都没执行就 cancel 的话 `finally` 不会跑，于是 job 永远留在 `_JOBS`，
+    `live_job_count()` 不降，续看端拿到一个永不产出帧的 job 并挂死
+    （该脚本 P3 修复前：订阅者 drain 超时、永久挂住）。
+
+    修法是 `start_job` 里加 done_callback 兜底 —— 它在未启动即取消时仍会触发。
+    """
+    async def main():
+        job = turn_job.TurnJob("u1", "s1", "gz")
+        sub = job.attach()
+        assert sub is not None
+
+        async def runner(j: turn_job.TurnJob) -> None:
+            await asyncio.sleep(3600)
+
+        turn_job.start_job(job, runner)
+        job.task.cancel()                 # 不给事件循环机会跑协程体
+        with pytest.raises(asyncio.CancelledError):
+            await job.task
+
+        assert job.finished is True, "未启动即取消也必须 finish"
+        assert turn_job._key("u1", "s1", "gz") not in turn_job._JOBS
+        assert turn_job.live_job_count() == 0
+        # 订阅者必须能干净退出，不能永久挂住
+        frames = await asyncio.wait_for(
+            _drain_all(sub), timeout=2.0)
+        assert frames == []
+
+    run(main())
+
+
+async def _drain_all(sub) -> list[str]:
+    return [f async for f in sub.drain()]
+
+
+def test_live_job_picks_newest_generation():
+    """同一会话有两个未 finish 的 job 时，必须挑**代际最新**的。
+
+    窗口真实存在（`tools/turn_job_verify/lifecycle_probes.py` 的 P5 复现）：
+    `_event_stream` 的 finally 先 `await release_generation()` 释放 DB 租约，
+    而 `job.finish()` 要等 `_wrapped` 的 finally 才执行。中间那段 await 里新请求
+    已经能抢到租约建新 job。
+
+    若按「第一个扫到的」返回，`_JOBS` 是 dict 且旧键先插入 → 稳定返回正要收尾的
+    旧 job → 刷新页面接到一个不再产出帧的流，表现为「一直转圈、内容不动」。
+    """
+    async def main():
+        async def long_runner(j: turn_job.TurnJob) -> None:
+            await asyncio.sleep(3600)
+
+        old = turn_job.TurnJob("u1", "s1", "g-old")
+        turn_job.start_job(old, long_runner)
+        new = turn_job.TurnJob("u1", "s1", "g-new")
+        turn_job.start_job(new, long_runner)
+
+        picked = turn_job.get_live_job_for_session("u1", "s1")
+        assert picked is not None
+        assert picked.generation_id == "g-new", \
+            f"应取最新一代，实际取到 {picked.generation_id}"
+
+        await turn_job.shutdown_all("test")
+
+    run(main())
+
+
+def test_live_job_skips_finished():
+    """已结束的 job 不能被选中，即使它是唯一一个。"""
+    async def main():
+        job = turn_job.TurnJob("u1", "s1", "g1")
+        turn_job._JOBS[turn_job._key("u1", "s1", "g1")] = job
+        job.finished = True
+        assert turn_job.get_live_job_for_session("u1", "s1") is None
+        turn_job._JOBS.clear()
+
+    run(main())
