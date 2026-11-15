@@ -227,6 +227,8 @@ export interface ContextUsage {
   compact_percent: number
   remaining_to_compact: number
   compacted: boolean
+  /** 赛后软线压缩是否仍在后台跑。为 true 时 used_tokens 是压缩前的值。 */
+  compaction_pending?: boolean
 }
 
 export interface SessionDetail {

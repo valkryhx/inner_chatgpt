@@ -79,6 +79,9 @@ class ContextUsageOut(BaseModel):
     compact_percent: float = 0.0
     remaining_to_compact: int = 0
     compacted: bool = False
+    # 赛后软线压缩是否还在跑。为 true 时 `used_tokens` 是压缩前的值，
+    # 前端应稍后重刷一次而不是把它当成最终读数（见 deferred_compact.is_pending）。
+    compaction_pending: bool = False
 
 
 class CreateSessionIn(BaseModel):

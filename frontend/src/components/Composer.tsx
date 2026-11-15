@@ -146,9 +146,14 @@ export default function Composer({
   }
 
   const canSend = !streaming && !uploading && (!!text.trim() || pending.length > 0)
+  // 显示层夹到 100%：软线压缩按设计推迟到本轮结束后跑（HLZ_SOFT_COMPACT_DEFER），
+  // 所以「一轮结束 → 后台压缩完成」之间 used 会真的超过 context_window。
+  // 那个数字对用户是纯噪音（超了就是超了，110% 不携带额外信息），后端的
+  // `percent` 保留真值供诊断，前端只夹显示。
   const ctxPct = contextUsage && contextUsage.context_window > 0
-    ? ((contextUsage.used_tokens / contextUsage.context_window) * 100).toFixed(1)
+    ? Math.min(100, (contextUsage.used_tokens / contextUsage.context_window) * 100).toFixed(1)
     : ''
+  const ctxPending = !!contextUsage?.compaction_pending
 
   return (
     <div className="composer-wrap">
@@ -246,6 +251,7 @@ export default function Composer({
             <>
               {' · '}
               {fmtK(contextUsage!.used_tokens)} / {fmtK(contextUsage!.context_window)} · {ctxPct}%
+              {ctxPending && <span className="foot-compacting" title="正在后台压缩较早的对话">（整理中…）</span>}
             </>
           )}
         </span>

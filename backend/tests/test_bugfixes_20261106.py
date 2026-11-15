@@ -253,3 +253,41 @@ def _async(value):
     async def _coro():
         return value
     return _coro()
+
+
+def test_manual_compact_too_few_reports_tokens_not_just_count(monkeypatch):
+    """「消息太少」必须带 token 数。
+
+    `keep` 是**条数**阈值，与 token 无关。只说「6 条」时，用户看到 4664 tokens
+    也在里面会觉得「这么多字应该能压」——2026-11-15 挑剔用户视角验收时
+    这条被记为「反直觉」。把 token 一并说出来，判据才有个解释。
+
+    判据：消息数 ≤ keep 时 `compacted=False`，且 message 里同时出现条数与 token。
+    """
+    import app.compaction as compaction
+
+    n = 4
+    ur = FakeUR(_history(n=n), "摘" * 20)
+    monkeypatch.setattr(compaction, "get_hub", lambda: type(
+        "Hub", (), {"get_user_runtime": staticmethod(lambda *a, **k: _async(ur))}
+    )())
+
+    async def fake_get_session(session_id, user_id):
+        return {"id": session_id, "model_id": "m"}
+
+    monkeypatch.setattr(compaction.db, "get_session", fake_get_session)
+
+    async def noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(compaction, "_record_visible_summary", noop)
+
+    stats = run(compaction.manual_compact("u1", "s1", keep=6))
+    assert stats["compacted"] is False
+    msg = stats["message"]
+    assert "消息太少" in msg
+    assert f"{n} 条" in msg, "必须保留条数"
+    assert "tokens" in msg, "必须同时给出 token 数，否则「这么多字为什么不能压」无解"
+    # token 数必须是真实估算值，不能写死
+    from app.tokens import message_token_counter
+    assert str(message_token_counter(_history(n=n))) in msg

@@ -282,3 +282,70 @@ def test_hard_limit_preempts_deferred_compaction():
     assert pos_preempt >= 0, "找不到抢占调用"
     assert pos_hard >= 0
     assert pos_preempt < pos_hard, "抢占必须在硬线裁剪之前"
+
+# --------------------------------------------------------------------------
+# is_pending：给 /context 判断「页脚读数是不是压缩前的旧值」
+#
+# 背景（2026-11-15 真机）：赛后压缩发生在 done 之后，而前端只在 done 后 180ms
+# 刷一次 /context，于是页脚会长时间停在压缩前的偏高数字上——实测截图里的
+# `440.8k / 400.0k · 110.2%` 就是这么来的。前端要据此有界轮询，
+# 就必须能从 /context 知道「后台还在压」。
+# --------------------------------------------------------------------------
+
+def test_is_pending_true_while_compaction_inflight(monkeypatch):
+    from app.deferred_compact import is_pending
+
+    gate = asyncio.Event()
+
+    async def _slow(u, s):
+        await gate.wait()
+        return None
+
+    _install_fake_soft(monkeypatch, _slow)
+
+    async def scenario():
+        schedule_soft_compact("u", "s")
+        await asyncio.sleep(0.02)          # 让 task 真的跑起来
+        flying = is_pending("u", "s")
+        gate.set()
+        await deferred_compact.drain_all(2.0)
+        return flying, is_pending("u", "s")
+
+    flying, after = asyncio.run(scenario())
+    assert flying is True, "压缩在飞时必须报 True"
+    assert after is False, "压缩完成后必须报 False，否则前端会一直轮询"
+
+
+def test_is_pending_false_for_other_session(monkeypatch):
+    """必须按 (user, session) 精确匹配，不能串会话。"""
+    from app.deferred_compact import is_pending
+
+    gate = asyncio.Event()
+
+    async def _slow(u, s):
+        await gate.wait()
+        return None
+
+    _install_fake_soft(monkeypatch, _slow)
+
+    async def scenario():
+        schedule_soft_compact("u", "s1")
+        await asyncio.sleep(0.02)
+        other_sid = is_pending("u", "s2")
+        other_uid = is_pending("u2", "s1")
+        gate.set()
+        await deferred_compact.drain_all(2.0)
+        return other_sid, other_uid
+
+    other_sid, other_uid = asyncio.run(scenario())
+    assert other_sid is False
+    assert other_uid is False
+
+
+def test_is_pending_false_when_defer_disabled(monkeypatch):
+    """开关关闭时赛后压缩不存在，必须恒 False（否则前端会白轮询）。"""
+    from app.deferred_compact import is_pending
+
+    monkeypatch.setenv("HLZ_SOFT_COMPACT_DEFER", "0")
+    assert schedule_soft_compact("u", "s") is None
+    assert is_pending("u", "s") is False

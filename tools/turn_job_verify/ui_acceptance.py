@@ -385,11 +385,26 @@ def main(argv: list[str]) -> int:
                         f"实际页脚 {foot[:80]!r}")
             else:
                 h.check("F-2 页脚用量与后端 /context 一致", False, "全程没捕获到 /context 响应")
-            # 超窗检查：真出现 percent>100 就是 UX 问题，必须暴露
+            # 超窗检查：**不能断言「必须 <100%」**。
+            #
+            # 2026-11-15 更正：软线压缩按设计推迟到本轮结束之后
+            # （`HLZ_SOFT_COMPACT_DEFER` 默认开，P4 为不推迟首个 token），
+            # 所以「一轮结束 → 后台压缩完成」之间 `/context` 读到压缩前的
+            # 真实值，完全可能 >100%。把它判成缺陷是**判据错误**。
+            # 实测证据见 docs/20261115-上下文用量超100%的成因与自动压缩时机核实.md
+            # （30k 窗口复现 121.42%，功能不受影响）。
+            #
+            # 这里改判「这些数字必须能被解释」：要么 <100%，要么该会话历史
+            # 确实超了窗口——两者都不代表前端出错。真正该抓的是
+            # 「页脚数字与 /context 不一致」（F-2 已覆盖）。
             over = [c for c in ctx_log if (c["body"].get("percent") or 0) > 100]
-            h.check("F-2b 没有出现超过窗口 100% 的用量显示", not over,
-                    f"{len(over)} 次超窗" + (f"，最大 {max(c['body']['percent'] for c in over)}%"
-                                             if over else ""))
+            explained = all(
+                (c["body"].get("used_tokens") or 0) > (c["body"].get("context_window") or 0)
+                for c in over)
+            h.check("F-2b 超 100% 的用量都有真实超窗解释（不是前端算错）",
+                    explained,
+                    f"{len(over)} 次超窗，全部 used>window" if over and explained
+                    else (f"{len(over)} 次超窗，其中有不自洽的读数" if over else "0 次超窗"))
             shot("06-context-usage")
 
             # ================= K 压缩 =================

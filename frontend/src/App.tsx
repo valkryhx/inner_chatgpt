@@ -132,6 +132,10 @@ export default function App() {
   // 单调递增，避免以 Date.now() 做 nonce 时同毫秒两次点击被去重掉。
   const focusNonceRef = useRef(0)
   const [activeId, setActiveId] = useState<string | null>(null)
+  // 给异步回调读「此刻的会话」用：`setActiveId` 有 9 个调用点，逐个手改 ref
+  // 迟早漏一个；用 effect 同步是唯一收口。
+  const activeIdRef = useRef<string | null>(null)
+  useEffect(() => { activeIdRef.current = activeId }, [activeId])
   const [messages, setMessages] = useState<Message[]>([])
   const [streaming, setStreaming] = useState(false)
   const [sendPulse, setSendPulse] = useState(0)
@@ -247,6 +251,35 @@ export default function App() {
       setContextUsage(await api.getContextUsage(id))
     } catch {
       setContextUsage(null)
+    }
+  }, [])
+
+  // 赛后软线压缩发生在 done 之后（HLZ_SOFT_COMPACT_DEFER），摘要要调一次 LLM，
+  // 实测 10~30s 才完成。只在 done 后刷一次的话，页脚会一直停在压缩前那个偏高的
+  // 数字上——2026-11-15 实测到的 `440.8k / 400.0k · 110.2%` 就是这么留在界面上的。
+  //
+  // 所以后台还有压缩在跑时**有界轮询**：最多 10 次、间隔 6s（覆盖到 60s 的
+  // deferred 超时），一旦后端说 `compaction_pending: false` 就停。
+  // 切到别的会话后立即放弃，别去改当前页脚。
+  //
+  // 同一会话只允许一个轮询在飞（连发多条时不要把定时器叠起来）：
+  // 用单调递增的 token 认领，旧的一轮发现 token 换了就自行退出。
+  const ctxPollTokenRef = useRef(0)
+  const refreshContextUntilSettled = useCallback(async (id: string) => {
+    const token = ++ctxPollTokenRef.current
+    for (let i = 0; i < 10; i++) {
+      if (token !== ctxPollTokenRef.current) return   // 有更新的一轮接手了
+      let usage: ContextUsage
+      try {
+        usage = await api.getContextUsage(id)
+      } catch {
+        return
+      }
+      if (token !== ctxPollTokenRef.current) return
+      if (activeIdRef.current !== id) return
+      setContextUsage(usage)
+      if (!usage.compaction_pending) return
+      await new Promise((r) => setTimeout(r, 6000))
     }
   }, [])
 
@@ -872,6 +905,10 @@ export default function App() {
       if (sid) {
         setTimeout(() => loadTeam(sid), 180)
         setTimeout(() => loadContextUsage(sid), 180)
+        // 赛后压缩还在跑时，页脚此刻读到的是压缩前的值。跑到结算为止
+        // （有界轮询，见 refreshContextUntilSettled），别让用户一直看着
+        // 一个 110% 之类的数字。
+        setTimeout(() => { void refreshContextUntilSettled(sid) }, 2000)
       }
     }
   }

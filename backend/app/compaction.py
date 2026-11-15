@@ -172,11 +172,15 @@ async def _manual_compact_locked(user_id, session_id, keep=6, instructions=""):
     ur = await hub.get_user_runtime(user_id, model_id)
     history = await ur.store.get(user_id, session_id)
     total = len(history)
+    total_tokens = message_token_counter(history)
     if total <= keep:
+        # `keep` 是**条数**阈值，与 token 无关 —— 但只说「6 条」会让用户觉得
+        # 「这么多字应该能压」。把 token 一并说出来，反直觉才有个解释。
         return {"compacted": False, "trigger": "manual", "dropped_messages": 0,
                 "kept_messages": total, "summary_tokens": 0, "before_messages": total,
                 "after_messages": total,
-                "message": "消息太少（" + str(total) + " 条，≤ 保留阈值 " + str(keep) + "），无需压缩"}
+                "message": "消息太少（" + str(total) + " 条 / " + str(total_tokens)
+                           + " tokens，≤ 保留阈值 " + str(keep) + " 条），无需压缩"}
 
     keep_from = _safe_keep_from(history, max(0, total - keep))
     old = history[:keep_from]
@@ -185,7 +189,8 @@ async def _manual_compact_locked(user_id, session_id, keep=6, instructions=""):
         return {"compacted": False, "trigger": "manual", "dropped_messages": 0,
                 "kept_messages": total, "summary_tokens": 0, "before_messages": total,
                 "after_messages": total,
-                "message": "消息太少（" + str(total) + " 条），无需压缩"}
+                "message": "消息太少（" + str(total) + " 条 / " + str(total_tokens)
+                           + " tokens），无需压缩"}
     extra = ("补充要求：" + instructions.strip() + chr(10)) if (instructions and instructions.strip()) else ""
     dialog = _dialog_text(old)
     summary = await _summarize(ur, SUMMARY_PROMPT.format(extra=extra, messages=dialog))

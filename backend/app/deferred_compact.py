@@ -146,3 +146,17 @@ async def drain_all(timeout_s: float = 5.0) -> int:
 
 def pending_count() -> int:
     return sum(1 for t in _pending.values() if not t.done())
+
+
+def is_pending(user_id: str, session_id: str) -> bool:
+    """该会话是否还有在飞的赛后压缩。
+
+    给 `/api/sessions/{id}/context` 用：赛后压缩发生在 `done` 之后，
+    用户端的页脚在那一刻读到的是**压缩前**的用量。前端据此决定要不要
+    稍后再刷一次，否则页脚会一直停在偏高的旧值上（2026-11-15 实测的
+    `440.8k / 400.0k · 110.2%` 就是这么留在截图里的）。
+
+    纯内存读、不建 runtime、不碰 DB —— `/context` 必须保持无副作用。
+    """
+    task = _pending.get((str(user_id), str(session_id)))
+    return task is not None and not task.done()

@@ -1422,6 +1422,8 @@ textarea, input { caret-color: var(--clay); }
   font-size: 13px; color: var(--muted);
 }
 .composer-foot .foot-note { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 赛后压缩进行中：告诉用户那个数字还会变，不是最终值 */
+.composer-foot .foot-compacting { color: var(--muted); font-style: italic; }
 .composer-foot .model-picker { flex: 0 0 auto; }
 .composer-foot .model-picker select { font-size: 13px; height: 24px; border-radius: 6px; }
 

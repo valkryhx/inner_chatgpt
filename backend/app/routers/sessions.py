@@ -136,6 +136,13 @@ async def get_context_usage(session_id: str, user: dict = Depends(get_current_us
     ctx = max(1, ctx)
     auto = max(1, auto)
     compaction = sess.get("compaction") or {}
+    # 赛后软线压缩可能还在跑：此时 used 是压缩前的值，前端应稍后重刷。
+    # 只读内存里的 pending 表，不建 runtime、不碰 DB（本端点必须无副作用）。
+    try:
+        from ..deferred_compact import is_pending
+        pending = is_pending(user["id"], session_id)
+    except Exception:  # noqa: BLE001 - 拿不到就按「没在压」处理
+        pending = False
     return ContextUsageOut(
         used_tokens=used,
         context_window=ctx,
@@ -145,6 +152,7 @@ async def get_context_usage(session_id: str, user: dict = Depends(get_current_us
         compact_percent=round(used / auto * 100, 2),
         remaining_to_compact=max(0, auto - used),
         compacted=bool(compaction.get("compacted")),
+        compaction_pending=pending,
     )
 
 
