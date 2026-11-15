@@ -75,3 +75,8 @@ _site/
 # 本地 skills 留存：技能包可能含业务数据或体积较大，不随仓库分发（2026-11-11 决定）。
 # 注意这只影响「今后」不再跟踪新文件；此前已提交的内容仍留在历史里。
 skill_assets/
+
+# 探针运行时动态生成的临时启动脚本（probe_multiworker 每次新建后即删，
+# 崩溃时可能残留；它不是源码，不该入库）。
+backend/_probe_mw_boot.py
+work/probe_verify/

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -30,9 +31,11 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 import httpx  # noqa: E402
 
-BASE = "http://127.0.0.1:8000"
+# 端口可被环境变量覆盖：探针常在隔离后端（非 8000）上跑。
+BASE = os.environ.get("HLZ_PROBE_BASE") or "http://127.0.0.1:8000"
 RID = f"{int(time.time())}-{uuid.uuid4().hex[:4]}"
-DB = ROOT / "backend" / "data" / "app.db"
+# 库路径可被环境变量覆盖：探针要能在隔离库上跑，否则默认指向生产库。
+DB = Path(os.environ.get("HLZ_PROBE_DB") or (ROOT / "backend" / "data" / "app.db"))
 
 
 def msg_count(sid: str) -> int:

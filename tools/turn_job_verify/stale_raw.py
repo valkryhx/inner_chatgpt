@@ -41,6 +41,7 @@ R-2 与 R-3 都指向缺陷，区别只在写入者身份。
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import threading
@@ -56,7 +57,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from live_selftest import Client, stream_post  # noqa: E402
 
 RUN_ID = f"{int(time.time())}-{uuid.uuid4().hex[:4]}-raw"
-DB = ROOT / "backend" / "data" / "app.db"
+DB = Path(os.environ.get("HLZ_PROBE_DB") or (ROOT / "backend" / "data" / "app.db"))
 
 PROMPT = (
     "请调用 code_run 工具执行下面这段 Python，然后把输出原样告诉我，不要做别的事：\n"

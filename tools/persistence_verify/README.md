@@ -18,17 +18,21 @@
 
 ## 脚本清单
 
-### 断线（最容易搞错的一组，按证据强度递进）
+### 断线
 
-| 文件 | 验什么 | 判据的演进 |
-|---|---|---|
-| `probe_disconnect.py` | 断开 SSE 后生成还在不在跑 | 第一版：看响应文本里有没有 "generation" —— **判据是坏的**，正常回复也可能出现该词 |
-| `probe_disconnect2.py` | 精确版：停没停 | 缩短窗口，仍靠文本 |
-| `probe_disconnect3.py` | 「跑完了」还是「跑到一半被掐」 | 比对落库字数与句子完整性 |
-| `probe_disconnect4.py` | 断开后能不能立刻重发 | **看 HTTP 状态码**（200 / 409），不猜文本 ← 结论以这版为准 |
+| 文件 | 验什么 |
+|---|---|
+| `probe_disconnect.py` | 断开后能不能立刻重发（看 HTTP 状态码，不猜文本） |
 
-> 保留四版是有意的：它记录了「怎么从坏判据走到好判据」。
-> 要复跑只需 `probe_disconnect4.py`。
+验三件事：
+
+- Q1 断开后立刻重发 → 200 还是 409？
+- Q2 若 409，等多久能恢复？
+- Q3 那条被掐断的 assistant 消息最终是什么状态？
+
+> **判据演进（为什么不再看文本）**：早期版本用「响应文本里有没有 `generation`
+> 这个词」判断是否被租约挡住 —— 那个判据是坏的，正常回复里也可能出现该词，
+> 而 409 的 body 里更是必然出现，等于恒真。现在只看**状态码**。
 
 ### 续看（阶段 1 / 阶段 2）
 
@@ -62,7 +66,48 @@ python probe_crash_resume.py before    # 提交并等待被掐
 python probe_crash_resume.py after     # 续上一轮，看模型怎么处理
 ```
 
+## ⚠️ 先读这条：默认会写生产库
+
+**这些探针会建用户、发消息、打团队记录。** 默认 `HLZ_PROBE_BASE=http://127.0.0.1:8000`
+指向正式服务，而 8000 用的是生产库 `backend/data/app.db`。
+
+2026-11-15 我就是在 8000 上直接跑了 `heartbeat_prod.py` 与 `stale_raw.py`，
+往生产库写入了 3 个测试用户 + 33 行关联数据（已按 `user_id` 精确清理，
+25 张表重新 `ALL MATCH`）。
+
+**规矩**：跑之前先问自己「这个探针会不会写」。会写 → 必须指向隔离后端：
+
+```bash
+python work/_probe_boot.py                    # 隔离库后端，监听 8123
+HLZ_PROBE_BASE=http://127.0.0.1:8123 HLZ_PROBE_DB=work/probe_verify/app.db python tools/persistence_verify/probe_xxx.py
+```
+
+只有明确要验「生产配置是否生效」（如 `heartbeat_prod.py` 验 `.env` 的 15s 心跳）
+才该连 8000，且跑完要核对库并清理。
+
+## 环境变量（2026-11-15 新增，为了不在生产库上跑）
+
+
+这些探针会**写会话**（建用户、发消息）。默认指向生产库 `backend/data/app.db`，
+所以默认值只适合「就是要验生产」的场合。常规验证请指到隔离库：
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `HLZ_PROBE_BASE` | 后端地址 | `http://127.0.0.1:8000` |
+| `HLZ_PROBE_DB` | 读/查哪个 sqlite 库 | `backend/data/app.db` |
+
+做法是起一个隔离库后端，再带上这两个变量：
+
+```bash
+# 1) 起隔离后端（复制生产库做副本，端口不同）
+python work/_probe_boot.py            # 监听 8123，库在 work/probe_verify/app.db
+
+# 2) 指过去跑
+HLZ_PROBE_BASE=http://127.0.0.1:8123 HLZ_PROBE_DB=work/probe_verify/app.db python tools/persistence_verify/probe_disconnect.py
+```
+
 ## 已知限制
+
 
 - `probe_disconnect*.py` 硬编码 `BASE = "http://127.0.0.1:8000"`；换端口要改脚本顶部。
 - `probe_persistence.py` 会调用 `subprocess` 起停后端，**跑之前确认没有别的东西占 8000**。

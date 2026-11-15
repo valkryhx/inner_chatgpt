@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 import sys
 import time
@@ -35,7 +36,8 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 import httpx  # noqa: E402
 
-BASE = "http://127.0.0.1:8000"
+# 端口可被环境变量覆盖：探针常在隔离后端（非 8000）上跑。
+BASE = os.environ.get("HLZ_PROBE_BASE") or "http://127.0.0.1:8000"
 STATE = ROOT / "work" / "crash_state.json"
 RID = f"{int(time.time())}-{uuid.uuid4().hex[:4]}"
 
@@ -105,7 +107,7 @@ async def after() -> int:
     checks: list[dict] = []
 
     # ---- 1) 崩溃标记是否建立 ----
-    con = sqlite3.connect(str(ROOT / "backend" / "data" / "app.db"))
+    con = sqlite3.connect(str(Path(os.environ.get("HLZ_PROBE_DB") or (ROOT / "backend" / "data" / "app.db"))))
     con.row_factory = sqlite3.Row
     row = con.execute("select * from turn_crash_markers where session_id=?",
                       (sid,)).fetchone()

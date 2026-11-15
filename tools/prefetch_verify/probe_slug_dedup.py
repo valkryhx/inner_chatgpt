@@ -1,8 +1,14 @@
-import asyncio, os, sys
-sys.stdout.reconfigure(encoding="utf-8")
-os.environ["HLZ_MEMORY_SELECTOR"]="1"
-os.environ["HLZ_MEMORY_SELECTOR_MODEL"]="moma/deepseek-latest-flash"
-sys.path.insert(0,".")
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+# tools/prefetch_verify/ 下：parents[2] 是仓库根
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "backend"))
+os.environ["HLZ_MEMORY_SELECTOR"] = "1"
+os.environ["HLZ_MEMORY_SELECTOR_MODEL"] = "moma/deepseek-latest-flash"
 
 async def main():
     from app.memory_inject import install_memory_injector

@@ -1,19 +1,20 @@
-"""核实：客户端断开 SSE 后，生成还在不在跑？（只读产品代码）
+"""断开后能不能立刻重发？（看 HTTP 状态码，不猜文本）
 
-这个问题决定「先做 SSE 续传 还是 先做自动续跑」。如果刷新页面会把生成
-当场掐死，那两者都不是第一优先级 —— 先得让它别死。
+早期探针用「响应文本里有没有 generation 这个词」判断被租约拦住 ——
+那个判据是坏的：正常回复里也可能出现该词，而 409 的 body 里必然出现。
+所以这一版直接看**状态码**。
 
-判据：断开后隔 25 秒再查 DB 里 assistant 消息的 **content 长度**。
-  - 长度还在涨 → 生成继续，只是看不到（那续传就是纯 UI 问题）
-  - 长度不变 + status=stopped → 生成被掐死（那是数据/体验的实质损失）
+要验的：
+  Q1 断开后立刻重发 → 200 还是 409？
+  Q2 若 409，等多久能恢复？
+  Q3 那条被掐断的 assistant 消息最终是什么状态？
 
-顺便验第二件事：刷新后重新发消息会不会被 generation 租约拦住。
-
-跑法：cd backend && python ../tools/persistence_verify/probe_disconnect.py
+跑法：python tools/persistence_verify/probe_disconnect.py
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 import sys
 import time
@@ -26,92 +27,106 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 import httpx  # noqa: E402
 
-BASE = "http://127.0.0.1:8000"
+# 端口可被环境变量覆盖：探针常在隔离后端（非 8000）上跑。
+BASE = os.environ.get("HLZ_PROBE_BASE") or "http://127.0.0.1:8000"
 RID = f"{int(time.time())}-{uuid.uuid4().hex[:4]}"
-DB = ROOT / "backend" / "data" / "app.db"
+# 库路径随 BASE 一起由环境变量给出：探针要能在隔离库上跑，
+# 否则默认指向生产库会让每次验证都往真实数据里写会话。
+DB = Path(os.environ.get("HLZ_PROBE_DB") or (ROOT / "backend" / "data" / "app.db"))
 
 
-def snapshot(sid: str) -> list[tuple]:
+def rows(sid: str) -> list[tuple[str, str, int]]:
     con = sqlite3.connect(str(DB))
     con.row_factory = sqlite3.Row
-    rows = con.execute(
+    rs = con.execute(
         "SELECT role, status, length(content) n FROM messages "
         "WHERE session_id=? ORDER BY rowid", (sid,)).fetchall()
     con.close()
-    return [(r["role"], r["status"], r["n"]) for r in rows]
+    return [(r["role"], r["status"], r["n"]) for r in rs]
+
+
+async def try_send(c, sid, h, text) -> tuple[int, str]:
+    """发一条消息，只取状态码（读完前 1 个事件就关）。"""
+    try:
+        async with c.stream("POST", f"/api/sessions/{sid}/messages",
+                            json={"text": text},
+                            headers={**h, "Accept": "text/event-stream"},
+                            timeout=120) as r:
+            if r.status_code != 200:
+                body = (await r.aread()).decode("utf-8", "replace")
+                return r.status_code, body[:200]
+            got = 0
+            async for line in r.aiter_lines():
+                if line.strip():
+                    got += 1
+                    if got >= 2:
+                        break
+            return 200, ""
+    except Exception as exc:  # noqa: BLE001
+        return -1, f"{type(exc).__name__}: {str(exc)[:120]}"
 
 
 async def main() -> int:
     from tests.e2e.harness import ensure_user, ensure_zhanlu
 
     async with httpx.AsyncClient(base_url=BASE, timeout=None) as c:
-        tok = await ensure_user(c, f"dc_{RID}".replace("-", "_"))
+        tok = await ensure_user(c, f"d4_{RID}".replace("-", "_"))
         await ensure_zhanlu(c, tok)
         h = {"Authorization": f"Bearer {tok}"}
-        sid = (await c.post("/api/sessions", json={"title": f"DC-{RID}"},
+        sid = (await c.post("/api/sessions", json={"title": f"D4-{RID}"},
                             headers=h)).json()["id"]
         print(f"session = {sid}")
 
-        prompt = ("用 code_run 执行：分 6 次 sleep，每次 6 秒，每次打印一行进度 "
-                  "(STEP1..STEP6)，最后总结。必须真的分 6 次，不要一次睡完。")
+        # 先起一轮长生成，收到正文就断开
+        cur, got = "", 0
+        async with c.stream("POST", f"/api/sessions/{sid}/messages",
+                            json={"text": "写一篇 6000 字长文，讲状态机与事件总线的测试难度，"
+                                         "分 20 小节。不要用工具。"},
+                            headers={**h, "Accept": "text/event-stream"},
+                            timeout=600) as r:
+            async for line in r.aiter_lines():
+                if not line.strip():
+                    continue
+                if line.startswith("event:"):
+                    cur = line[6:].strip()
+                elif line.startswith("data:") and cur == "text_delta":
+                    got += len(line[5:])
+                    if got >= 150:
+                        break
+        print(f"断开（已收 {got} 字）")
 
-        # ---- 1) 发消息，只读几行就断开 ----
-        print("发出消息，读 3 行后主动断开……")
-        got_lines = 0
-        try:
-            async with c.stream("POST", f"/api/sessions/{sid}/messages",
-                                json={"text": prompt},
-                                headers={**h, "Accept": "text/event-stream"},
-                                timeout=200) as r:
-                async for line in r.aiter_lines():
-                    if line.strip():
-                        got_lines += 1
-                        if got_lines >= 3:
-                            break
-        except Exception as exc:  # noqa: BLE001
-            print("  (断开时异常，正常)：", type(exc).__name__)
-        print(f"  断开，已读 {got_lines} 行")
+        # Q1：立刻重发
+        code, body = await try_send(c, sid, h, "只回答 OK")
+        print(f"\nQ1 断开后立刻重发 → HTTP {code}  {body[:120]}")
+        if code == 409:
+            for i in range(1, 7):
+                await asyncio.sleep(1)
+                code, body = await try_send(c, sid, h, "只回答 OK")
+                print(f"    +{i}s 重试 → HTTP {code} {body[:80]}")
+                if code == 200:
+                    print(f"   → 约 {i}s 后租约自愈")
+                    break
 
-        s0 = snapshot(sid)
-        print(f"  断开瞬间 DB：{s0}")
-
-        # ---- 2) 等 25 秒，看内容还涨不涨 ----
-        for t in (8, 16, 25):
-            await asyncio.sleep(t - (0 if t == 8 else (8 if t == 16 else 16)))
-            s = snapshot(sid)
-            print(f"  t={t:2d}s  DB：{s}")
-
-        # ---- 3) 断开后重新发一句，看会不会被租约拦住 ----
-        print("\n断开后重新发一条短消息，看能否正常开始……")
-        try:
-            async with c.stream("POST", f"/api/sessions/{sid}/messages",
-                                json={"text": "只回答 OK"},
-                                headers={**h, "Accept": "text/event-stream"},
-                                timeout=120) as r:
-                txt = ""
-                async for line in r.aiter_lines():
-                    if line.startswith("data:"):
-                        txt += line[5:]
-                print(f"  第二条返回了 {len(txt)} 字符")
-                blocked = "generation_active" in txt or "generation" in txt.lower()
-                print(f"  被租约拦住 = {blocked}")
-        except Exception as exc:  # noqa: BLE001
-            print("  第二条失败：", type(exc).__name__, str(exc)[:100])
-            blocked = True
-
-        final = snapshot(sid)
-        print(f"\n最终 DB：{final}")
-        asst = [x for x in final if x[0] == "assistant"]
-        grew = bool(asst) and asst[0][2] > (s0[0][2] if s0 and s0[0][0] == "assistant" else 0)
+        # Q3：**等生成真正结束**再看。只 sleep 2s 查库会读到 status=streaming，
+        # 那只是「这一刻还在写」，不是「卡住了」——2026-11-15 实测：
+        # 2 秒时 status=streaming / len=2146，最终 status=complete / len=7535。
+        # 判据错会让人误判成「断线导致消息永远卡在 streaming」。
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            asst_now = [x for x in rows(sid) if x[0] == "assistant"]
+            if asst_now and asst_now[0][1] != "streaming":
+                break
+            await asyncio.sleep(3)
         print()
-        print("=" * 62)
-        print(f"断开后 assistant 内容是否继续增长：{grew}")
-        print(f"断开后能否立即重发：{'否' if blocked else '是'}")
-        print("=" * 62)
-        print("判读：")
-        print("  增长=True  → 生成仍在后台跑，SSE 续传是纯 UI 问题")
-        print("  增长=False → **刷新会掐死生成**，这是实质损失，应优先修")
-
+        print(f"Q3 消息表：{rows(sid)}")
+        asst = [x for x in rows(sid) if x[0] == "assistant"]
+        if asst:
+            _role, status, n = asst[0]
+            print(f"   被掐断的那条：status={status} len={n}")
+            if status == "streaming":
+                print("   ⚠ 等了 300s 仍是 streaming —— 这才是真卡住的信号")
+            else:
+                print(f"   ✓ 断开不影响生成：最终 status={status}（内容继续写完了）")
     return 0
 
 
