@@ -364,7 +364,7 @@ task_get  task_list  task_update  send_message  list_messages
 
 ---
 
-## 7bis. 中途插话（steering）
+## 7.1. 中途插话（steering）
 
 **生成过程中可以继续输入。** 按发送不会另起一轮，而是把这句话插进正在执行的那个回合，
 模型在下一次模型调用前读到它。
@@ -428,7 +428,7 @@ POST /api/sessions/{sid}/messages
 
 ---
 
-## 7ter. 韧性（API 中断自愈）
+## 7.2. 韧性（API 中断自愈）
 
 上游模型服务不稳定时（502 / 504 / 429 / 连接中断 / 流被截断），平台自动恢复，
 而不是让整轮对话死掉。
