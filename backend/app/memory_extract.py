@@ -306,7 +306,7 @@ def make_turn_end_hook(ur):
 
     async def _hook(history: list[dict]) -> None:
         if _inflight.get(user_id):
-            logger.debug("[memory] 该用户上一次提取还没结束，本轮跳过")
+            logger.info("[memory] 该用户上一次提取还没结束，本轮跳过")
             return
         # 快照：只要 role/content/tool_calls 这类字段，深拷贝一层
         snapshot = [dict(m) for m in history if isinstance(m, dict)]
@@ -325,12 +325,19 @@ _background: set[asyncio.Task] = set()
 
 
 async def _run_detached(user_id: str, client, history: list[dict]) -> None:
-    """后台提取的实际执行体。任何异常都只记日志，绝不外抛。"""
+    """后台提取的实际执行体。任何异常都只记日志，绝不外抛。
+
+    日志级别约定：**闸门拒绝一律 INFO**。曾经用 DEBUG，结果是默认 INFO 级别下
+    「没有 [memory] 日志」无法区分「没触发」与「触发了但被闸门挡了」两种状态 ——
+    排障时只能改代码加 print。闸门拒绝每轮最多一条，量级可以忽略。
+    """
     try:
         if ms.memory_hard_disabled() or not ms.auto_write_enabled():
+            logger.debug("[memory] 自动提取已关闭（HLZ_MEMORY_DISABLED / "
+                         "HLZ_MEMORY_AUTO_WRITE），不提取")
             return
         if client is None:
-            logger.debug("[memory] 没有可用 client，跳过提取")
+            logger.info("[memory] 没有可用 client，跳过提取")
             return
         turn_count = _turn_counter(user_id).tick()
         decision = mw.evaluate_gates(
@@ -339,14 +346,22 @@ async def _run_detached(user_id: str, client, history: list[dict]) -> None:
             permission_ok=True,
         )
         if not decision.allowed:
-            logger.debug("[memory] 闸门未通过：%s", decision.reason)
+            logger.info("[memory] 第 %d 轮提取未触发（gate=%s）：%s",
+                        turn_count, decision.gate or "-", decision.reason)
             return
         conversation = mw.conversation_from(history)
         if not conversation.strip():
+            logger.info("[memory] 第 %d 轮闸门通过，但窗口内没有可读对话", turn_count)
             return
+        logger.info("[memory] 第 %d 轮闸门通过，开始后台提取", turn_count)
         out = await run_extraction(client, user_id, conversation)
         if out.written:
             logger.info("[memory] 后台提取写入 %d 条：%s", len(out.written), out.written)
+        else:
+            logger.info(
+                "[memory] 后台提取结束，未写入任何条目（耗时 %.1fs，轮数 %d，%s）",
+                out.elapsed_s, out.turns,
+                f"错误：{out.error}" if out.error else "模型判断无值得记的")
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001 - 后台提取失败绝不能影响任何东西

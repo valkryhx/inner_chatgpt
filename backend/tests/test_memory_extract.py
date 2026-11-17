@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import pytest
 
@@ -333,3 +334,63 @@ def test_hook_without_user_id_is_noop(store):
         await mx.drain_background(timeout_s=1.0)
 
     run(scenario())
+
+
+# ---------------- 闸门拒绝必须可见（INFO，不是 DEBUG） ----------------
+def test_gate_rejection_is_logged_at_info(store, monkeypatch, caplog):
+    """闸门拒绝必须落 INFO。
+
+    为什么锁死这条：默认日志级别是 INFO。曾经这里用 DEBUG，导致
+    「日志里没有 [memory]」既可能是「没触发」也可能是「触发了但被闸门挡了」，
+    排障时无法区分 —— 本用例就是那个场景的回归锁。
+    """
+    monkeypatch.setenv("HLZ_MEMORY_AUTO_WRITE", "1")
+    monkeypatch.setenv("HLZ_MEMORY_EVERY_N_TURNS", "3")
+    caplog.set_level(logging.INFO, logger="app.memory_extract")
+
+    async def scenario():
+        hook = mx.make_turn_end_hook(FakeUR("u1", FakeClient([])))
+        await hook(_history())          # 第 1 轮 -> 闸 3 挡
+        await mx.drain_background(timeout_s=5.0)
+
+    run(scenario())
+    infos = [r for r in caplog.records if r.levelno == logging.INFO]
+    msgs = [r.getMessage() for r in infos]
+    assert any("未触发" in m for m in msgs), f"闸门拒绝没有 INFO 日志：{msgs}"
+    assert any("frequency" in m for m in msgs), f"日志里没有 gate 名：{msgs}"
+
+
+def test_gate_pass_is_logged_at_info(store, monkeypatch, caplog):
+    """闸门通过也要留一条，否则「通过但没写」同样不可见。"""
+    monkeypatch.setenv("HLZ_MEMORY_AUTO_WRITE", "1")
+    monkeypatch.setenv("HLZ_MEMORY_EVERY_N_TURNS", "1")
+    caplog.set_level(logging.INFO, logger="app.memory_extract")
+
+    async def scenario():
+        hook = mx.make_turn_end_hook(FakeUR("u1", FakeClient([])))
+        await hook(_history())
+        await mx.drain_background(timeout_s=5.0)
+
+    run(scenario())
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("闸门通过" in m for m in msgs), f"闸门通过没有 INFO 日志：{msgs}"
+    assert any("未写入任何条目" in m for m in msgs), \
+        f"「通过但没写」必须能看见：{msgs}"
+
+
+def test_auto_write_off_stays_debug(store, monkeypatch, caplog):
+    """总开关关闭时**不**落 INFO —— 那是用户主动选的常态，不是异常。
+
+    每轮都刷一条「已关闭」会把日志淹掉，真正的问题反而看不见。
+    """
+    monkeypatch.setenv("HLZ_MEMORY_AUTO_WRITE", "0")
+    caplog.set_level(logging.DEBUG, logger="app.memory_extract")
+
+    async def scenario():
+        hook = mx.make_turn_end_hook(FakeUR("u1", FakeClient([])))
+        await hook(_history())
+        await mx.drain_background(timeout_s=5.0)
+
+    run(scenario())
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert not any("[memory]" in m for m in infos), f"关闭态不该刷 INFO：{infos}"

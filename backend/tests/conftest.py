@@ -135,3 +135,26 @@ def _no_real_network_for_llm():
             os.environ.pop(k, None)
         else:
             os.environ[k] = v
+
+
+# 记忆开关的**测试基线**。app/__init__.py 启动时会 load_dotenv(.env) 把开发者本地
+# 配置灌进 os.environ —— 于是「默认值」类断言（如 test_status_endpoint 断言
+# auto_write 默认 False）会随开发者本地 .env 而变化：2026-11-17 本地开发者为排障
+# 把 HLZ_MEMORY_AUTO_WRITE 改成 1，全量测试就开始红，而代码没有任何问题。
+# 这里在会话开始时删除所有 HLZ_MEMORY_* 变量，让「未设置」成为真正的默认状态；
+# 用例仍可用 monkeypatch.setenv 逐个覆盖（那是 function 作用域，优先级更高）。
+_MEMORY_ENV_PREFIX = "HLZ_MEMORY_"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_memory_env():
+    """让记忆相关环境变量回到「未设置」，杜绝本地 .env 污染测试。"""
+    saved = {k: v for k, v in os.environ.items() if k.startswith(_MEMORY_ENV_PREFIX)}
+    for k in saved:
+        os.environ.pop(k, None)
+    yield
+    # 还原：即使测试进程还要跑别的，也不该改掉调用方的环境
+    for k in list(os.environ):
+        if k.startswith(_MEMORY_ENV_PREFIX):
+            os.environ.pop(k, None)
+    os.environ.update(saved)
