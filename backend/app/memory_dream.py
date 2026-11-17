@@ -676,8 +676,14 @@ async def dream_once(user_id: str, client, *, force: bool = False,
 
     ``force=True`` 跳过时间闸与会话数闸（设置页「立即整理」用），
     但仍然尊重锁与开关 —— 否则用户连点两次会并发两个 dream。
+
+    日志约定（与 ``memory_extract`` 一致）：**判定拒绝与执行结果一律 INFO**。
+    dream 会改文件、删条目，是记忆系统里唯一有破坏性的路径；它做过什么
+    必须能从 app.log 直接读出来，而不是靠比对文件 mtime 反推。
     """
     if not dream_enabled():
+        # 关闭是用户主动选的常态，与提取侧同理：留给 DEBUG，不刷 INFO
+        logger.debug("[dream] 已关闭（HLZ_MEMORY_DREAM_ENABLED=0 或 HLZ_MEMORY_DISABLED=1）")
         return DreamOutcome(
             ran=False,
             reason="dream 已关闭（HLZ_MEMORY_DREAM_ENABLED=0 或 HLZ_MEMORY_DISABLED=1）")
@@ -686,6 +692,7 @@ async def dream_once(user_id: str, client, *, force: bool = False,
     state = await get_state(user_id)
     if state.get("last_status") == STATUS_RUNNING and \
             int(state.get("lock_at") or 0) > now - LOCK_STALE_MS:
+        logger.info("[dream] 用户 %s 未触发：已有 dream 在跑", user_id)
         return DreamOutcome(ran=False, reason="已有 dream 在跑", user_id=user_id)
 
     since = int(state.get("last_consolidated") or 0)
@@ -695,16 +702,17 @@ async def dream_once(user_id: str, client, *, force: bool = False,
         # 几个会话就该整理一次。会话数闸仍是硬门槛，所以不会「一有记忆就跑」。
         # 别把它「修」成 `if not since: return`，那会让新用户永远等不到首次整理。
         if now - since < min_hours() * 3600 * 1000:
-            return DreamOutcome(
-                ran=False, user_id=user_id,
-                reason=f"距上次成功合并不足 {min_hours():.0f} 小时")
+            reason = f"距上次成功合并不足 {min_hours():.0f} 小时"
+            logger.info("[dream] 用户 %s 未触发：%s", user_id, reason)
+            return DreamOutcome(ran=False, user_id=user_id, reason=reason)
         touched = await sessions_touched_since(user_id, since)
         if len(touched) < min_sessions():
-            return DreamOutcome(
-                ran=False, user_id=user_id,
-                reason=f"期间被触碰的会话数不足（{len(touched)} < {min_sessions()}）")
+            reason = f"期间被触碰的会话数不足（{len(touched)} < {min_sessions()}）"
+            logger.info("[dream] 用户 %s 未触发：%s", user_id, reason)
+            return DreamOutcome(ran=False, user_id=user_id, reason=reason)
 
     if not await acquire_lock(user_id, now_ms=now):
+        logger.info("[dream] 用户 %s 未触发：没抢到 dream 锁（别的任务在跑）", user_id)
         return DreamOutcome(ran=False, reason="没抢到 dream 锁（别的任务在跑）",
                             user_id=user_id)
 
@@ -720,6 +728,12 @@ async def dream_once(user_id: str, client, *, force: bool = False,
                              last_error=out.error,
                              # 改过文件就必须重建索引，哪怕本轮报错
                              index_pending=1 if (out.written or out.deleted) else 0)
+            # 失败前已经落盘的改动同样要说清：这是判断「半途状态」的唯一依据，
+            # 否则用户只看到「失败」，不知道文件是不是已经被改了一半。
+            logger.warning(
+                "[dream] 用户 %s 合并失败（%s）：本轮已写入 %s，已删除 %s，"
+                "索引待下一轮补建",
+                user_id, out.error, out.written or "无", out.deleted or "无")
             return out
 
         # Phase 3 成功：**先推 last_consolidated，再重建索引**（方案 §4.6 ③）。
@@ -730,6 +744,17 @@ async def dream_once(user_id: str, client, *, force: bool = False,
         out.index_rebuilt = await run_phase4(user_id)
         if out.index_rebuilt:
             await _set_state(user_id, index_pending=0)
+        # 成功路径必须自己说清「改了什么」。放在最后（索引状态已定），
+        # 这样一条日志就是这次 dream 的完整结论：写哪些、删哪些、索引成不成。
+        if out.written or out.deleted:
+            logger.info(
+                "[dream] 用户 %s 合并完成：写入 %s，删除 %s，索引重建 %s（%.1fs）",
+                user_id, out.written or "无", out.deleted or "无",
+                "成功" if out.index_rebuilt else "失败", out.elapsed_s)
+        else:
+            logger.info(
+                "[dream] 用户 %s 合并完成：未修改任何条目，索引重建 %s（%.1fs）",
+                user_id, "成功" if out.index_rebuilt else "失败", out.elapsed_s)
         return out
     except asyncio.CancelledError:
         # 被取消（服务关闭 / 手动停止）：状态停在 running 会让下一次误判，

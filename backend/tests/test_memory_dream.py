@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 
 import pytest
@@ -657,3 +658,72 @@ def test_case_listed_tests_are_documented():
     """看一眼这份测试覆盖了方案里的哪几条（给人读的锚点）。"""
     ids = ("M-17", "M-18", "M-19", "M-21", "M-22", "M-23")
     assert set(ids) == {"M-17", "M-18", "M-19", "M-21", "M-22", "M-23"}
+
+
+# ---------------- 可观测性：成功路径必须落 INFO ----------------
+def test_dream_success_logs_written_and_deleted(env, monkeypatch, caplog):
+    """dream 改过文件就必须在 INFO 留下「写了什么、删了什么」。
+
+    为什么锁这条：2026-11-17 真机上提取器写入 `user-name-ciri` 成功（有 INFO），
+    但几秒后库里就没有了 —— 是 dream 合并把它并进了 `user-name` 并删除。
+    当时 dream **成功路径一条日志都没有**，只能靠比对文件 mtime 与
+    `memory_dream_state.last_attempt` 才能推断发生了什么。
+    `DreamOutcome` 本来就带着 written / deleted，落一条日志成本极低。
+    """
+    monkeypatch.setenv("HLZ_MEMORY_DREAM_MIN_SESSIONS", "1")
+    _mem("user-name", "用户叫 Ciri")
+    _mem("user-name-ciri", "用户叫 Ciri（重复条目）")
+
+    script = [
+        # 读两条，拿到 version（删除前置条件）
+        [_call("memory_list", {}, "c1")],
+        # 合并进保留者
+        [_call("memory_write", {"slug": "user-name", "content": "用户叫 Ciri",
+                                "description": "用户叫 Ciri"}, "c2")],
+        # 再读一次（删除要求「读后未变」）
+        [_call("memory_read", {"slug": "user-name-ciri"}, "c3")],
+        # 删掉重复条目
+        [_call("memory_delete", {"slug": "user-name-ciri"}, "c4")],
+    ]
+    caplog.set_level(logging.INFO, logger="app.memory_dream")
+    out = run(md.dream_once("u1", FakeClient(script), force=True))
+
+    assert out.ran is True
+    assert "user-name-ciri" in out.deleted, "前提没成立，测试本身失效"
+
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("user-name-ciri" in m and "[dream]" in m for m in msgs), \
+        f"删除没有落日志，事后无法追溯：{msgs}"
+
+
+def test_dream_noop_is_logged_at_info(env, monkeypatch, caplog):
+    """跑完但什么都没改也要留一条 —— 否则「没变化」与「没跑」不可区分。"""
+    monkeypatch.setenv("HLZ_MEMORY_DREAM_MIN_SESSIONS", "1")
+    _mem("a", "第一条")
+    caplog.set_level(logging.INFO, logger="app.memory_dream")
+    out = run(md.dream_once("u1", FakeClient([[]]), force=True))
+    assert out.ran is True and not out.written and not out.deleted
+
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("[dream]" in m and "未修改" in m for m in msgs), \
+        f"空跑没有 INFO 日志：{msgs}"
+
+
+def test_dream_gate_rejection_is_logged_at_info(env, monkeypatch, caplog):
+    """时间闸挡住的理由必须可见（默认 INFO）。
+
+    与提取侧同理：用户问「为什么没整理」，日志要能直接回答。
+    """
+    monkeypatch.setenv("HLZ_MEMORY_DREAM_MIN_HOURS", "24")
+    monkeypatch.setenv("HLZ_MEMORY_DREAM_MIN_SESSIONS", "1")
+    _mem("a", "第一条")
+    now = md._now_ms()
+    run(md._set_state("u1", last_status=md.STATUS_IDLE, last_consolidated=now))
+
+    caplog.set_level(logging.INFO, logger="app.memory_dream")
+    out = run(md.dream_once("u1", FakeClient([[]]), now_ms=now + 60_000))
+    assert out.ran is False and "不足" in out.reason
+
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("[dream]" in m and "不足" in m for m in msgs), \
+        f"时间闸拒绝没有 INFO 日志：{msgs}"
