@@ -106,7 +106,13 @@ def new_id(prefix: str) -> str:
 
 
 async def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # PG 后端不需要目录（`DB_PATH` 只是测试隔离用的标识符，不是真文件）。
+    # 这里包一层 try 而不是判断后端 —— 判断后端就得 import dbselect，
+    # 而这个模块要保持「不关心后端」的定位。
+    try:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    except (AttributeError, OSError):
+        pass
     async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.executescript(_SCHEMA)

@@ -158,19 +158,32 @@ def _simple_insert_columns(sql: str) -> Optional[list[str]]:
     只处理「显式列清单」这一种形态 —— 项目里所有 INSERT 都是这种。
     解析不出就返回 None，调用方退回 `DO NOTHING`（宁可少覆盖也不报错）。
     """
-    m = re.search(r"INSERT\s+(?:OR\s+\w+\s+)?INTO\s+[\w.]+\s*\(([^)]*)\)",
+    m = re.search(r"INSERT\s+(?:OR\s+\w+\s+)?INTO\s+[\w.\"]+\s*\(([^)]*)\)",
                   sql, re.IGNORECASE)
     if not m:
         return None
-    return [c.strip().strip('"`[]') for c in m.group(1).split(",") if c.strip()]
+    cols = [c.strip().strip('"`[]') for c in m.group(1).split(",") if c.strip()]
+    # 只接受「纯列名清单」。若抓到的是 VALUES(...) 里的表达式（含数字/引号/
+    # 运算符），说明列清单没写，直接放弃 —— 否则会拼出不存在的列名。
+    if not cols or not all(re.fullmatch(r"[A-Za-z_]\w*", c) for c in cols):
+        return None
+    return cols
 
 
 def _strip_insert_or(sql: str) -> tuple[Optional[str], str]:
-    """拆掉 `INSERT OR XXX` 前缀，返回 (xxx, 剩余 SQL)。"""
+    """拆掉 `INSERT OR XXX` 前缀，返回 (xxx, `INSERT INTO t(...) ...` 剩余部分)。
+
+    ⚠️ 返回的 `rest` 必须**包含** `INSERT INTO t` —— 只去掉 `OR XXX` 两个词。
+    早期版本把 `INSERT OR XXX` 整段都吃掉，调用方拼回 `INSERT ` 时表名就没了，
+    PG 报 `syntax error at or near "("`。
+    """
     m = _INSERT_OR.match(sql)
     if not m:
         return None, sql
-    return m.group(1).upper(), sql[m.end():].lstrip()
+    kind = m.group(1).upper()
+    table = m.group(2)
+    rest = sql[m.end():].lstrip()
+    return kind, f"INSERT INTO {table} {rest}"
 
 
 # ---------------------------------------------------------------- 连接对象
@@ -437,6 +450,6 @@ def connect(path) -> Connection:
 
     if dbselect.is_postgres():
         from .pgdriver import PgConnection
-        return PgConnection()
+        return PgConnection(path)
     from .sqlitedriver import SqliteConnection
     return SqliteConnection(path)

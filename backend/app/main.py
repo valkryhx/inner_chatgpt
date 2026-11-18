@@ -29,6 +29,14 @@ async def lifespan(app: FastAPI):
     logging.getLogger(__name__).info(
         "logging ready: level=%s team_log=%s",
         _LOG_CONFIG["level"], _LOG_CONFIG["team_log"] or "(disabled)")
+    # PG 后端先预热连接池：冷建连 ~200ms，首个请求不该承担它
+    # （记忆预取有 50ms 级的时序要求，见 pgdriver.warm_pool）。
+    try:
+        from . import dbselect, pgdriver
+        if dbselect.is_postgres():
+            await pgdriver.warm_pool()
+    except Exception:  # noqa: BLE001 - 预热失败不该阻止启动
+        pass
     await db.init_db()
     from .a2a import store as a2a_store
     await a2a_store.init_tables()

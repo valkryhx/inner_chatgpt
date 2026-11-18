@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import asyncio
 
-import aiosqlite
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from app import sqlcompat
 from app import db
 from app.auth import get_current_user
 
@@ -38,7 +38,7 @@ def isolated_db(tmp_path, monkeypatch):
     run(store.init_tables())
 
     async def seed_user(uid):
-        async with aiosqlite.connect(path) as conn:
+        async with sqlcompat.connect(path) as conn:
             await conn.execute(
                 "INSERT OR IGNORE INTO users(id,email,username,password_hash,name,role,status,token_ver,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",

@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-import aiosqlite
+from app import sqlcompat
 import pytest
 
 from app import db
@@ -157,8 +157,8 @@ def test_marker_survives_restart(isolated_db):
     run(turn_marker.mark_crashed("s3", last_tool="file_write", steps=5))
 
     async def read_fresh():
-        async with aiosqlite.connect(isolated_db) as conn:
-            conn.row_factory = aiosqlite.Row
+        async with sqlcompat.connect(isolated_db) as conn:
+            conn.row_factory = sqlcompat.Row
             cur = await conn.execute(
                 "SELECT * FROM turn_crash_markers WHERE session_id='s3'")
             return await cur.fetchone()

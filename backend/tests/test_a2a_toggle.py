@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import asyncio
 
-import aiosqlite
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app import sqlcompat
 from app import db
 from app.auth import get_current_user
 
@@ -29,7 +29,7 @@ def isolated_db(tmp_path, monkeypatch):
     run(store.init_tables())
 
     async def seed_user(uid):
-        async with aiosqlite.connect(path) as conn:
+        async with sqlcompat.connect(path) as conn:
             await conn.execute(
                 "INSERT OR IGNORE INTO users(id,email,username,password_hash,name,role,status,token_ver,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
@@ -143,7 +143,7 @@ def test_migration_defaults_existing_agents_to_disabled(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "DB_PATH", path)
 
     async def seed_old():
-        async with aiosqlite.connect(path) as conn:
+        async with sqlcompat.connect(path) as conn:
             await conn.execute(
                 "CREATE TABLE a2a_agents (id TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE,"
                 " agent_id TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL)"

@@ -164,9 +164,9 @@ def test_m17_sessions_gate_counts_only_since_last_consolidation(env, monkeypatch
 
 
 async def _backdate_sessions(session_ids: list[str], ts_ms: int) -> None:
-    import aiosqlite
+    from app import sqlcompat
 
-    async with aiosqlite.connect(db.DB_PATH) as conn:
+    async with sqlcompat.connect(db.DB_PATH) as conn:
         for sid in session_ids:
             await conn.execute("UPDATE sessions SET updated_at=? WHERE id=?", (ts_ms, sid))
         await conn.commit()

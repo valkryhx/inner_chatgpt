@@ -177,6 +177,10 @@ def test_sqlite_awaitable_execute_matches_aiosqlite(dbpath):
     assert a == b == {"id": "a"}
 
 
+@pytest.mark.skipif(
+    __import__("app.dbselect", fromlist=["x"]).is_postgres(),
+    reason="该用例用 sqlite3 直读文件验证回滚，PG 后端无文件可读",
+)
 def test_sqlite_uncommitted_rolls_back_on_exit(dbpath):
     """`async with` 退出时不 commit 就回滚 —— 与 aiosqlite 一致。"""
     async def go():
@@ -222,6 +226,10 @@ def test_sqlite_integrity_error_catchable_via_sqlcompat(dbpath):
     assert run(go()) is True
 
 
+@pytest.mark.skipif(
+    __import__("app.dbselect", fromlist=["x"]).is_postgres(),
+    reason="await connect() 只在 SQLite 后端支持，PG 的池化连接不实现 __await__",
+)
 def test_sqlite_connect_await_form(dbpath):
     """`conn = await connect(path)` 这种写法也要成立。"""
     async def go():

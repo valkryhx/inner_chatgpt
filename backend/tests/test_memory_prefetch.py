@@ -535,6 +535,14 @@ def test_loop_consumes_only_after_tool_steps(store, monkeypatch):
     loop.prefetch_factory = factory
 
     async def scenario():
+        # PG 后端下先预热连接池：冷建连 ~200ms，而本测试的模型调用只
+        # sleep 50ms，不预热的话选择器来不及 settle，测的就不是「预取
+        # 让位首帧」而是「建连慢」。（SQLite 建连 0.17ms，所以这个前提
+        # 在 SQLite 时代天然成立；PG 下必须显式做。）
+        from app import dbselect
+        if dbselect.is_postgres():
+            from app import pgdriver
+            await pgdriver.warm_pool()
         history = [{"role": "user", "content": "问一个具体问题"}]
         evs = [e async for e in loop.run_stream(history)]
         return history, evs

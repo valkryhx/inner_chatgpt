@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-import aiosqlite
+from app import sqlcompat
 import pytest
 
 from app import db
@@ -47,7 +47,7 @@ def isolated_db(tmp_path, monkeypatch):
     run(store.init_tables())
 
     async def seed():
-        async with aiosqlite.connect(path) as conn:
+        async with sqlcompat.connect(path) as conn:
             await conn.execute(
                 "INSERT OR IGNORE INTO users(id,email,username,password_hash,name,role,status,token_ver,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
@@ -98,8 +98,8 @@ def test_snapshot_survives_process_kill(isolated_db):
                               last_tool="file_write", partial_chars=1024))
     # 不做任何 close/flush，换一个连接读
     async def read_fresh():
-        async with aiosqlite.connect(isolated_db) as conn:
-            conn.row_factory = aiosqlite.Row
+        async with sqlcompat.connect(isolated_db) as conn:
+            conn.row_factory = sqlcompat.Row
             cur = await conn.execute(
                 "SELECT snapshot FROM a2a_tasks WHERE task_id='task_x'")
             return (await cur.fetchone())["snapshot"]
@@ -179,7 +179,7 @@ def test_snapshot_column_migrates_on_old_db(isolated_db, tmp_path):
 
     # 手工造一个「老结构」的表
     async def make_old():
-        async with aiosqlite.connect(isolated_db) as conn:
+        async with sqlcompat.connect(isolated_db) as conn:
             await conn.executescript("""
                 DROP TABLE IF EXISTS a2a_tasks;
                 CREATE TABLE a2a_tasks (

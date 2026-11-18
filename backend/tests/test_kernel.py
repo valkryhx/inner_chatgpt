@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from app.agent_loop import AgentLoop, _safe_json
 from app.sse import detect_artifacts
 from app.tokens import estimate_tokens, is_summary_message, message_text
@@ -226,6 +228,11 @@ def test_safe_keep_from_skips_tool_boundary():
     assert _safe_keep_from(msgs, 4) == 4
 
 
+@pytest.mark.skipif(
+    __import__("app.dbselect", fromlist=["x"]).is_postgres(),
+    reason="该用例用 sqlite3 直接构造旧版 SQLite schema 验证迁移；"
+           "PG 后端不存在这种历史库，迁移路径不适用",
+)
 def test_history_store_legacy_migration_backfills_owner(tmp_path, monkeypatch):
     import asyncio
     import sqlite3
