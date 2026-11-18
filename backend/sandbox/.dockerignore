@@ -1,0 +1,5 @@
+# 构建上下文只需要 Dockerfile。
+# 这个目录里其余是 Python 源码（config/runtime/pool/...），与镜像无关，
+# 传进去只会拖慢构建。
+*
+!Dockerfile

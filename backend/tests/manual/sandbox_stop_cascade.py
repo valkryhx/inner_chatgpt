@@ -34,8 +34,7 @@ async def token_for(uid: str) -> str:
 def container_pids(name: str) -> str:
     """容器内长跑 python 进程数。
 
-    ⚠️ 不能用 ``ps``：``python:3.12-slim`` 没有 procps（实测 which 空）。
-    用 /proc 遍历，只有 argv 以 /ws/ 开头的才算业务进程。
+    用 /proc 遍历（与 runtime 同源），只有 argv 以 /ws/ 开头的才算业务进程。
     """
     import subprocess
     script = (

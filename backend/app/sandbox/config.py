@@ -1,18 +1,28 @@
 """沙箱配置：环境变量 + 默认值。
 
 全部环境变量都以 ``HLZ_SANDBOX_`` 开头，与项目既有 ``HLZ_`` 前缀一致。
-默认值取自实测（设计文档 §4.1）：镜像 ``python:3.12-slim``、exec 约 250ms、
-空闲内存 1.19 MiB。
+默认值取自实测（设计文档 §4.1、§11 镜像实测表）。
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 
-# 已定镜像（设计文档 §4.1 实测：177MB，Python 3.12.16，3 个包）
-# 用 tag 而非 digest：本机镜像站对固定 digest 的拉取不稳定，
-# 且 MVP 只在本机跑。换机器前请按设计文档 §9.1-R8 固定 digest。
-DEFAULT_IMAGE = "python:3.12-slim"
+# 默认镜像：本项目自建（backend/sandbox/Dockerfile），基线 python:3.12-slim
+# 加上常用系统命令与 10 个 pip 包。
+#
+# 为什么不用 python:3.12-slim 直接跑：容器 network_mode="none"，
+# **运行时 pip install 必然失败**，所以模型能用的命令/包必须预装。
+# slim 缺 ps/curl/git/unzip/jq 等基础命令，模型一写就失败。
+#
+# 实测对比（2026-11-18 本机）：
+#   python:3.12-slim       177 MB   创建 263ms   exec 73~94ms   pandas 无
+#   hlz-sandbox:2026-11-18 733 MB   创建 624ms   exec 72~81ms   pandas 680ms
+#   → exec 延迟不变，代价在体积/创建耗时。
+#
+# 用 tag 而非 digest：MVP 只在本机跑，本地构建的镜像没有稳定 digest
+# 可跨机器引用。换机器前请按设计文档 §9.1-R8 固定 digest。
+DEFAULT_IMAGE = "hlz-sandbox:2026-11-18"
 
 # MVP 白名单：hx / xh（设计文档 §9.3 Q2）
 DEFAULT_MVP_USERS = "u_c56b8337dd09,u_343a46896bff"

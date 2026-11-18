@@ -51,7 +51,9 @@ def test_default_image_and_users(monkeypatch):
     monkeypatch.delenv("HLZ_SANDBOX_IMAGE", raising=False)
     monkeypatch.delenv("HLZ_SANDBOX_MVP_USERS", raising=False)
     cfg = sbx_config.get_config(reload=True)
-    assert cfg.image == "python:3.12-slim"
+    # 断言等于常量而不是硬编码镜像名：换镜像（如换成本项目的 hlz-sandbox）
+    # 不该让这条「未设置时取默认值」的测试变红。
+    assert cfg.image == sbx_config.DEFAULT_IMAGE
     assert cfg.mvp_users == ("u_c56b8337dd09", "u_343a46896bff")
 
 

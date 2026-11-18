@@ -290,10 +290,13 @@ class ContainerRuntime:
     def _pkill_marker_sync(self, container_id: str, marker: str) -> None:
         """按 marker 精确杀进程，避免误杀同容器里其它会话的进程。
 
-        与 ``exec_shell_sync_killall`` 同理：镜像里没有 pkill，
+        与 ``exec_shell_sync_killall`` 同理：不依赖 pkill（见那个方法的说明），
         改用遍历 ``/proc`` 匹配环境变量。读 ``/proc/<pid>/environ`` 找
         ``HLZ_EXEC_MARKER=<marker>`` —— ``_exec`` 通过 ``environment=``
         把它注入了每个执行进程。
+
+        这是 ``_exec`` 超时分支调的：超时后必须让那个进程真的死掉，
+        否则调用方已经放弃等待、进程还在烧 CPU，比不超时更糟。
         """
         needle = f"HLZ_EXEC_MARKER={marker}".encode()
         script = (
@@ -338,16 +341,24 @@ class ContainerRuntime:
     def exec_shell_sync_killall(self, container_id: str) -> int:
         """杀掉容器内所有 python 子进程（/stop 级联用）。返回杀掉的进程数。
 
-        ⚠️ **不能用 pkill / ps**：``python:3.12-slim`` 是 Debian slim，
-        没有 procps 包，``pkill`` / ``ps`` / ``pgrep`` 全都不存在（2026-11-18
-        实测：``which pkill ps pgrep`` 全空）。第一版用 ``pkill -f``，
-        结果**永远返回 0** —— `/stop` 看起来成功，容器内进程照样跑完，
-        是彻底失效的假信号（§8.5「没报错 ≠ 有效信号」的又一实例）。
+        ⚠️ **不用 pkill / ps，走 /proc**。两层原因：
 
-        改为**纯 Python 遍历 `/proc`**，只依赖解释器本身：
-        - 读 ``/proc/<pid>/cmdline``；
-        - 命中「python 且命令行含 ``/ws/``」或含 ``HLZ_EXEC_MARKER`` 就 SIGKILL；
-        - 跳过自己（那个 ``python -c`` 进程）。
+        1. **最初的事故**：第一版用 ``pkill -f``，而当时的基础镜像
+           ``python:3.12-slim`` 是 Debian slim、**没有 procps 包**
+           （``pkill`` / ``ps`` / ``pgrep`` 全不存在，``which`` 全空）。
+           ``pkill -f`` 静默失败、返回 0 —— `/stop` 看起来成功，
+           容器内进程照样跑完，是彻底失效的假信号（§8.5「没报错 ≠ 有效信号」）。
+
+        2. **即使现在有了 procps 也不改回去**（默认镜像已装 procps）：
+           - 依赖外部命令 = 依赖镜像内容。换镜像、裁剪镜像就静默失效，
+             而且失效时**没有报错**，只会表现为「停止不生效」；
+           - ``pkill -f`` 是子串匹配，容易误杀；
+           - ``/proc`` 是内核提供的，任何 Linux 镜像上都有，零依赖。
+
+        实现：遍历 ``/proc/<pid>/cmdline``，任一 argv **以 ``/ws/`` 开头**
+        就 SIGKILL。为什么按前缀而不是子串：``python -c <内联源码>`` 的
+        argv 里可能含 ``/ws/`` 字样（第一版因此把查询脚本自己也算成业务进程，
+        计数从 7 降到 1 而非 0）。跳过自己那个 ``python -c`` 进程。
 
         粗粒度：同用户多会话共享一个容器，这里会把该用户其它会话的执行也杀掉。
         ``20261111`` 方案 §2.3 已承认「同用户共享容器」是已知取舍。

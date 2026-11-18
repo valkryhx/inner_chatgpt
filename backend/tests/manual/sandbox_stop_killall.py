@@ -42,8 +42,9 @@ async def main() -> int:
     def count_long() -> int:
         """数容器内的长跑进程。
 
-        ⚠️ 不能用 ``ps``：``python:3.12-slim`` 没有 procps（实测 `which ps` 空）。
-        改用 /proc 遍历，与 runtime 的实现同源。
+        用 /proc 遍历，与 runtime 的实现同源 —— 这样测的就是生产路径本身。
+        （历史上基础镜像是 python:3.12-slim，没有 procps，用不了 ps；
+        现在默认镜像已装 procps，但 /proc 才是 runtime 的实际做法。）
         """
         script = (
             "import os\n"

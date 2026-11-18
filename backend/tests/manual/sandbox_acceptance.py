@@ -31,7 +31,7 @@ BACKEND = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BACKEND))
 
 os.environ.setdefault("HLZ_SANDBOX_MODE", "strict")
-os.environ.setdefault("HLZ_SANDBOX_IMAGE", "python:3.12-slim")
+os.environ.setdefault("HLZ_SANDBOX_IMAGE", "hlz-sandbox:2026-11-18")
 
 RESULTS: list[tuple[str, bool, str]] = []
 
