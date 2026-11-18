@@ -498,3 +498,96 @@ async def test_read_timeout_reaches_the_http_client():
         assert c._get_client().timeout.read == 300
     finally:
         await c.aclose()
+
+
+# ---------------- 补齐 RETRYABLE_STATUS 的逐个验证 ----------------
+#
+# 背景（2026-11-18）：用户问「LLM 调用有重试吗，不会一遇 429 就断吧」。
+# 查代码确认有完整机制（4 次重试 + 指数退避 + Retry-After + 池扩容），
+# 但测试只覆盖了 503/429/500，其余 5 个可重试码没有单独验证。
+# 这里逐个补齐 —— 集合里的每个码都必须真的触发重试，否则等于写错了白名单。
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [408, 409, 425, 502, 504, 529])
+async def test_each_retryable_status_retries_once(status, _no_sleep):
+    """RETRYABLE_STATUS 里的每个码都必须触发重试。
+
+    为什么逐个测而不是抽一个代表：这些码来自不同的失败语义
+    （408 超时 / 409 冲突 / 425 too early / 502 坏网关 / 504 网关超时 /
+    529 上游过载）。只测 503 无法证明集合里其它项真的接上了判断逻辑 ——
+    曾经出现过「常量写全了，但分支只判断了其中一个」的缺陷。
+    """
+    calls = {"n": 0}
+
+    def handler(req):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(status, text=f"err {status}")
+        return httpx.Response(200, content=_sse("好了"))
+
+    async with _mk(handler) as c:
+        res = await c.run([{"role": "user", "content": "hi"}])
+
+    assert calls["n"] == 2, f"{status} 应重试一次，实际调用 {calls['n']} 次"
+    assert res.content == "好了"
+
+
+@pytest.mark.asyncio
+async def test_429_retries_within_budget_then_succeeds(_no_sleep):
+    """连续 429 但没超过预算时要一直重试，最后成功。
+
+    这是多智能体最常见的真实形态：一次派多个 teammate，
+    上游对同一 key 限流。只要还在预算内，就不该放弃。
+    """
+    calls = {"n": 0}
+
+    def handler(req):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            return httpx.Response(429, text="rate limited",
+                                  headers={"retry-after": "1"})
+        return httpx.Response(200, content=_sse("终于好了"))
+
+    async with _mk(handler) as c:
+        res = await c.run([{"role": "user", "content": "hi"}])
+
+    assert calls["n"] == 4, f"应重试 3 次后成功，实际 {calls['n']} 次"
+    assert res.content == "终于好了"
+
+
+@pytest.mark.asyncio
+async def test_connection_drop_mid_stream_is_retried(_no_sleep):
+    """流还没吐任何内容就断开 -> 应重试（与「吐了一半」区分处理）。
+
+    「吐了一半」走的是降级非流式（已有 test），
+    「一点没吐」应该直接重试，否则会白丢一次请求。
+    """
+    calls = {"n": 0}
+
+    def handler(req):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ReadError("connection reset")
+        return httpx.Response(200, content=_sse("恢复"))
+
+    async with _mk(handler) as c:
+        res = await c.run([{"role": "user", "content": "hi"}])
+
+    assert calls["n"] >= 2, "连接中断应重试"
+    assert res.content == "恢复"
+
+
+def test_retryable_and_never_retry_sets_do_not_overlap():
+    """两个集合不能有交集 —— 重叠会让判断顺序决定行为，是隐蔽 bug。"""
+    from app.llm_client import NEVER_RETRY_STATUS, RETRYABLE_STATUS
+    overlap = RETRYABLE_STATUS & NEVER_RETRY_STATUS
+    assert not overlap, f"两个集合重叠：{overlap}"
+
+
+def test_429_is_retryable_and_401_is_not():
+    """最常被搞混的一对：429 要重试，401 绝不能重试。"""
+    from app.llm_client import NEVER_RETRY_STATUS, RETRYABLE_STATUS
+    assert 429 in RETRYABLE_STATUS, "429 限流必须重试"
+    assert 401 in NEVER_RETRY_STATUS, "401 鉴权失败重试没用"
+    assert 401 not in RETRYABLE_STATUS
