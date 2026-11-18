@@ -291,84 +291,85 @@ def test_off_mode_emits_no_sandbox_log(ws_root, monkeypatch, caplog):
     assert not [r for r in caplog.records if "code_run" in r.getMessage()]
 
 
-def test_sandbox_write_result_marks_container(ws_root, monkeypatch):
-    """沙箱内写文件的返回文案必须能看出「这是在容器里执行的」。
+# ---------------- 路径不泄露宿主系统信息 ----------------
 
-    为什么：文案里的路径是**宿主**路径（D:\sandbox\<uid>\...），
-    用户看到 `D:\` 会以为是在 Windows 宿主机上直接写的，从而怀疑沙箱没生效
-    （2026-11-18 用户自测时实际发生）。路径要保留（模型需要知道文件在哪），
-    但必须补一个容器标识。
+
+def _fake_pool():
+    class FakeRuntime:
+        def exec_python(self, cid, code, *, timeout_s, cwd="/ws", host_workspace=""):
+            async def _go():
+                return sbx_runtime.ExecResult(0, "", "mk")
+            return _go()
+
+    class FakePool:
+        runtime = FakeRuntime()
+
+        async def acquire(self, uid, host_ws):
+            return sbx_pool.ContainerEntry(
+                user_id=uid, container_id="abc123456789", created_at=0, last_used=0,
+                in_flight=1, host_workspace=host_ws)
+
+        async def release(self, entry):
+            return None
+
+    return FakePool()
+
+
+def test_write_result_does_not_leak_host_path(ws_root, monkeypatch):
+    """结果文案不能出现宿主绝对路径（D:\ / C:\ / /home/ / /Users/）。
+
+    为什么：宿主路径会在前端暴露「跑在 Windows 上」「目录结构长什么样」，
+    这是使用者不需要、也不该感知的实现细节。用 workspace 相对路径就够
+    —— 模型只需要知道「相对 workspace 根在哪」，用户也只需要这个。
     """
     monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
     monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
     sbx_config.get_config(reload=True)
     monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
 
-    class FakeRuntime:
-        def exec_python(self, cid, code, *, timeout_s, cwd="/ws", host_workspace=""):
-            async def _go():
-                return sbx_runtime.ExecResult(0, "", "mk")
-            return _go()
-
-    class FakePool:
-        runtime = FakeRuntime()
-
-        async def acquire(self, uid, host_ws):
-            return sbx_pool.ContainerEntry(
-                user_id=uid, container_id="abc123456789", created_at=0, last_used=0,
-                in_flight=1, host_workspace=host_ws)
-
-        async def release(self, entry):
-            return None
-
-    mgr = sbx_manager.SandboxManager(cfg=sbx_config.get_config(), pool=FakePool())
+    mgr = sbx_manager.SandboxManager(cfg=sbx_config.get_config(), pool=_fake_pool())
     monkeypatch.setattr(sbx_manager, "get_manager", lambda **_kw: mgr)
 
     t = tools_for("u_mvp")
-    out = call(t["file_write"], path="mark.txt", content="hi")
+    out = call(t["file_write"], path="sub/dir/leak.txt", content="hi")
 
-    assert "已写入" in out, out
-    assert "沙箱" in out or "容器" in out, f"文案没有容器标识，用户会误判：{out!r}"
-    # 路径仍要保留（模型靠它定位文件）
-    assert "mark.txt" in out
+    for bad in ("D:\\", "C:\\", "/home/", "/Users/", "AppData"):
+        assert bad not in out, f"文案泄露了宿主路径（{bad}）：{out!r}"
+    assert "sub/dir/leak.txt" in out, f"相对路径要保留：{out!r}"
 
 
-def test_sandbox_patch_result_marks_container(ws_root, monkeypatch):
-    """patch 同理。"""
-    monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
-    monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
+def test_in_process_write_result_does_not_leak_host_path(ws_root, monkeypatch):
+    """进程内路径同样不能泄露宿主绝对路径（两边一致）。"""
+    monkeypatch.setenv("HLZ_SANDBOX_MODE", "off")
     sbx_config.get_config(reload=True)
-    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
 
-    base = ws_root / "sandbox" / "u_mvp"
-    base.mkdir(parents=True, exist_ok=True)
-    (base / "p.txt").write_text("old-text", encoding="utf-8")
+    t = tools_for("u_off")
+    out = call(t["file_write"], path="rel/leak.txt", content="hi")
 
-    class FakeRuntime:
-        def exec_python(self, cid, code, *, timeout_s, cwd="/ws", host_workspace=""):
-            async def _go():
-                return sbx_runtime.ExecResult(0, "", "mk")
-            return _go()
+    for bad in ("D:\\", "C:\\", "/home/", "/Users/", "AppData"):
+        assert bad not in out, f"文案泄露了宿主路径（{bad}）：{out!r}"
+    assert "rel/leak.txt" in out
 
-    class FakePool:
-        runtime = FakeRuntime()
 
-        async def acquire(self, uid, host_ws):
-            return sbx_pool.ContainerEntry(
-                user_id=uid, container_id="abc123456789", created_at=0, last_used=0,
-                in_flight=1, host_workspace=host_ws)
+# ---------------- display_path 本身 ----------------
 
-        async def release(self, entry):
-            return None
 
-    mgr = sbx_manager.SandboxManager(cfg=sbx_config.get_config(), pool=FakePool())
-    monkeypatch.setattr(sbx_manager, "get_manager", lambda **_kw: mgr)
+def test_display_path_relative_inside_workspace(ws_root, monkeypatch):
+    from app.workspace import display_path
+    base = ws_root / "ws" / "u_dp"
+    f = base / "sub" / "a.py"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("x", encoding="utf-8")
+    assert display_path("u_dp", f) == "sub/a.py"
 
-    t = tools_for("u_mvp")
-    # 先读再改（写前必读门禁）
-    call(t["file_read"], path=str(base / "p.txt"))
-    out = call(t["file_patch"], path=str(base / "p.txt"),
-               old_content="old-text", new_content="new-text")
 
-    assert "已局部修改" in out, out
-    assert "沙箱" in out or "容器" in out, f"文案没有容器标识：{out!r}"
+def test_display_path_never_absolute_outside_workspace(ws_root):
+    """workspace 之外的路径只给文件名 —— 绝不返回绝对路径。"""
+    from app.workspace import display_path
+    outside = ws_root / "elsewhere" / "secret.txt"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_text("x", encoding="utf-8")
+    got = display_path("u_dp", outside)
+    assert got == "secret.txt", f"越界路径泄露了结构：{got!r}"
+    for bad in ("D:\\", "C:\\", "AppData", str(ws_root)):
+        assert bad not in got

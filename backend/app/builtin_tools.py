@@ -25,6 +25,7 @@ from .file_search import file_glob as _file_glob, file_grep as _file_grep
 from .tools import Tool
 from .workspace import (
     PathSecurityError,
+    display_path,
     safe_read_path,
     safe_workspace_path,
     user_workspace,
@@ -98,7 +99,7 @@ def _read_impl(user_id: str, path: str, start: int = 1, count: int = DEFAULT_REA
     chunk = all_lines[start - 1:end]
     if show_linenos:
         body = "\n".join(f"{start + i}|{line}" for i, line in enumerate(chunk))
-        header = f"[FILE] {target} | 共 {total} 行，显示 {start}-{end}\n"
+        header = f"[FILE] {display_path(user_id, target)} | 共 {total} 行，显示 {start}-{end}\n"
         return header + body
     return "\n".join(chunk)
 
@@ -133,7 +134,8 @@ def _write_impl(user_id: str, path: str, content: str, mode: str = "overwrite",
         new_text = content
     with open(target, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(new_text)
-    return f"已写入 {target}（{len(new_text)} 字符，mode={mode}）"
+    # 用相对路径：绝对路径会泄露宿主 OS 与目录结构（见 workspace.display_path）
+    return f"已写入 {display_path(user_id, target)}（{len(new_text)} 字符，mode={mode}）"
 
 
 # ---------------- file_patch ----------------
@@ -163,7 +165,7 @@ def _patch_impl(user_id: str, path: str, old_content: str, new_content: str,
     updated = full.replace(old_content, new_content, 1)
     with open(target, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(updated)
-    return f"已局部修改 {target}（替换 1 处）"
+    return f"已局部修改 {display_path(user_id, target)}（替换 1 处）"
 
 
 # ---------------- list_files ----------------

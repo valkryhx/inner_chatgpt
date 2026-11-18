@@ -67,6 +67,50 @@ def workspaces_root(user_id: str) -> Path:
     return WORKSPACES_DIR / user_id
 
 
+def display_path(user_id: str, target: Path) -> str:
+    """把绝对路径转成给用户/模型看的**相对**表示。
+
+    为什么不能直接返回绝对路径：宿主路径（``D:\\sandbox\\<uid>\\a.py``、
+    ``/home/x/...``）会在工具结果里暴露三件使用者不需要感知的事：
+    跑在什么操作系统上、目录结构长什么样、哪个盘。沙箱路径和非沙箱路径
+    都要用这一套，否则两边文案不一致，而且换平台就会露馅。
+
+    规则：
+    - 落在用户 workspace 内 -> 相对 workspace 根的 POSIX 路径（``sub/a.py``）
+    - 落在某个 skill 目录内 -> 用 ``skill:<dir>/...`` 前缀标识
+    - 其它（理论上不该出现）-> 只返回文件名，绝不返回绝对路径
+
+    与 ``normalize_workspace_path`` 是互逆的：那边把各种写法归一成
+    workspace 相对路径，这边把绝对路径还原成同一个相对表示。
+    """
+    try:
+        t = target.resolve()
+    except OSError:
+        return target.name
+
+    try:
+        base = user_workspace(user_id, create=False).resolve()
+        if t == base or base in t.parents:
+            return t.relative_to(base).as_posix() or "."
+    except OSError:
+        pass
+
+    for root, prefix in (
+        (user_skills_root(user_id), "skill"),
+        (builtin_skills_root(), "builtin-skill"),
+        (shared_skills_root(), "shared-skill"),
+    ):
+        try:
+            r = root.resolve()
+        except OSError:
+            continue
+        if t == r or r in t.parents:
+            return f"{prefix}:{t.relative_to(r).as_posix()}"
+
+    # 兜底：只给文件名。宁可信息少，也不泄露宿主结构。
+    return target.name
+
+
 def user_workspace(user_id: str, *, create: bool = True) -> Path:
     """Return (and optionally create) the user's workspace root."""
     root = workspaces_root(user_id)
