@@ -84,7 +84,8 @@ def check(cfg: SandboxConfig | None = None) -> tuple[bool, str]:
     return True, ""
 
 
-def cleanup_orphans(*, all_owners: bool = False, same_machine: bool = False) -> int:
+def cleanup_orphans(*, all_owners: bool = False, same_machine: bool = False,
+                    live_owners: set[str] | None = None) -> int:
     """删除**属于本进程**的残留沙箱容器。返回删除数量。
 
     ## 为什么默认只清自己的（2026-11-18 改）
@@ -99,7 +100,7 @@ def cleanup_orphans(*, all_owners: bool = False, same_machine: bool = False) -> 
     注意：本进程刚启动时 pid 是新的，所以严格说清不到"上一次自己"——
     上一轮的容器 owner 是旧 pid，属于"别人的"。这类残留由：
 
-    1. ``same_machine=True``（清本机所有）手动处理；
+    1. ``same_machine=True``（清本机所有，**但会跳过 live_owners**）；
     2. TTL 回收协程（`pool.reap_idle`）自然清掉；
     3. 运维显式 ``all_owners=True``。
 
@@ -108,7 +109,10 @@ def cleanup_orphans(*, all_owners: bool = False, same_machine: bool = False) -> 
     ## 参数
 
     - ``all_owners=True``：清全部沙箱容器（运维手动清场用）；
-    - ``same_machine=True``：只按主机名过滤，清本机所有实例的（介于两者之间）；
+    - ``same_machine=True``：清本机所有**已死实例**的容器；
+    - ``live_owners``：本机当前**活着**的 owner 集合（`cluster.instances.live_owners()`
+      的结果）。传了就跳过这些 owner 的容器 —— 这是多实例下不误删的关键。
+      不传（None）则退化成纯机器名前缀匹配（单实例语义，迁移前的行为）。
     - 都不传：只清本进程自己的（最安全）。
     """
     try:
@@ -129,13 +133,21 @@ def cleanup_orphans(*, all_owners: bool = False, same_machine: bool = False) -> 
         else:
             label_filters.append(f"{OWNER_LABEL}={owner_id()}")
 
+    alive = live_owners or set()
+
     removed = 0
     try:
         containers = client.containers.list(all=True, filters={"label": label_filters})
         for c in containers:
             if same_machine and not all_owners:
-                got = (getattr(c, "labels", None) or {}).get(OWNER_LABEL, "")
+                labels = getattr(c, "labels", None) or {}
+                got = labels.get(OWNER_LABEL, "")
                 if not got.startswith(f"{owner_machine()}:"):
+                    continue
+                # 多实例：本机还活着的实例的容器**绝不能碰**
+                if alive and got in alive:
+                    logger.debug("跳过存活实例的容器：%s（owner=%s）",
+                                 getattr(c, "name", "?"), got)
                     continue
             try:
                 c.remove(force=True)

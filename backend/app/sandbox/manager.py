@@ -87,8 +87,49 @@ class SandboxManager:
         self.cfg = cfg or get_config()
         self.pool = pool or get_pool()
         self._reaper: asyncio.Task | None = None
+        # 启动清扫时抢到的租约句柄（清完才释放，见 start()）
+        self._cleanup_lock: object | None = None
 
     # ---------------- 生命周期 ----------------
+
+    async def _is_cluster_leader(self) -> bool:
+        """本实例是否是集群里唯一该做启动清扫的那个。
+
+        ## 为什么不用 `cluster.get_elector().is_leader`
+
+        elector 的后台循环是 `asyncio.create_task`，需要在 `start()` 里
+        启动并等一轮才拿到结论。而沙箱 `start()` 是**启动序列的一环**，
+        它需要的只是一个「现在能不能清」的答案。
+
+        所以这里直接用一次性的 `SET NX` 抢一个清扫专用租约：
+        - 抢到 -> 我就是清理者，租约短（默认 60s），做完即释放
+        - 抢不到 -> 别的实例正在/刚做过，跳过
+
+        这比复用长期 leader 更贴切：清扫是**一次性动作**，
+        不需要长期持有身份；用长期 leader 反而会让「leader 换了」和
+        「该清扫了」两件事耦在一起。
+
+        没有 Redis 时直接返回 True（单实例，本来就该清）。
+        """
+        try:
+            from .. import cluster
+            if not cluster.cluster_enabled():
+                return True
+        except Exception:  # noqa: BLE001 - import 失败按单实例处理
+            return True
+
+        try:
+            handle = await cluster.distributed_lock(
+                "sandbox:startup-cleanup", ttl_ms=60_000, wait_ms=0)
+        except Exception:  # noqa: BLE001 - 抢不到 / 超时都算「别人在做」
+            return False
+        # 立刻释放：租约只用来「选出唯一清理者」，不是互斥整个清理过程
+        #
+        # ⚠️ 但释放之后别的实例可能马上抢到并**重复清理**。这里的处理是：
+        # 清理由本函数返回 True 后同步执行，释放放在**执行完之后** ——
+        # 见调用方把 release 包在 try/finally 里。这里改成返回句柄。
+        self._cleanup_lock = handle
+        return True
 
     async def start(self) -> tuple[bool, str]:
         """启动自检 + 清扫残留 + 起后台回收协程。返回 (ok, reason)。"""
@@ -101,23 +142,50 @@ class SandboxManager:
             logger.warning("沙箱自检失败：%s", reason)
             return False, reason
 
-        # 启动清扫：按**机器**过滤，不用精确 owner。
+        # 启动清扫：**只由集群 leader 执行**，且按机器过滤。
         #
-        # 为什么不用精确 owner：owner_id 含 PID，进程重启后 PID 变了，
-        # 上一轮留下的容器 owner 是旧 PID，精确匹配永远清不到 ——
-        # 启动清扫就成了摆设，每次重启泄漏一批容器。
+        # ## 为什么不用精确 owner（含 pid）
+        # 进程重启后 PID 变了，上一轮留下的容器 owner 是旧 PID，
+        # 精确匹配永远清不到 —— 启动清扫就成了摆设，每次重启泄漏一批容器。
         #
-        # 为什么按机器过滤是安全的：容器只存在于本机 Docker；启动这一刻，
-        # 本机「上一轮」的进程已经死了（否则端口会冲突，起不来第二个），
-        # 而本进程自己还没建任何容器。所以此刻本机的沙箱容器都是残留。
+        # ## 为什么按机器过滤在多实例下**不安全**，必须配 leader election
+        # 容器只存在于本机 Docker。单进程时「启动这一刻本机的沙箱容器都是残留」
+        # 成立；但同机跑两个后端进程时，新起的实例会把**另一个正在干活**的
+        # 容器删掉（它同样满足 `hlz.owner=<本机主机名>:*`）。
         #
-        # 多进程/多机部署下是否安全：多进程时各实例的 PID 不同但机器相同，
-        # 会互相清 —— 所以真要跑多进程，必须配合「启动清扫只在第一个实例执行」
-        # （用 Redis leader election，见 LibreChat 的 LeaderElection 做法）。
-        # 在那之前，本项目的部署形态是单机单进程，这个假设成立。
-        n = await asyncio.to_thread(probe.cleanup_orphans, same_machine=True)
-        if n:
-            logger.info("启动时清理了 %d 个残留沙箱容器", n)
+        # 所以清扫必须满足两个条件同时成立：
+        #   1. 我是集群 leader（`HLZ_REDIS_URL` 配了时才有意义，没配恒为真）
+        #   2. 我在这台机器上是**第一个**活着的实例
+        # 条件 2 由 `probe` 侧的「本机活跃 owner 探测」保证 —— 见下面注释。
+        #
+        # 没有 Redis（单实例）时 leader 恒为真，行为与迁移前完全一致。
+        is_leader = await self._is_cluster_leader()
+        if not is_leader:
+            logger.info("非 leader 实例，跳过启动清扫（避免误删其他实例的容器）")
+        else:
+            try:
+                # 真正的多实例保护：把「本机还活着的实例」传给清理逻辑，
+                # 它们正在用的容器一律不碰。没配 Redis 时返回空集合，
+                # 退化成「按机器名清本机全部」= 迁移前的单实例语义。
+                alive: set[str] = set()
+                try:
+                    from ..cluster import instances as inst
+                    alive = await inst.live_owners()
+                except Exception:  # noqa: BLE001 - 拿不到就按单实例处理
+                    pass
+                n = await asyncio.to_thread(
+                    probe.cleanup_orphans, same_machine=True, live_owners=alive)
+                if n:
+                    logger.info("启动时清理了 %d 个残留沙箱容器", n)
+            finally:
+                # 清扫**做完**才释放租约，否则别的实例会立刻抢到并重复清理一遍
+                lock = getattr(self, "_cleanup_lock", None)
+                if lock is not None:
+                    self._cleanup_lock = None
+                    try:
+                        await lock.release()
+                    except Exception:  # noqa: BLE001
+                        pass
 
         if self._reaper is None or self._reaper.done():
             self._reaper = asyncio.create_task(reap_loop(60.0))

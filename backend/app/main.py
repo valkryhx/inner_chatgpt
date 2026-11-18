@@ -1,6 +1,7 @@
 """FastAPI 入口：lifespan 装配 RuntimeHub + 路由 + CORS + 前端静态托管。"""
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -78,6 +79,18 @@ async def lifespan(app: FastAPI):
     hub = RuntimeHub()
     await hub.startup()
     set_hub(hub)
+    # 多实例协调：登记本实例 + 起心跳。**必须在沙箱启动之前**——
+    # 沙箱启动清扫会查「本机有哪些活着的实例」，本实例不先登记进去，
+    # 就会被自己（或别的实例）当成死实例清掉刚建的容器。
+    #
+    # 没配 HLZ_REDIS_URL 时这些调用全是空操作，单实例行为不变。
+    instance_hb = None
+    try:
+        from .cluster import instances as inst_registry
+        await inst_registry.register_self()
+        instance_hb = asyncio.create_task(_instance_heartbeat_loop())
+    except Exception:
+        logging.getLogger(__name__).warning("实例登记失败（按单实例继续）", exc_info=True)
     # 沙箱管理器：自检 Docker/镜像 + 清扫上次进程残留容器 + 起 TTL 回收协程。
     # 自检失败**不阻断启动**（auto 模式降级留痕、strict 模式在工具调用点报错），
     # 这与设计文档 §6.5「沙箱故障不能拖垮主服务」一致。
@@ -99,6 +112,15 @@ async def lifespan(app: FastAPI):
     finally:
         if dream_handle is not None:
             await dream_handle.stop()
+        # 心跳先停：否则退出过程中还在往 Redis 写，等于宣告「我活着」
+        if instance_hb is not None:
+            instance_hb.cancel()
+            try:
+                await instance_hb
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        # 注销要在**容器销毁之后**：否则别的实例会在这一瞬间
+        # 把本实例还活着的容器当残留清掉。顺序见下面沙箱 shutdown。
         # Turn jobs 先收：它们跑着生成，必须在 runtime 被拆掉之前停下来，
         # 否则工具/子代理会在一个已被 close 的 runtime 上继续跑。
         # 取消是**优雅**的：`_event_stream` 的 finally 会把消息收敛成 stopped。
@@ -118,6 +140,32 @@ async def lifespan(app: FastAPI):
                 logging.getLogger(__name__).info("已销毁 %d 个沙箱容器", n)
         except Exception:
             logging.getLogger(__name__).warning("沙箱管理器关闭失败", exc_info=True)
+        # 容器都销毁了，才把自己从存活实例表里移除
+        try:
+            from .cluster import instances as inst_registry
+            await inst_registry.unregister_self()
+        except Exception:
+            pass
+
+
+async def _instance_heartbeat_loop() -> None:
+    """定期刷新本实例的心跳。
+
+    没有 Redis 时 `heartbeat()` 直接返回，所以这个协程是空转的（很快）。
+    单独写成模块级函数而不是塞进 lifespan，是为了让测试能直接调它。
+    """
+    try:
+        from .cluster import instances as inst_registry
+    except Exception:  # noqa: BLE001
+        return
+    while True:
+        try:
+            await asyncio.sleep(30)
+            await inst_registry.heartbeat()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - 心跳失败不该杀掉协程
+            logging.getLogger(__name__).debug("实例心跳异常", exc_info=True)
 
 
 app = FastAPI(title="Hlaudz (self-built agent kernel)", version="0.3.0", lifespan=lifespan)
