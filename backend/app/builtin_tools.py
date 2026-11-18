@@ -42,6 +42,46 @@ def _err(msg: str) -> str:
     return f"[工具执行错误] {msg}"
 
 
+def _find_posix_bash() -> str | None:
+    """在 Windows 上找一个能跑 POSIX 语义的 bash，找不到返回 None。
+
+    为什么需要：`code_run(type="sh")` 的语义是 **POSIX shell**，
+    目的是让同一段命令在 Windows 宿主与 Linux 沙箱容器里行为一致。
+    Windows 自带的 `powershell` 语义完全不同（`ls` 是 alias、`cat` 是
+    `Get-Content`），拿它冒充 sh 会让模型写出「本地能跑、沙箱里挂掉」的代码。
+
+    查找顺序（不依赖 PATH 里的 `bash`，本机 `bash` 可能命中 WSL 存根）：
+    1. ``HLZ_POSIX_BASH`` 环境变量（显式覆盖）
+    2. Git for Windows 的常规安装位置
+    3. PATH 里的 ``bash`` —— 但要排除 System32 的 WSL 存根
+    """
+    import os
+    import shutil
+
+    explicit = (os.environ.get("HLZ_POSIX_BASH") or "").strip()
+    if explicit and Path(explicit).is_file():
+        return explicit
+
+    candidates = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\bin\bash.exe"),
+        os.path.expandvars(r"%USERPROFILE%\scoop\apps\git\current\bin\bash.exe"),
+    ]
+    for c in candidates:
+        try:
+            if c and Path(c).is_file():
+                return c
+        except OSError:
+            continue
+
+    found = shutil.which("bash")
+    if found and "system32" not in found.lower():
+        return found
+    return None
+
+
 def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     if len(text) <= limit:
         return text
@@ -233,9 +273,26 @@ async def _run_code_impl(
                 fh.write(code)
             cmd = [sys.executable, "-X", "utf8", "-u", "-c",
                    WORKSPACE_PYTHON_GUARD, tmp_path, str(cwd)]
-        elif code_type in ("powershell", "ps1", "pwsh", "bash", "sh", "shell"):
-            cmd = (["powershell", "-NoProfile", "-NonInteractive", "-Command", code]
-                   if os.name == "nt" else ["bash", "-c", code])
+        elif code_type in ("powershell", "ps1", "pwsh"):
+            # 显式要求 powershell：只有 Windows 有，Linux 直接报可操作的错
+            if os.name == "nt":
+                cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", code]
+            else:
+                return _err(
+                    "Linux 环境没有 powershell。请改用 type=sh（POSIX shell），"
+                    "或用 type=python 通过 subprocess 调用。")
+        elif code_type in ("sh", "bash", "shell"):
+            # POSIX shell。Windows 宿主机上用 Git Bash 的 bash，保证 `ls`/`cat`
+            # 这类命令的语义与沙箱容器内一致（而不是 powershell 的 alias）。
+            if os.name == "nt":
+                bash = _find_posix_bash()
+                if bash is None:
+                    return _err(
+                        "本机找不到 bash（Git Bash）。请改用 type=python，"
+                        "或安装 Git for Windows 后重试。")
+                cmd = [bash, "-c", code]
+            else:
+                cmd = ["bash", "-c", code]
         else:
             return _err(f"不支持的类型: {code_type}")
 
@@ -578,13 +635,28 @@ def _build_tool_list(file_read, file_write, file_patch, list_files, code_run, lo
         ),
         Tool(
             "code_run",
-            "在 workspace 内执行代码并返回输出。type=python(默认, 跑脚本) | powershell(单条命令)。"
-            "有超时(默认 60s)，输出会截断。适合计算与验证，不要做交互式等待。",
+            "在 workspace 内执行代码并返回输出。type=python(默认，跑 Python 脚本) | "
+            "sh(跑 shell 命令)。有超时(默认 60s)，输出会截断。适合计算与验证，不要做交互式等待。"
+            "\n\n选型：**默认用 python**。只有 shell 才能做的事（管道、系统命令、pip、"
+            "进程管理）才用 sh。"
+            "\n\n平台说明：type 里的 shell 写法在 Linux/沙箱容器内是 sh(POSIX)，"
+            "在 Windows 宿主上是 powershell。**如果你不知道自己在哪个平台，用 sh** ——"
+            "`ls`/`pwd`/`cat` 这类命令在两者上都能跑；写 PowerShell 特有语法"
+            "（`dir`、`Get-ChildItem`、`$env:`）在沙箱里会失败。"
+            "\n\n路径：当前目录就是你的 workspace 根，**直接用相对路径**（如 `a.py`、"
+            "`out/data.csv`）。不要拼绝对路径，不要假设 C:\\ 或 /home。",
             {
                 "type": "object",
                 "properties": {
                     "code": {"type": "string", "description": "要执行的代码/命令"},
-                    "type": {"type": "string", "enum": ["python", "powershell"], "description": "默认 python"},
+                    "type": {
+                        "type": "string",
+                        "enum": ["python", "sh"],
+                        "description": (
+                            "python(默认) 或 sh。sh 在沙箱容器内是 POSIX shell，"
+                            "在 Windows 宿主上是 powershell —— 不确定平台时用 sh。"
+                        ),
+                    },
                     "timeout": {"type": "integer", "description": "超时秒数，默认 60，最大 600"},
                 },
                 "required": ["code"],
