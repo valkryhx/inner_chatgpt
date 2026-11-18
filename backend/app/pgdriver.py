@@ -102,12 +102,48 @@ _NOOP_PRAGMA = re.compile(
 # 代价是所有 `BEGIN IMMEDIATE` 事务串行；项目里只有 6 处、都是
 # 「读-改-写-提交」的短事务（team 的停用/建队/发事件），可接受。
 #
-# 想再细一点可以按 team_id 做键，但那要在应用层传提示，先不做。
+# 想再细一点可以按 team_id 做键，但那要在应用层传提示 —— 见下方
+# `_LOCK_SCOPE_RE` + `conn.scope_lock()`：SQL 里写出 `BEGIN IMMEDIATE :key`
+# 就可以按 key 分锁，不同队不再互相排队。
+
+# 默认全局键（`BEGIN IMMEDIATE` 不带 key 时用）。保留它是为了向后兼容：
+# 现有 6 处调用点不改也能跑，只是仍全局串行。
 _WRITE_LOCK_KEY = 0x68_6C_7A_02   # 'hlz' + 版本号，固定值即可
-_BEGIN_LOCKED = re.compile(r"^\s*BEGIN\s+(?:IMMEDIATE|EXCLUSIVE)\b",
-                           re.IGNORECASE)
+
+# `BEGIN IMMEDIATE <scope>` —— scope 可以是任意标识符字面量。
+#
+# 为什么用「SQL 里带尾随标识符」而不是新 API：6 处调用点写的都是
+# `conn.execute("BEGIN IMMEDIATE")` 这种字符串。加一个尾随 scope 是**纯增量**
+# 改动（不改的那些照旧工作），而且读代码时立刻能看出「这个事务锁的是什么粒度」，
+# 比 `conn.begin_locked(team_id)` 更显式。
+_BEGIN_LOCKED = re.compile(
+    r"^\s*BEGIN\s+(?:IMMEDIATE|EXCLUSIVE)(?:\s+([A-Za-z_][\w:.\-]*))?\s*$",
+    re.IGNORECASE)
 # 纯 `BEGIN` / `BEGIN DEFERRED` 不拿锁，只开事务
 _BEGIN_PLAIN = re.compile(r"^\s*BEGIN(?:\s+DEFERRED)?\s*;?\s*$", re.IGNORECASE)
+
+
+def lock_key_for(scope: str | None) -> int:
+    """把 scope 字符串映射成 `pg_advisory_xact_lock` 的 64 位键。
+
+    ## 为什么不用 Python 的 `hash()`
+    `hash()` 在同一进程内稳定，但**跨进程/跨版本不稳定**（PYTHONHASHSEED
+    随机化字符串哈希）。advisory lock 的键必须让所有实例算出同一个数，
+    否则两个实例以为自己在锁不同的东西 —— 这比不锁更危险（看起来有保护）。
+
+    所以用 `blake2b` 取 8 字节，截成有符号 64 位。
+
+    ## 为什么 scope=None 仍用旧常量
+    向后兼容：不带 scope 的 `BEGIN IMMEDIATE` 必须与之前行为完全一致
+    （所有这种事务互斥）。这样升级不需要同时改 6 处业务代码。
+    """
+    if not scope:
+        return _WRITE_LOCK_KEY
+    import hashlib
+    digest = hashlib.blake2b(scope.encode("utf-8"), digest_size=8).digest()
+    value = int.from_bytes(digest, "big", signed=False)
+    # pg_advisory_xact_lock 接受 bigint（有符号），折到正区间避免踩 int8 边界
+    return value % (2 ** 63 - 1)
 
 _TABLE_INFO = re.compile(r"^\s*PRAGMA\s+table_info\s*\(\s*['\"]?([\w.]+)['\"]?\s*\)",
                          re.IGNORECASE)
@@ -377,13 +413,15 @@ class PgConnection(Connection):
             _known_schemas.add(schema)
         await raw.execute(f'SET search_path TO "{schema}", public')
 
-    async def _begin(self, *, lock: bool = False) -> None:
+    async def _begin(self, *, lock: bool = False, scope: str | None = None) -> None:
         raw = await self._ensure()
         await raw.execute("BEGIN")
         self._in_tx = True
         if lock:
-            # 顶替 SQLite 的库级写锁：整个事务独占写，事务结束自动释放
-            await raw.execute("SELECT pg_advisory_xact_lock($1)", _WRITE_LOCK_KEY)
+            # 顶替 SQLite 的库级写锁：整个事务独占写，事务结束自动释放。
+            # `scope` 决定锁粒度（None = 全局，与迁移前行为一致）。
+            await raw.execute("SELECT pg_advisory_xact_lock($1)",
+                              lock_key_for(scope))
         await self._savepoint()
 
     async def _savepoint(self) -> None:
@@ -406,7 +444,10 @@ class PgConnection(Connection):
     # ---------------- SQL 方言改写 ----------------
 
     async def _prepare(self, sql: str) -> str:
-        raw = sql.strip()
+        # 基类先剥掉两端通用的部分（`BEGIN IMMEDIATE <scope>` 的尾随标识符）。
+        # `scope` 由 `_execute_raw` 从**原始 SQL** 里解析 —— 那时还没被剥。
+        from .sqlcompat import strip_begin_scope
+        raw = strip_begin_scope(sql.strip())
 
         # 剥掉开头的注释行：`_DDL_HEAD` 之类的前缀判断必须看**语句**，
         # 不能看注释里的文字（注释里写了 "CREATE TABLE" 会误判）。
@@ -551,9 +592,11 @@ class PgConnection(Connection):
         # 否则后续 commit/rollback 会漏掉这个事务；并且必须真拿写锁，
         # 否则 `MAX(seq)+1` 这类「读后写」在并发下会撞主键。
         if _BEGIN_LOCKED.match(sql.strip()):
+            m_lock = _BEGIN_LOCKED.match(sql.strip())
+            scope = m_lock.group(1) if m_lock else None
             await self._ensure()
             if not self._in_tx:
-                await self._begin(lock=True)
+                await self._begin(lock=True, scope=scope)
             return Cursor([], rowcount=-1)
 
         if _BEGIN_PLAIN.match(sql.strip()):

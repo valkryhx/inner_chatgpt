@@ -186,6 +186,23 @@ def _strip_insert_or(sql: str) -> tuple[Optional[str], str]:
     return kind, f"INSERT INTO {table} {rest}"
 
 
+# `BEGIN IMMEDIATE <scope>` —— scope 是**给 PG 分锁粒度用的尾随标识符**，
+# SQLite 不认它（`BEGIN IMMEDIATE` 后只能跟事务结束）。
+#
+# 为什么由 sqlcompat 统一剥：两个后端都经过这里，剥一次就够。若只在
+# sqlitedriver 里剥，PG 那条路径仍要自己解析 scope，两边逻辑会漂移。
+# 剥出来的 scope 由 pgdriver 从**原始 SQL** 重新解析（它需要这个值）。
+_BEGIN_SCOPE_TAIL = re.compile(
+    r"^(\s*BEGIN\s+(?:IMMEDIATE|EXCLUSIVE))\s+[A-Za-z_][\w:.\-]*\s*$",
+    re.IGNORECASE)
+
+
+def strip_begin_scope(sql: str) -> str:
+    """把 `BEGIN IMMEDIATE <scope>` 还原成 `BEGIN IMMEDIATE`（SQLite 用）。"""
+    m = _BEGIN_SCOPE_TAIL.match(sql)
+    return m.group(1) if m else sql
+
+
 # ---------------------------------------------------------------- 连接对象
 
 class Cursor:
@@ -298,6 +315,14 @@ class Connection:
     def _apply_row_factory(self, value) -> None:
         """子类把 row_factory 真正装到驱动连接上。"""
 
+    def _prepare(self, sql: str) -> str:
+        """方言改写钩子。基类只做「两端通用」的剥离。
+
+        ⚠️ 子类覆盖时必须先调 `super()._prepare(sql)` —— 否则
+        `BEGIN IMMEDIATE <scope>` 的 scope 不会被剥掉，SQLite 会语法错。
+        """
+        return strip_begin_scope(sql)
+
     # ---- 子类实现 ----
     async def _execute_raw(self, sql: str, params: tuple) -> Cursor:
         raise NotImplementedError
@@ -313,10 +338,6 @@ class Connection:
 
     async def _close_raw(self) -> None:
         raise NotImplementedError
-
-    def _prepare(self, sql: str) -> str:
-        """方言改写钩子（SQLite 后端原样返回）。"""
-        return sql
 
     # ---- 公共 API ----
     def execute(self, sql: str, params: Iterable | None = None) -> _Awaitable:

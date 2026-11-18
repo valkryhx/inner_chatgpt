@@ -257,7 +257,7 @@ async def converge_generation_facts(user_id: str, session_id: str, generation_id
     ts = now_ms()
     async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
-        await conn.execute("BEGIN IMMEDIATE")
+        await conn.execute("BEGIN IMMEDIATE " + f"gen:{user_id}:{session_id}:{generation_id}")
         try:
             gen_cur = await conn.execute(
                 "UPDATE session_generations SET status=?,finished_at=? "
@@ -290,7 +290,7 @@ async def create_team(scope: TeamScope, *, name: str) -> dict[str, Any]:
     ts = now_ms()
     async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
-        await conn.execute("BEGIN IMMEDIATE")
+        await conn.execute("BEGIN IMMEDIATE " + f"team:{scope.team_id}")
         try:
             await conn.execute(
                 "INSERT INTO team_runs(team_id,user_id,session_id,generation_id,lead_agent_id,name,status,created_at,updated_at) "
@@ -351,7 +351,7 @@ async def emit_event(scope: TeamScope, event_type: str, payload: dict[str, Any],
         await conn.execute("PRAGMA busy_timeout=5000;")
         # Reserve the write lock before allocating MAX+1.  A plain SELECT then
         # INSERT lets concurrent emitters observe the same sequence number.
-        await conn.execute("BEGIN IMMEDIATE")
+        await conn.execute("BEGIN IMMEDIATE " + f"team:{scope.team_id}")
         try:
             cur = await conn.execute(
                 "SELECT COALESCE(MAX(event_seq),0)+1 FROM team_events WHERE team_id=?",
@@ -764,7 +764,7 @@ async def consume_inbox(scope: TeamScope, *, limit: int = 20) -> list[dict[str, 
     async with sqlcompat.connect(DB_PATH) as conn:
         conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
-        await conn.execute("BEGIN IMMEDIATE")
+        await conn.execute("BEGIN IMMEDIATE " + f"team:{scope.team_id}")
         try:
             cur = await conn.execute(
                 f"SELECT * FROM team_messages WHERE {where} "
@@ -841,7 +841,7 @@ async def pin_name(scope: TeamScope, name: str, agent_id: str) -> dict[str, Any]
     async with sqlcompat.connect(DB_PATH) as conn:
         conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
-        await conn.execute("BEGIN IMMEDIATE")
+        await conn.execute("BEGIN IMMEDIATE " + f"team:{scope.team_id}")
         try:
             cur = await conn.execute(
                 "SELECT agent_id FROM team_name_pins WHERE team_id=? AND name=?",

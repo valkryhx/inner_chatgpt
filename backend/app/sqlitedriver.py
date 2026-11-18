@@ -61,11 +61,13 @@ class SqliteConnection(Connection):
 
     async def _execute_raw(self, sql: str, params: tuple) -> Cursor:
         conn = await self._ensure()
-        return await conn.execute(sql, params)
+        # 基类只做「两端通用」的剥离：`BEGIN IMMEDIATE <scope>` 的 scope 是
+        # 给 PG 分锁粒度用的，SQLite 不认（会语法错）。其余一律原样透传。
+        return await conn.execute(self._prepare(sql), params)
 
     async def _executemany_raw(self, sql: str, seq: list) -> None:
         conn = await self._ensure()
-        await conn.executemany(sql, seq)
+        await conn.executemany(self._prepare(sql), seq)
 
     async def _commit_raw(self) -> None:
         conn = await self._ensure()
