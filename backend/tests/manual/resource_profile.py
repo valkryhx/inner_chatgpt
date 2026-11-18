@@ -119,8 +119,15 @@ def main() -> int:
     time.sleep(3)
     rows = []
 
-    def snapshot(label: str) -> None:
-        vals = [mem_mib(nm) for nm in names]
+    def snapshot(label: str, subset: list[str] | None = None) -> None:
+        """采样内存。subset=None 表示全部容器。
+
+        大负载档必须传 subset：否则「只压了 3 个、7 个空闲」的平均值
+        会被稀释成 ~100 MiB，看起来像「300MB 数组只要 100MB 内存」，
+        是误导数字。要报就报**被压的那几个**的平均。
+        """
+        targets = subset if subset is not None else names
+        vals = [mem_mib(nm) for nm in targets]
         good = [v for v in vals if v >= 0]
         if not good:
             print(f"  {label}: 读取失败")
@@ -128,37 +135,45 @@ def main() -> int:
         avg = sum(good) / len(good)
         rows.append({"stage": label, "avg_mib": round(avg, 2),
                      "max_mib": round(max(good), 2), "n": len(good)})
-        print(f"  {label}: 平均 {avg:.2f} MiB，最大 {max(good):.2f} MiB")
+        print(f"  {label}: 平均 {avg:.2f} MiB，最大 {max(good):.2f} MiB（样本 {len(good)}）")
 
     print("\n== 分档内存（都在进程存活期间采样）==")
     snapshot("1_空闲")
 
-    # 2. python 解释器加载后
+    # 2. python 解释器加载后（全量，成本低）
     for nm in names:
         exec_background(nm, "print('py-ready')", keep_s=20)
     time.sleep(6)
     snapshot("2_跑过python")
     time.sleep(18)
 
-    # 3. import pandas
+    # 3. import pandas（全量，~45MiB/个，安全）
     for nm in names:
         exec_background(nm, "import pandas\nprint(pandas.__version__)", keep_s=25)
     time.sleep(12)
     snapshot("3_import_pandas")
     time.sleep(20)
 
-    # 4. 分配 ~300MB 数组（真实数据处理量级）
-    for nm in names:
+    # ---- 以下是大内存档：只跑子集，防止撑爆宿主 ----
+    # 单个 300MB 数组 × n 个容器会直接吃掉 n×330 MiB。
+    # 宿主可用可能只有 2~3 GB，所以这档最多跑 min(3, n//3) 个，
+    # 其余保持空闲，用来验证「部分容器重载时整体是否稳定」。
+    heavy_n = max(1, min(3, n // 3))
+    heavy = names[:heavy_n]
+    print(f"\n  [保护] 大内存档只对 {heavy_n}/{n} 个容器施压（避免撑爆宿主）")
+
+    # 4. 分配 ~300MB 数组（只对 heavy 子集施压）
+    for nm in heavy:
         exec_background(nm,
                         "import numpy as np\n"
                         "a = np.ones((400, 1024, 100), dtype=np.float64)\n"
                         "print(a.nbytes)", keep_s=30)
     time.sleep(14)
-    snapshot("4_分配300MB")
+    snapshot(f"4_分配300MB", subset=heavy)
     time.sleep(22)
 
-    # 5. pandas 读 CSV + 分组聚合（最常见的数据任务形态）
-    for nm in names:
+    # 5. pandas 读 CSV + 分组聚合（只对 heavy 子集施压）
+    for nm in heavy:
         exec_background(nm,
                         "import pandas as pd, numpy as np\n"
                         "df = pd.DataFrame({'k': np.random.randint(0,50,300000),\n"
@@ -166,7 +181,7 @@ def main() -> int:
                         "g = df.groupby('k')['v'].agg(['mean','sum','count'])\n"
                         "print(len(g))", keep_s=30)
     time.sleep(16)
-    snapshot("5_pandas聚合")
+    snapshot(f"5_pandas聚合", subset=heavy)
     time.sleep(20)
 
     # 5. 矩阵运算（CPU 峰值，取 cpu.stat 增量）
