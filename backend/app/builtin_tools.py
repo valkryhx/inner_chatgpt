@@ -594,11 +594,14 @@ def _build_tool_list(file_read, file_write, file_patch, list_files, code_run, lo
         ),
         Tool(
             "file_write",
-            "写入文件（workspace 内）。mode=overwrite(默认) | append | prepend；自动创建父目录。",
+            "写入文件（workspace 内）。mode=overwrite(默认) | append | prepend；自动创建父目录。"
+            "\n\n路径：**相对 workspace 根**直接写，如 `a.py`、`out/data.csv`，不需要也不要用"
+            "绝对路径（绝对路径在沙箱内外指向不同位置，会写丢）。"
+            "\n\n覆盖已存在的文件前要先 file_read（硬门禁），否则会被拒绝。",
             {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "workspace 内路径"},
+                    "path": {"type": "string", "description": "文件路径，相对 workspace 根，如 `a.py` 或 `out/data.csv`"},
                     "content": {"type": "string", "description": "写入内容"},
                     "mode": {"type": "string", "enum": ["overwrite", "append", "prepend"]},
                 },
@@ -608,11 +611,13 @@ def _build_tool_list(file_read, file_write, file_patch, list_files, code_run, lo
         ),
         Tool(
             "file_patch",
-            "在文件中把唯一的 old_content 替换为 new_content（必须唯一匹配；0 或多处都报错）。",
+            "在文件中把唯一的 old_content 替换为 new_content（必须唯一匹配；0 或多处都报错）。"
+            "\n\n使用顺序：先 file_read 看清当前内容（写入前必读是硬门禁），再给出"
+            "**足够长的、在本文件内唯一**的 old_content。太短会命中多处而被拒绝。",
             {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description": "文件路径，相对 workspace 根，如 `a.py` 或 `out/data.csv`"},
                     "old_content": {"type": "string", "description": "要被替换的原文（必须全文唯一）"},
                     "new_content": {"type": "string", "description": "替换后的新内容"},
                 },
