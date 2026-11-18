@@ -8,6 +8,10 @@ from typing import Optional
 from .agent import UserRuntime, probe_mcp_status
 from .history_store import get_history_store, HistoryStore
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 _hub: Optional["RuntimeHub"] = None
 
 
@@ -224,6 +228,9 @@ _generation_reservations: dict[tuple[str, str, str], float] = {}
 # the explicit intent so register_generation returns an already-set event.
 _stop_requested: dict[tuple[str, str, str], float] = {}
 _STOP_INTENT_TTL_S = 300.0
+# 跨实例停止监听协程：key 同上。生成结束时必须 cancel，否则每轮留一个
+# 每秒打一次 Redis 的协程。
+_remote_watchers: dict[tuple[str, str, str], asyncio.Task] = {}
 # A reservation only bridges the tiny gap between accepting an HTTP request
 # and the StreamingResponse task entering the generator.  If a client never
 # consumes the response body, the reservation must not block the session
@@ -404,7 +411,34 @@ def register_generation(user_id: str, session_id: str, generation_id: str) -> as
     task = asyncio.current_task()
     if task is not None:
         _generation_tasks[key] = task
+    # 跨实例停止：挂一个后台协程监听 Redis。收到标记就 set 本地 Event，
+    # 之后 `stopped()` 照旧读这个 Event —— 核心循环零改动。
+    # 没配 Redis 时 watch() 返回 None，行为与迁移前完全一致。
+    _start_stop_watch(user_id, session_id, generation_id, ev)
     return ev
+
+
+def _start_stop_watch(user_id: str, session_id: str, generation_id: str,
+                      ev: asyncio.Event) -> None:
+    """起跨实例停止监听（尽力而为，失败不影响本地停止）。"""
+    key = _key(user_id, session_id, generation_id)
+    try:
+        from .cluster import stopsignal
+        watcher = asyncio.create_task(
+            stopsignal.watch(user_id, session_id, generation_id, ev))
+        _remote_watchers[key] = watcher
+    except Exception:  # noqa: BLE001
+        logger.debug("跨实例停止监听启动失败", exc_info=True)
+
+
+async def _stop_watch_task(watcher: asyncio.Task) -> None:
+    """关掉一个停止监听（先取回 StopWatcher 再 stop）。"""
+    try:
+        w = await watcher
+        if w is not None:
+            await w.stop()
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
 
 
 def unregister_generation(user_id: str, session_id: str, generation_id: str) -> None:
@@ -412,6 +446,17 @@ def unregister_generation(user_id: str, session_id: str, generation_id: str) -> 
     _stop_events.pop(key, None)
     _generation_tasks.pop(key, None)
     _generation_reservations.pop(key, None)
+    # 关掉跨实例停止监听：不关的话每轮留一个每秒打 Redis 的协程。
+    watcher = _remote_watchers.pop(key, None)
+    if watcher is not None:
+        _spawn(_stop_watch_task(watcher))
+    # 顺手清掉 Redis 里的停止标记（避免同 id 复用被误停）。
+    # 尽力而为：失败只可能是 Redis 抖动，下次生成会重新覆盖。
+    try:
+        from .cluster import stopsignal
+        _spawn(stopsignal.clear(user_id, session_id, generation_id))
+    except Exception:  # noqa: BLE001
+        pass
     # Do not discard a *pending* tombstone here; the pre-stream stop path calls
     # unregister_generation() before StreamingResponse first iterates, and the
     # later register_generation() must still observe the stop intent.  However,
@@ -419,6 +464,25 @@ def unregister_generation(user_id: str, session_id: str, generation_id: str) -> 
     # unregister marks normal completion and the tombstone must be cleared so a
     # reused generation id in tests or a future retry does not inherit a stop.
     _stop_requested.pop(key, None)
+
+
+def _spawn(coro) -> None:
+    """起一个「发后不管」的后台协程，**没有运行中的 loop 时静默丢弃**。
+
+    为什么需要：`unregister_generation` / `request_stop` 都是同步函数，
+    但测试里它们可能在 `asyncio.run` 之外被调用（例如构造/清理阶段）。
+    直接 `create_task` 会抛 `RuntimeError: no running event loop`，
+    把一次清理变成一次崩溃。这类后台动作失败没有正确性影响 ——
+    最坏情况是 Redis 里留一个会自己过期的标记。
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        loop.create_task(coro)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def request_stop(user_id: str, session_id: str, generation_id: str | None = None) -> int:
@@ -434,6 +498,14 @@ def request_stop(user_id: str, session_id: str, generation_id: str | None = None
     if generation_id:
         # Record intent even when the stream has not started registering yet.
         _stop_requested[_key(user_id, session_id, generation_id)] = time.monotonic()
+        # 跨实例：把这个意图也发到 Redis。生成可能跑在**另一个实例**上，
+        # 那边看不到本进程的 `_stop_events`。对方有一个 StopWatcher
+        # 在轮询这个 key，收到就 set 它本地的 Event。
+        try:
+            from .cluster import stopsignal
+            _spawn(stopsignal.publish(user_id, session_id, generation_id))
+        except Exception:  # noqa: BLE001
+            pass
     return n
 
 
