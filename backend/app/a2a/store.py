@@ -6,8 +6,7 @@ import secrets
 import time
 from typing import Any, Optional
 
-import aiosqlite
-
+from .. import sqlcompat
 from ..config import DB_PATH
 
 _SCHEMA = """
@@ -81,7 +80,7 @@ def new_id(prefix: str) -> str:
 
 
 async def init_tables() -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.executescript(_SCHEMA)
@@ -113,13 +112,13 @@ async def init_tables() -> None:
     await mark_interrupted_tasks("server restart")
 
 
-def _row_to_agent(row: aiosqlite.Row) -> dict[str, Any]:
+def _row_to_agent(row: sqlcompat.Row) -> dict[str, Any]:
     d = dict(row)
     d["enabled"] = bool(d.get("enabled"))
     return d
 
 
-def _row_to_token(row: aiosqlite.Row) -> dict[str, Any]:
+def _row_to_token(row: sqlcompat.Row) -> dict[str, Any]:
     d = dict(row)
     try:
         d["scopes"] = json.loads(d.get("scopes") or "[]")
@@ -128,7 +127,7 @@ def _row_to_token(row: aiosqlite.Row) -> dict[str, Any]:
     return d
 
 
-def _row_to_task(row: aiosqlite.Row) -> dict[str, Any]:
+def _row_to_task(row: sqlcompat.Row) -> dict[str, Any]:
     d = dict(row)
     try:
         d["artifacts"] = json.loads(d.get("artifacts") or "[]")
@@ -138,8 +137,8 @@ def _row_to_task(row: aiosqlite.Row) -> dict[str, Any]:
 
 
 async def ensure_agent(user_id: str) -> dict[str, Any]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute("SELECT * FROM a2a_agents WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
@@ -152,7 +151,7 @@ async def ensure_agent(user_id: str) -> dict[str, Any]:
                 (new_id("a2a"), user_id, agent_id, now_ms()),
             )
             await conn.commit()
-        except aiosqlite.IntegrityError:
+        except sqlcompat.IntegrityError:
             await conn.rollback()
         cur = await conn.execute("SELECT * FROM a2a_agents WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
@@ -162,16 +161,16 @@ async def ensure_agent(user_id: str) -> dict[str, Any]:
 
 
 async def get_agent(user_id: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute("SELECT * FROM a2a_agents WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
     return _row_to_agent(row) if row else None
 
 
 async def get_agent_by_agent_id(agent_id: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute("SELECT * FROM a2a_agents WHERE agent_id=?", (agent_id,))
         row = await cur.fetchone()
     return _row_to_agent(row) if row else None
@@ -181,8 +180,8 @@ async def create_token(*, user_id: str, agent_id: str, name: str, token_hash: st
                        tool_policy: str = "full") -> dict[str, Any]:
     tid = new_id("a2at")
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute(
             "INSERT INTO a2a_tokens(id,user_id,agent_id,name,token_hash,prefix,scopes,"
             "tool_policy,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -196,8 +195,8 @@ async def create_token(*, user_id: str, agent_id: str, name: str, token_hash: st
 
 
 async def list_tokens(user_id: str) -> list[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM a2a_tokens WHERE user_id=? ORDER BY created_at DESC", (user_id,)
         )
@@ -206,21 +205,21 @@ async def list_tokens(user_id: str) -> list[dict[str, Any]]:
 
 
 async def find_token_by_hash(token_hash: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute("SELECT * FROM a2a_tokens WHERE token_hash=?", (token_hash,))
         row = await cur.fetchone()
     return _row_to_token(row) if row else None
 
 
 async def touch_token(token_id: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("UPDATE a2a_tokens SET last_used_at=? WHERE id=?", (now_ms(), token_id))
         await conn.commit()
 
 
 async def revoke_token(user_id: str, token_id: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             "UPDATE a2a_tokens SET revoked_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL",
             (now_ms(), token_id, user_id),
@@ -233,8 +232,8 @@ async def create_task(*, task_id: str, context_id: str, user_id: str, agent_id: 
                       state: str = "TASK_STATE_SUBMITTED",
                       tool_policy: str = "full") -> dict[str, Any]:
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute(
             "INSERT INTO a2a_tasks(task_id,context_id,user_id,agent_id,session_id,message_id,"
             "generation_id,tool_policy,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -248,8 +247,8 @@ async def create_task(*, task_id: str, context_id: str, user_id: str, agent_id: 
 
 
 async def get_task(user_id: str, agent_id: str, task_id: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM a2a_tasks WHERE task_id=? AND user_id=? AND agent_id=?",
             (task_id, user_id, agent_id),
@@ -259,8 +258,8 @@ async def get_task(user_id: str, agent_id: str, task_id: str) -> Optional[dict[s
 
 
 async def find_task_by_message(agent_id: str, context_id: str, message_id: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM a2a_tasks WHERE agent_id=? AND context_id=? AND message_id=? "
             "ORDER BY created_at ASC LIMIT 1",
@@ -285,8 +284,8 @@ async def update_task(task_id: str, **fields: Any) -> Optional[dict[str, Any]]:
     sets.append("updated_at=?")
     vals.append(now_ms())
     vals.append(task_id)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute(f"UPDATE a2a_tasks SET {', '.join(sets)} WHERE task_id=?", vals)
         await conn.commit()
         cur = await conn.execute("SELECT * FROM a2a_tasks WHERE task_id=?", (task_id,))
@@ -317,7 +316,7 @@ async def update_snapshot(task_id: str, *, steps: int = 0, tools_run: int = 0,
         "partial_chars": int(partial_chars),
         "at": now_ms(),
     }
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute(
             "UPDATE a2a_tasks SET snapshot=?, updated_at=? WHERE task_id=?",
             (json.dumps(snap, ensure_ascii=False), now_ms(), task_id),
@@ -356,8 +355,8 @@ async def mark_interrupted_tasks(reason: str = "server restart") -> int:
     返回受影响行数（测试与启动日志用）。
     """
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute(
             "SELECT task_id, snapshot FROM a2a_tasks "
@@ -394,8 +393,8 @@ async def list_tasks(user_id: str, agent_id: str, *, context_id: str = "",
         vals.append(state)
     sql += " ORDER BY created_at DESC LIMIT ?"
     vals.append(max(1, min(100, int(limit))))
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(sql, vals)
         rows = await cur.fetchall()
     return [_row_to_task(r) for r in rows]
@@ -403,8 +402,8 @@ async def list_tasks(user_id: str, agent_id: str, *, context_id: str = "",
 
 async def find_task_by_message_any(agent_id: str, message_id: str) -> Optional[dict[str, Any]]:
     """Idempotency lookup when the caller omitted contextId."""
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM a2a_tasks WHERE agent_id=? AND message_id=? "
             "ORDER BY created_at ASC LIMIT 1",
@@ -424,7 +423,7 @@ async def count_active(user_id: str, exclude_task_id: str = "") -> tuple[int, in
     if exclude_task_id:
         sql += " AND task_id<>?"
         vals.append(exclude_task_id)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute(sql, vals)
         total = int((await cur.fetchone())[0])
@@ -437,7 +436,7 @@ async def record_audit(*, user_id: str, agent_id: str, method: str, outcome: str
                        token_id: str = "", task_id: str = "", tool_policy: str = "",
                        detail: str = "", latency_ms: int = 0) -> None:
     """一次 JSON-RPC 调用一行。审计失败不能影响主链路。"""
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute(
             "INSERT INTO a2a_audit(ts,user_id,agent_id,token_id,method,task_id,"
@@ -453,8 +452,8 @@ async def record_audit(*, user_id: str, agent_id: str, method: str, outcome: str
 
 
 async def list_audit(user_id: str, limit: int = 50) -> list[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM a2a_audit WHERE user_id=? ORDER BY ts DESC, id DESC LIMIT ?",
             (user_id, max(1, min(500, int(limit)))),
@@ -465,8 +464,8 @@ async def list_audit(user_id: str, limit: int = 50) -> list[dict[str, Any]]:
 
 async def set_agent_enabled(user_id: str, enabled: bool) -> Optional[dict[str, Any]]:
     """用户级开关：立刻生效（每次请求现查，不走缓存）。"""
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute(
             "UPDATE a2a_agents SET enabled=? WHERE user_id=?",

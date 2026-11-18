@@ -42,8 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-import aiosqlite
-
+from . import sqlcompat
 from .config import DB_PATH, MEMORIES_DIR
 from .workspace import PathSecurityError, _reject_unsafe_segment, _resolve_under
 
@@ -578,7 +577,7 @@ def now_ms() -> int:
 
 async def init_tables() -> None:
     """幂等建表。启动时调用一次。"""
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.executescript(_CREATE_TABLES)
@@ -597,23 +596,23 @@ async def init_tables() -> None:
         await conn.commit()
 
 
-async def _fetch(sql: str, params: tuple = ()) -> list[aiosqlite.Row]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+async def _fetch(sql: str, params: tuple = ()) -> list[sqlcompat.Row]:
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute(sql, params)
         return list(await cur.fetchall())
 
 
 async def _execute(sql: str, params: tuple = ()) -> int:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute(sql, params)
         await conn.commit()
         return cur.rowcount
 
 
-def _row_to_spec(row: aiosqlite.Row, *, scope: str, team_key: str,
+def _row_to_spec(row: sqlcompat.Row, *, scope: str, team_key: str,
                  with_version: bool = False) -> MemorySpec:
     """索引行 -> MemorySpec。
 
@@ -771,7 +770,7 @@ async def _upsert_rows(user_id: str, specs: list[MemorySpec]) -> int:
             spec.created_at or now_ms(),
             spec.updated_at or now_ms(),
         ))
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.executemany(
             "INSERT INTO memories(id,user_id,scope,team_key,slug,title,description,tags,kind,path,"

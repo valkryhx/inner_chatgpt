@@ -9,8 +9,7 @@ import json
 import time
 from typing import Any, Optional
 
-import aiosqlite
-
+from .. import sqlcompat
 from ..config import DB_PATH
 
 _BASE_TABLES = """
@@ -63,7 +62,7 @@ def now_ms() -> int:
 
 
 async def init_tables() -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA busy_timeout=5000;")
         # Add columns before creating scope indexes.  Legacy tables do not have
@@ -103,7 +102,7 @@ async def create_run(*, run_id: str, ctx_user_id: str, session_id: str, message_
                      task_message: str, status: str = "running",
                      generation_id: str = "", team_id: str = "") -> dict:
     started = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute(
             "INSERT INTO subagent_runs(run_id,user_id,session_id,generation_id,team_id,message_id,"
             "parent_agent_id,agent_id,name,role,status,task_message,started_at) "
@@ -137,7 +136,7 @@ async def set_status(run_id: str, status: str, *, user_id: str = "", session_id:
     sql, vals = _scope_sql("UPDATE subagent_runs SET status=? WHERE run_id=?", run_id,
                            user_id, session_id, generation_id, team_id)
     vals.insert(0, status)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(sql, vals)
         await conn.commit()
         return (cur.rowcount or 0) == 1
@@ -151,7 +150,7 @@ async def finish_run(run_id: str, *, status: str, result_text: str = "", turns: 
         "finished_at=? WHERE run_id=?", run_id, user_id, session_id, generation_id, team_id
     )
     vals[:0] = [status, result_text, int(turns), error, now_ms()]
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(sql, vals)
         await conn.commit()
         return (cur.rowcount or 0) == 1
@@ -176,7 +175,7 @@ async def update_run_progress(run_id: str, *, turns: int = 0, result_text: str =
     sql, scope_vals = _scope_sql(
         f"UPDATE subagent_runs SET {', '.join(sets)} WHERE run_id=?", run_id,
         user_id, session_id, generation_id, team_id)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(sql, vals + scope_vals)
         await conn.commit()
         return (cur.rowcount or 0) == 1
@@ -189,7 +188,7 @@ async def append_sidechain(run_id: str, history: list[dict], *, start_seq: int =
     if not rows:
         return start_seq
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         if user_id or session_id or generation_id or team_id:
             cur = await conn.execute(
                 "SELECT 1 FROM subagent_runs WHERE run_id=? AND user_id=? AND session_id=? "
@@ -218,8 +217,8 @@ async def load_sidechain(run_id: str, *, user_id: str = "", session_id: str = ""
             sql += f" AND {col}=?"
             vals.append(value)
     sql += " ORDER BY seq ASC"
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(sql, vals)
         rows = await cur.fetchall()
     out = []
@@ -235,8 +234,8 @@ async def get_run(run_id: str, *, user_id: str = "", session_id: str = "",
                   generation_id: str = "", team_id: str = "") -> Optional[dict]:
     sql, vals = _scope_sql("SELECT * FROM subagent_runs WHERE run_id=?", run_id,
                            user_id, session_id, generation_id, team_id)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(sql, vals)
         row = await cur.fetchone()
     return dict(row) if row else None
@@ -256,15 +255,15 @@ async def list_runs(session_id: str, user_id: str, *, message_id: str = "",
         sql += " AND team_id=?"
         params.append(team_id)
     sql += " ORDER BY started_at ASC"
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(sql, params)
         rows = await cur.fetchall()
     return [dict(r) for r in rows]
 
 
 async def mark_stale_running_as_errored(reason: str = "restarted") -> int:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             "UPDATE subagent_runs SET status='errored', error=?, finished_at=? "
             "WHERE status IN ('starting','running')",
@@ -277,7 +276,7 @@ async def mark_stale_running_as_errored(reason: str = "restarted") -> int:
 async def add_notification(*, nid: str, user_id: str, session_id: str,
                            generation_id: str, agent_name: str, status: str,
                            preview: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute(
             "INSERT OR IGNORE INTO subagent_notifications"
             "(id,user_id,session_id,generation_id,agent_name,status,preview,created_at)"
@@ -289,8 +288,8 @@ async def add_notification(*, nid: str, user_id: str, session_id: str,
 
 async def list_pending_notifications(user_id: str, session_id: str,
                                      limit: int = 20) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM subagent_notifications"
             " WHERE user_id=? AND session_id=? AND acked_at IS NULL"
@@ -305,7 +304,7 @@ async def ack_notifications_db(ids: list[str]) -> int:
     if not ids:
         return 0
     placeholders = ",".join("?" for _ in ids)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             f"UPDATE subagent_notifications SET acked_at=? WHERE id IN ({placeholders})",
             (now_ms(), *ids),
@@ -315,8 +314,8 @@ async def ack_notifications_db(ids: list[str]) -> int:
 
 async def get_latest_run_by_name(user_id: str, session_id: str, name: str) -> dict | None:
     """按名字取本会话最近一次 run（跨 generation 回退用）。"""
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM subagent_runs WHERE user_id=? AND session_id=? AND name=?"
             " ORDER BY started_at DESC LIMIT 1",

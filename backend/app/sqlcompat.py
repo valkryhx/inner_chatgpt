@@ -357,40 +357,74 @@ def split_statements(sql: str) -> list[str]:
     """按 `;` 拆分 DDL 脚本，跳过字符串字面量与注释里的分号。
 
     `executescript` 在项目里只用来跑建表语句（没有函数体 / 触发器 / 存储过程），
-    所以「简单拆分」是安全的。仍然扫字面量，避免 `DEFAULT ';'` 这类误切。
+    所以「按顶层分号拆分」是安全的。仍然要扫字面量，否则 `DEFAULT ';'`、
+    注释里的分号会把一条语句切成两半。
+
+    ⚠️ 必须**逐字符**扫，不能先按 token 分段再切 —— 那样「注释前面的那一大段
+    文本」会被整块塞进缓冲而不切分，导致多条 CREATE 合并成一条
+    （2026-11-19 实测：team_store 的 12 条 DDL 被并成 8 条，
+    aiosqlite 报 `You can only execute one statement at a time`）。
     """
     out: list[str] = []
     buf: list[str] = []
-    pos = 0
-    for m in _SQL_TOKEN.finditer(sql):
-        chunk = sql[pos:m.start()]
-        tok = m.group(0)
-        pos = m.end()
-        if tok.startswith("--") or tok.startswith("/*"):
-            buf.append(chunk)
-            buf.append(tok)
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        # 单引号字符串：'' 是转义，整块跳过
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            buf.append(sql[i:j])
+            i = j
             continue
-        # 字符串/标识符里可能有分号，整块塞进去
-        parts = chunk.split(";")
-        buf.append(parts[0])
-        for p in parts[1:]:
+        # 双引号标识符："" 是转义
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if sql[j] == '"':
+                    if j + 1 < n and sql[j + 1] == '"':
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            buf.append(sql[i:j])
+            i = j
+            continue
+        # 行注释：到行尾
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            j = sql.find("\n", i)
+            j = n if j < 0 else j + 1
+            buf.append(sql[i:j])
+            i = j
+            continue
+        # 块注释：到 */
+        if ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            j = sql.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            buf.append(sql[i:j])
+            i = j
+            continue
+        if ch == ";":
             stmt = "".join(buf).strip()
             if stmt:
                 out.append(stmt)
-            buf = [p]
-        buf.append(tok)
-    tail = sql[pos:]
-    parts = tail.split(";")
-    buf.append(parts[0])
-    for p in parts[1:]:
-        stmt = "".join(buf).strip()
-        if stmt:
-            out.append(stmt)
-        buf = [p]
-    last = "".join(buf).strip()
-    if last:
-        out.append(last)
-    return [s for s in out if s.strip()]
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        out.append(tail)
+    return out
 
 
 def connect(path) -> Connection:

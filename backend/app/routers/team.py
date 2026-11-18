@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import aiosqlite
+from .. import sqlcompat
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from .. import db, team_store
@@ -22,9 +22,9 @@ async def _owned_session(session_id: str, user: dict) -> dict[str, Any]:
     return session
 
 
-async def _latest_team(conn: aiosqlite.Connection, user_id: str,
+async def _latest_team(conn: sqlcompat.Connection, user_id: str,
                        session_id: str) -> dict[str, Any] | None:
-    conn.row_factory = aiosqlite.Row
+    conn.row_factory = sqlcompat.Row
     cur = await conn.execute(
         "SELECT * FROM team_runs WHERE user_id=? AND session_id=? "
         "ORDER BY created_at DESC LIMIT 1",
@@ -47,7 +47,7 @@ async def _team_scope(session_id: str, user: dict) -> tuple[dict[str, Any] | Non
             )
         else:
             await team_store.converge_orphaned_active_teams(user["id"], session_id)
-    async with aiosqlite.connect(team_store.DB_PATH) as conn:
+    async with sqlcompat.connect(team_store.DB_PATH) as conn:
         team = await _latest_team(conn, user["id"], session_id)
     if team is None:
         return None, None

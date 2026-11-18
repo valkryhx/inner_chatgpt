@@ -52,8 +52,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import aiosqlite
-
+from . import sqlcompat
 from . import memory_store as ms
 from .tools import Tool, ToolRegistry
 
@@ -163,7 +162,7 @@ def _now_ms() -> int:
 
 
 async def init_tables() -> None:
-    async with aiosqlite.connect(ms.DB_PATH) as conn:
+    async with sqlcompat.connect(ms.DB_PATH) as conn:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.executescript(_CREATE_TABLE)
@@ -185,8 +184,8 @@ def _blank_state(user_id: str) -> dict[str, Any]:
 
 async def get_state(user_id: str) -> dict[str, Any]:
     """读一个用户的 dream 状态；没有行时返回默认值（不建行）。"""
-    async with aiosqlite.connect(ms.DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(ms.DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute("SELECT * FROM memory_dream_state WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
@@ -197,7 +196,7 @@ async def _set_state(user_id: str, **fields: Any) -> None:
     if not fields:
         return
     cols = ", ".join(f"{k}=?" for k in fields)
-    async with aiosqlite.connect(ms.DB_PATH) as conn:
+    async with sqlcompat.connect(ms.DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute(
             "INSERT INTO memory_dream_state(user_id) VALUES(?) ON CONFLICT(user_id) DO NOTHING",
@@ -219,7 +218,7 @@ async def acquire_lock(user_id: str, *, pid: int = 0, now_ms: int = 0) -> bool:
     """
     now = now_ms or _now_ms()
     pid = pid or os.getpid()
-    async with aiosqlite.connect(ms.DB_PATH) as conn:
+    async with sqlcompat.connect(ms.DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute(
             "INSERT INTO memory_dream_state(user_id) VALUES(?) ON CONFLICT(user_id) DO NOTHING",
@@ -237,7 +236,7 @@ async def release_lock(user_id: str, *, pid: int = 0) -> None:
     （状态由调用方在成功/失败时各自设置）。
     """
     pid = pid or os.getpid()
-    async with aiosqlite.connect(ms.DB_PATH) as conn:
+    async with sqlcompat.connect(ms.DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute(
             "UPDATE memory_dream_state SET lock_pid=0, lock_at=0 "
@@ -254,7 +253,7 @@ async def recover_dream_state(reason: str = "server restart") -> int:
 
     返回被收敛的行数（用于启动日志）。
     """
-    async with aiosqlite.connect(ms.DB_PATH) as conn:
+    async with sqlcompat.connect(ms.DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute(
             "UPDATE memory_dream_state SET lock_pid=0, lock_at=0, "
@@ -278,8 +277,8 @@ async def list_users_needing_dream(*, now_ms: int = 0) -> list[dict[str, Any]]:
     """
     now = now_ms or _now_ms()
     threshold = int(now - min_hours() * 3600 * 1000)
-    async with aiosqlite.connect(ms.DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(ms.DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
         # LEFT JOIN：从没有 dream 状态的用户（last_consolidated=0）也应该入选
         cur = await conn.execute(
@@ -301,7 +300,7 @@ async def list_users_with_pending_index() -> list[str]:
     这条路径**不受时间闸约束** —— 索引重建很便宜（不调模型），
     让「上次被 kill 在重建之前」的用户等 24 小时毫无道理。
     """
-    async with aiosqlite.connect(ms.DB_PATH) as conn:
+    async with sqlcompat.connect(ms.DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute(
             "SELECT user_id FROM memory_dream_state WHERE index_pending=1 AND lock_pid=0")
@@ -310,7 +309,7 @@ async def list_users_with_pending_index() -> list[str]:
 
 async def sessions_touched_since(user_id: str, since_ms: int) -> list[str]:
     """``since_ms`` 之后被更新过的会话 id（sessions 表，毫秒时间戳）。"""
-    async with aiosqlite.connect(ms.DB_PATH) as conn:
+    async with sqlcompat.connect(ms.DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute(
             "SELECT id FROM sessions WHERE user_id=? AND updated_at>=? ORDER BY updated_at DESC",

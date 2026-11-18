@@ -12,8 +12,7 @@ import secrets
 import time
 from typing import Any, Optional
 
-import aiosqlite
-
+from . import sqlcompat
 from .config import DB_PATH
 from .logging_setup import team_event
 from .scope import TeamScope
@@ -177,7 +176,7 @@ def new_id(prefix: str) -> str:
 
 
 async def init_tables() -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute("PRAGMA foreign_keys=ON;")
@@ -208,7 +207,7 @@ def _scope_where(scope: TeamScope, alias: str = "") -> tuple[str, tuple[str, str
 
 # ---------------- generation lease ----------------
 async def acquire_generation(user_id: str, session_id: str, generation_id: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         try:
             await conn.execute(
@@ -218,13 +217,13 @@ async def acquire_generation(user_id: str, session_id: str, generation_id: str) 
             )
             await conn.commit()
             return True
-        except aiosqlite.IntegrityError:
+        except sqlcompat.IntegrityError:
             await conn.rollback()
             return False
 
 
 async def release_generation(user_id: str, session_id: str, generation_id: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute(
             "UPDATE session_generations SET status='finished', finished_at=? "
             "WHERE user_id=? AND session_id=? AND generation_id=? AND status='active'",
@@ -234,7 +233,7 @@ async def release_generation(user_id: str, session_id: str, generation_id: str) 
 
 
 async def get_active_generation(user_id: str, session_id: str) -> Optional[str]:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             "SELECT generation_id FROM session_generations "
             "WHERE user_id=? AND session_id=? AND status='active' LIMIT 1",
@@ -256,7 +255,7 @@ async def converge_generation_facts(user_id: str, session_id: str, generation_id
     if status not in TEAM_STATUSES:
         status = "stale"
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute("BEGIN IMMEDIATE")
         try:
@@ -289,7 +288,7 @@ async def converge_generation_facts(user_id: str, session_id: str, generation_id
 # ---------------- team lifecycle ----------------
 async def create_team(scope: TeamScope, *, name: str) -> dict[str, Any]:
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute("BEGIN IMMEDIATE")
         try:
@@ -324,8 +323,8 @@ async def create_team(scope: TeamScope, *, name: str) -> dict[str, Any]:
 
 async def get_team(scope: TeamScope) -> Optional[dict[str, Any]]:
     where, args = _scope_where(scope)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(f"SELECT * FROM team_runs WHERE {where}", args)
         row = await cur.fetchone()
     return dict(row) if row else None
@@ -335,7 +334,7 @@ async def set_team_status(scope: TeamScope, status: str) -> bool:
     if status not in TEAM_STATUSES:
         raise ValueError(f"invalid team status: {status}")
     where, args = _scope_where(scope)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             f"UPDATE team_runs SET status=?, updated_at=?, closed_at=? WHERE {where}",
             (status, now_ms(), now_ms() if status != "active" else 0, *args),
@@ -348,7 +347,7 @@ async def set_team_status(scope: TeamScope, status: str) -> bool:
 async def emit_event(scope: TeamScope, event_type: str, payload: dict[str, Any],
                      *, agent_id: str = "", task_id: str = "") -> dict[str, Any]:
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         # Reserve the write lock before allocating MAX+1.  A plain SELECT then
         # INSERT lets concurrent emitters observe the same sequence number.
@@ -376,8 +375,8 @@ async def emit_event(scope: TeamScope, event_type: str, payload: dict[str, Any],
 
 async def events_since(scope: TeamScope, since_seq: int = 0, limit: int = 200) -> list[dict[str, Any]]:
     where, args = _scope_where(scope)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             f"SELECT * FROM team_events WHERE {where} AND event_seq>? ORDER BY event_seq ASC LIMIT ?",
             (*args, max(0, int(since_seq)), max(1, min(int(limit), 1000))),
@@ -400,8 +399,8 @@ async def create_task(scope: TeamScope, *, subject: str, description: str = "",
     ts = now_ms()
     blocked = [str(x) for x in (blocked_by or []) if str(x)]
     clean_subject = subject.strip()
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
         # 幂等：同一团队里已有同名且未完成的任务时复用，而不是再插一行。
         # 模型很容易因为「上一步返回失败」而重做整段计划（真机 runId
@@ -450,8 +449,8 @@ async def create_task(scope: TeamScope, *, subject: str, description: str = "",
 
 async def get_task(scope: TeamScope, task_id: str) -> Optional[dict[str, Any]]:
     where, args = _scope_where(scope)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             f"SELECT * FROM team_tasks WHERE task_id=? AND {where}", (task_id, *args)
         )
@@ -477,8 +476,8 @@ async def list_tasks(scope: TeamScope, *, status: str = "") -> list[dict[str, An
         sql += " AND status=?"
         vals.append(status)
     sql += " ORDER BY created_at ASC"
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(sql, vals)
         rows = await cur.fetchall()
         out = [dict(r) for r in rows]
@@ -492,7 +491,7 @@ async def list_tasks(scope: TeamScope, *, status: str = "") -> list[dict[str, An
     return out
 
 
-async def _deps_complete(conn: aiosqlite.Connection, scope: TeamScope, task_id: str) -> bool:
+async def _deps_complete(conn: sqlcompat.Connection, scope: TeamScope, task_id: str) -> bool:
     cur = await conn.execute(
         "SELECT 1 FROM team_task_deps d JOIN team_tasks t "
         "ON t.task_id=d.blocked_by AND t.user_id=d.user_id AND t.session_id=d.session_id "
@@ -510,13 +509,13 @@ async def task_is_blocked(scope: TeamScope, task_id: str) -> bool:
     Public so callers can refuse *before* doing expensive work (e.g. spawning a
     teammate that would only be torn down again once the bind is rejected).
     """
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         return not await _deps_complete(conn, scope, task_id)
 
 
 async def claim_task(scope: TeamScope, task_id: str, *, expected_version: int) -> dict[str, Any]:
     where, args = _scope_where(scope)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         if not await _deps_complete(conn, scope, task_id):
             return {"ok": False, "reason": "blocked"}
@@ -543,7 +542,7 @@ async def claim_task(scope: TeamScope, task_id: str, *, expected_version: int) -
 
 async def complete_task(scope: TeamScope, task_id: str, *, expected_version: int) -> dict[str, Any]:
     where, args = _scope_where(scope)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute(
             f"UPDATE team_tasks SET status='completed',version=version+1,updated_at=? "
@@ -570,7 +569,7 @@ async def complete_task(scope: TeamScope, task_id: str, *, expected_version: int
 
 async def reclaim_task(scope: TeamScope, task_id: str, *, expected_version: int) -> dict[str, Any]:
     where, args = _scope_where(scope)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         # 幂等：任务本来就是 pending 且无人认领时，reclaim 的目标状态已经达成，
         # 直接返回成功。以前这里会落到下面的 CAS 失败分支返回 "conflict"，
@@ -633,7 +632,7 @@ async def bind_task_owner(scope: TeamScope, task_id: str, owner_agent_id: str, *
     otherwise "blocked" only means "blocked if you happen to use task_update".
     """
     where, args = _scope_where(scope)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         if not await _deps_complete(conn, scope, task_id):
             team_event("task_bind_blocked", task_id=task_id, actor=owner_agent_id,
@@ -696,7 +695,7 @@ async def send_message(scope: TeamScope, *, recipient: str, kind: str,
     mid = new_id("tmsg")
     ts = now_ms()
     target = normalize_agent_id(recipient) or str(recipient or "").strip()
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute(
             "INSERT INTO team_messages(message_id,team_id,user_id,session_id,generation_id,"
             "sender_agent_id,recipient_agent_id,kind,content,created_at,state) "
@@ -728,8 +727,8 @@ async def list_messages(scope: TeamScope, *, recipient: str = "",
         sql += " AND read_at=0"
     sql += " ORDER BY created_at ASC LIMIT ?"
     vals.append(max(1, min(int(limit), 500)))
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(sql, vals)
         rows = await cur.fetchall()
     return [dict(r) for r in rows]
@@ -737,7 +736,7 @@ async def list_messages(scope: TeamScope, *, recipient: str = "",
 
 async def mark_message_read(scope: TeamScope, message_id: str) -> bool:
     where, args = _scope_where(scope)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             f"UPDATE team_messages SET read_at=?, state='consumed' "
             f"WHERE message_id=? AND {where} AND read_at=0",
@@ -762,8 +761,8 @@ async def consume_inbox(scope: TeamScope, *, limit: int = 20) -> list[dict[str, 
     target = normalize_agent_id(scope.agent_id) or scope.agent_id
     where, args = _scope_where(scope)
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute("BEGIN IMMEDIATE")
         try:
@@ -816,7 +815,7 @@ async def mark_messages_delivered(scope: TeamScope, message_ids: list[str]) -> i
     where, args = _scope_where(scope)
     placeholders = ",".join("?" for _ in ids)
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             f"UPDATE team_messages SET read_at=?, delivered_at=?, state='consumed' "
             f"WHERE message_id IN ({placeholders}) AND {where} "
@@ -839,8 +838,8 @@ async def pin_name(scope: TeamScope, name: str, agent_id: str) -> dict[str, Any]
     agent = normalize_agent_id(agent_id) or str(agent_id or "").strip()
     if not key or not agent:
         raise ValueError("name and agent_id are required")
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute("BEGIN IMMEDIATE")
         try:
@@ -881,7 +880,7 @@ async def resolve_name(scope: TeamScope, name: str) -> str:
         return ""
     if key in LEAD_ALIASES:
         return LEAD_AGENT_ID
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             "SELECT agent_id FROM team_name_pins WHERE team_id=? AND name=?",
             (scope.team_id, key),
@@ -901,7 +900,7 @@ async def converge_orphaned_active_teams(user_id: str, session_id: str) -> int:
     is no active lease at all.
     """
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute(
             "UPDATE team_runs SET status='stale',updated_at=?,closed_at=? "
@@ -925,7 +924,7 @@ async def recover_stale_runtime(reason: str = "server restart") -> dict[str, int
     an incremented version, invalidating stale CAS holders.
     """
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute("BEGIN IMMEDIATE")
         try:
@@ -953,7 +952,7 @@ async def recover_stale_runtime(reason: str = "server restart") -> dict[str, int
 
 
 async def delete_session_data(user_id: str, session_id: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         for table in ("team_events", "team_messages", "team_task_deps",
                       "team_tasks", "team_runs", "session_generations"):

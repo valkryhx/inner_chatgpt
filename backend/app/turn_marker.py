@@ -38,8 +38,7 @@ from __future__ import annotations
 import time
 from typing import Any, Optional
 
-import aiosqlite
-
+from . import sqlcompat
 from .config import DB_PATH
 
 _CREATE = """
@@ -57,7 +56,7 @@ def now_ms() -> int:
 
 
 async def init_tables() -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.executescript(_CREATE)
@@ -69,7 +68,7 @@ async def mark_crashed(session_id: str, *, last_tool: str = "",
     """记下「这个会话的上一轮被进程崩溃打断」。"""
     if not session_id:
         return
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute(
             "INSERT INTO turn_crash_markers(session_id,last_tool,steps,marked_at) "
@@ -86,8 +85,8 @@ async def get_crash_marker(session_id: str) -> Optional[dict[str, Any]]:
     """读标记；没有则返回 None（这是「可以安全重放」的判据）。"""
     if not session_id:
         return None
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM turn_crash_markers WHERE session_id=?", (session_id,))
         row = await cur.fetchone()
@@ -98,7 +97,7 @@ async def clear_crash_marker(session_id: str) -> None:
     """一轮正常结束后清掉。幂等。"""
     if not session_id:
         return
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute(
             "DELETE FROM turn_crash_markers WHERE session_id=?", (session_id,))
         await conn.commit()
@@ -113,8 +112,8 @@ async def mark_all_unfinished_crashed(reason: str = "server restart") -> int:
 
     返回标记数量（启动日志用）。
     """
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute("PRAGMA busy_timeout=5000;")
         cur = await conn.execute(
             "SELECT DISTINCT session_id FROM messages "

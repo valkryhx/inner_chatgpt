@@ -9,16 +9,15 @@ from __future__ import annotations
 
 from typing import Any
 
-import aiosqlite
-
+from . import sqlcompat
 from .scope import TeamScope
 from .team_store import TASK_STATUSES, new_id
 
 
 async def copy_resume_taskboard(
-    conn: aiosqlite.Connection, scope: TeamScope, ts: int
+    conn: sqlcompat.Connection, scope: TeamScope, ts: int
 ) -> dict[str, Any] | None:
-    conn.row_factory = aiosqlite.Row
+    conn.row_factory = sqlcompat.Row
     cur = await conn.execute(
         "SELECT r.team_id,r.generation_id FROM team_runs r "
         "WHERE r.user_id=? AND r.session_id=? AND r.team_id<>? "

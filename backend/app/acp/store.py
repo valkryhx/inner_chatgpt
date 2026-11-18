@@ -17,8 +17,7 @@ from __future__ import annotations
 import time
 from typing import Any, Optional
 
-import aiosqlite
-
+from .. import sqlcompat
 from ..config import DB_PATH
 
 _TABLE = """
@@ -47,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_ga_runs_owner
 
 async def init_tables() -> None:
     """幂等建表；与其它侧链表一起在启动时调用。"""
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.executescript(_TABLE)
@@ -71,7 +70,7 @@ async def save_result(
     prompts: int = 0,
 ) -> None:
     """写入 / 覆盖一条 GA 结果快照。``agent_id`` 是主键，重复调用即更新。"""
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute(
             "INSERT INTO ga_runs(agent_id,user_id,session_id,generation_id,title,status,"
             "result_text,full_text,error,stop_reason,tool_calls,prompts,updated_at) "
@@ -94,8 +93,8 @@ async def save_result(
 
 async def load_result(agent_id: str) -> Optional[dict[str, Any]]:
     """按 agent_id 读回快照；不存在返回 ``None``。"""
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         async with conn.execute(
             "SELECT * FROM ga_runs WHERE agent_id=?", (agent_id,)
         ) as cur:
@@ -105,7 +104,7 @@ async def load_result(agent_id: str) -> Optional[dict[str, Any]]:
 
 async def delete_for_generation(user_id: str, session_id: str, generation_id: str) -> int:
     """清理某个 generation 的全部快照（预留：generation 回收时调用）。"""
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             "DELETE FROM ga_runs WHERE user_id=? AND session_id=? AND generation_id=?",
             (user_id, session_id, generation_id),

@@ -12,8 +12,7 @@ import json
 import time
 from typing import Optional
 
-import aiosqlite
-
+from . import sqlcompat
 from .config import DB_PATH
 
 _CREATE_TABLE = """
@@ -78,7 +77,7 @@ def _strip_volatile(history: list[dict]) -> list[dict]:
 
 class HistoryStore:
     async def init(self) -> None:
-        async with aiosqlite.connect(DB_PATH) as conn:
+        async with sqlcompat.connect(DB_PATH) as conn:
             await conn.execute("PRAGMA journal_mode=WAL;")
             await conn.execute("PRAGMA busy_timeout=5000;")
             # Create only the base table first.  Existing databases may have the
@@ -117,8 +116,8 @@ class HistoryStore:
             owner, sid = "", str(user_id)
         else:
             owner, sid = str(user_id), str(session_id)
-        async with aiosqlite.connect(DB_PATH) as conn:
-            conn.row_factory = aiosqlite.Row
+        async with sqlcompat.connect(DB_PATH) as conn:
+            conn.row_factory = sqlcompat.Row
             cur = await conn.execute(
                 "SELECT history FROM session_history WHERE user_id=? AND session_id=?",
                 (owner, sid),
@@ -139,7 +138,7 @@ class HistoryStore:
             owner, sid, payload = str(user_id), str(session_id_or_history), history
         text = json.dumps(_strip_volatile(payload or []), ensure_ascii=False)
         async with _lock(owner, sid):
-            async with aiosqlite.connect(DB_PATH) as conn:
+            async with sqlcompat.connect(DB_PATH) as conn:
                 await conn.execute("PRAGMA busy_timeout=5000;")
                 await conn.execute(
                     "INSERT INTO session_history(user_id,session_id,history,updated_at) VALUES(?,?,?,?) "
@@ -155,9 +154,9 @@ class HistoryStore:
         else:
             owner, sid, new_messages = str(user_id), str(session_id_or_messages), messages
         async with _lock(owner, sid):
-            async with aiosqlite.connect(DB_PATH) as conn:
+            async with sqlcompat.connect(DB_PATH) as conn:
                 await conn.execute("PRAGMA busy_timeout=5000;")
-                conn.row_factory = aiosqlite.Row
+                conn.row_factory = sqlcompat.Row
                 cur = await conn.execute(
                     "SELECT history FROM session_history WHERE user_id=? AND session_id=?",
                     (owner, sid),
@@ -183,7 +182,7 @@ class HistoryStore:
             owner, sid = "", str(user_id)
         else:
             owner, sid = str(user_id), str(session_id)
-        async with aiosqlite.connect(DB_PATH) as conn:
+        async with sqlcompat.connect(DB_PATH) as conn:
             await conn.execute(
                 "DELETE FROM session_history WHERE user_id=? AND session_id=?", (owner, sid)
             )
@@ -194,7 +193,7 @@ class HistoryStore:
             owner, sid = "", str(user_id)
         else:
             owner, sid = str(user_id), str(session_id)
-        async with aiosqlite.connect(DB_PATH) as conn:
+        async with sqlcompat.connect(DB_PATH) as conn:
             cur = await conn.execute(
                 "SELECT 1 FROM session_history WHERE user_id=? AND session_id=?", (owner, sid)
             )

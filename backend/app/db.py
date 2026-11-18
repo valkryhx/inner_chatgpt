@@ -11,8 +11,7 @@ import secrets
 import time
 from typing import Any, Optional
 
-import aiosqlite
-
+from . import sqlcompat
 from .config import DB_PATH
 
 _SCHEMA = """
@@ -108,7 +107,7 @@ def new_id(prefix: str) -> str:
 
 async def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.executescript(_SCHEMA)
         # 旧库迁移：user_llm_configs 增加压缩阈值列（幂等）。
@@ -211,7 +210,7 @@ async def _mark_crashed_before_converge(conn) -> int:
     return len(sessions)
 
 
-def _row_to_session(row: aiosqlite.Row) -> dict[str, Any]:
+def _row_to_session(row: sqlcompat.Row) -> dict[str, Any]:
     d = dict(row)
     d["pinned"] = bool(d.get("pinned"))
     d["archived"] = bool(d.get("archived"))
@@ -242,7 +241,7 @@ def _normalize_legacy_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any
     return [b for b in blocks if b.get("type") != "text"] + [blocks[0]]
 
 
-def _row_to_message(row: aiosqlite.Row) -> dict[str, Any]:
+def _row_to_message(row: sqlcompat.Row) -> dict[str, Any]:
     d = dict(row)
     try:
         d["blocks"] = _normalize_legacy_blocks(json.loads(d.get("blocks") or "[]"))
@@ -254,8 +253,8 @@ def _row_to_message(row: aiosqlite.Row) -> dict[str, Any]:
 async def create_session(user_id: str, title: str = "新会话", model_id: str = "", provider: str = "") -> dict[str, Any]:
     sid = new_id("co")
     ts = now_ms()
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute(
             "INSERT INTO sessions(id,user_id,title,model_id,provider,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
             (sid, user_id, title or "新会话", model_id, provider, ts, ts),
@@ -267,8 +266,8 @@ async def create_session(user_id: str, title: str = "新会话", model_id: str =
 
 
 async def list_sessions(user_id: str, limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], bool]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM sessions WHERE user_id=? AND archived=0 ORDER BY updated_at DESC LIMIT ? OFFSET ?",
             (user_id, limit + 1, offset),
@@ -279,8 +278,8 @@ async def list_sessions(user_id: str, limit: int = 50, offset: int = 0) -> tuple
 
 
 async def get_session(session_id: str, user_id: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute("SELECT * FROM sessions WHERE id=? AND user_id=?", (session_id, user_id))
         row = await cur.fetchone()
     return _row_to_session(row) if row else None
@@ -304,8 +303,8 @@ async def update_session(session_id: str, user_id: str, **fields: Any) -> Option
     sets.append("updated_at=?")
     vals.append(now_ms())
     vals.extend([session_id, user_id])
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id=? AND user_id=?", vals)
         await conn.commit()
         cur = await conn.execute("SELECT * FROM sessions WHERE id=? AND user_id=?", (session_id, user_id))
@@ -314,7 +313,7 @@ async def update_session(session_id: str, user_id: str, **fields: Any) -> Option
 
 
 async def delete_session(session_id: str, user_id: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute("DELETE FROM sessions WHERE id=? AND user_id=?", (session_id, user_id))
         deleted = cur.rowcount > 0
         if deleted:
@@ -329,8 +328,8 @@ async def add_message(session_id: str, role: str, content: str = "", reasoning: 
     mid = message_id or new_id("msg")
     ts = now_ms()
     blocks_json = json.dumps(blocks or [], ensure_ascii=False)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute(
             "INSERT INTO messages(id,session_id,role,content,reasoning,blocks,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
             (mid, session_id, role, content, reasoning, blocks_json, status, ts),
@@ -355,14 +354,14 @@ async def update_message(message_id: str, **fields: Any) -> None:
     if not sets:
         return
     vals.append(message_id)
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute(f"UPDATE messages SET {', '.join(sets)} WHERE id=?", vals)
         await conn.commit()
 
 
 async def list_messages(session_id: str) -> list[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM messages WHERE session_id=? ORDER BY created_at ASC, rowid ASC", (session_id,)
         )
@@ -429,8 +428,8 @@ async def search_messages(
     sql += " ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?"
     params.append(limit + 1)
 
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(sql, params)
         rows = await cur.fetchall()
 
@@ -456,7 +455,7 @@ async def search_messages(
 
 async def mark_stale_streaming_stopped(session_id: str) -> int:
     """把某会话内遗留的 assistant streaming 消息收敛为 stopped（调用方需自行确认无活跃生成）。"""
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             "UPDATE messages SET status='stopped' WHERE session_id=? AND role='assistant' AND status='streaming'",
             (session_id,),
@@ -466,14 +465,14 @@ async def mark_stale_streaming_stopped(session_id: str) -> int:
 
 
 async def count_messages(session_id: str) -> int:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute("SELECT COUNT(*) FROM messages WHERE session_id=?", (session_id,))
         row = await cur.fetchone()
     return int(row[0]) if row else 0
 
 
 # ---------------- users ----------------
-def _row_to_user(row: aiosqlite.Row) -> dict[str, Any]:
+def _row_to_user(row: sqlcompat.Row) -> dict[str, Any]:
     d = dict(row)
     d.pop("password_hash", None)
     return d
@@ -485,8 +484,8 @@ async def create_user(email: str, password_hash: str, name: str = "", role: str 
     ts = now_ms()
     email = email.lower().strip()
     uname = (username or "").strip().lower() or email.split("@")[0]
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute(
             "INSERT INTO users(id,email,username,password_hash,name,role,status,token_ver,created_at) "
             "VALUES(?,?,?,?,?,?,?,?,?)",
@@ -499,16 +498,16 @@ async def create_user(email: str, password_hash: str, name: str = "", role: str 
 
 
 async def get_user(user_id: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute("SELECT * FROM users WHERE id=?", (user_id,))
         row = await cur.fetchone()
     return _row_to_user(row) if row else None
 
 
 async def get_user_with_hash_by_email(email: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute("SELECT * FROM users WHERE email=?", (email.lower().strip(),))
         row = await cur.fetchone()
     return dict(row) if row else None
@@ -523,8 +522,8 @@ async def get_user_with_hash_by_identifier(identifier: str) -> Optional[dict[str
     ident = (identifier or "").strip().lower()
     if not ident:
         return None
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         if "@" in ident:
             cur = await conn.execute("SELECT * FROM users WHERE email=?", (ident,))
         else:
@@ -544,7 +543,7 @@ async def get_user_with_hash_by_identifier(identifier: str) -> Optional[dict[str
 
 
 async def username_exists(username: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             "SELECT 1 FROM users WHERE lower(username)=? LIMIT 1", (username.strip().lower(),)
         )
@@ -552,7 +551,7 @@ async def username_exists(username: str) -> bool:
 
 
 async def email_exists(email: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute(
             "SELECT 1 FROM users WHERE email=? LIMIT 1", (email.strip().lower(),)
         )
@@ -560,7 +559,7 @@ async def email_exists(email: str) -> bool:
 
 
 async def count_users() -> int:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute("SELECT COUNT(*) FROM users")
         row = await cur.fetchone()
     return int(row[0]) if row else 0
@@ -568,7 +567,7 @@ async def count_users() -> int:
 
 # ---------------- refresh tokens ----------------
 async def add_refresh_token(jti: str, user_id: str, expires_at: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute(
             "INSERT INTO refresh_tokens(jti,user_id,expires_at,revoked,created_at) VALUES(?,?,?,0,?)",
             (jti, user_id, expires_at, now_ms()),
@@ -577,15 +576,15 @@ async def add_refresh_token(jti: str, user_id: str, expires_at: int) -> None:
 
 
 async def get_refresh_token(jti: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute("SELECT * FROM refresh_tokens WHERE jti=?", (jti,))
         row = await cur.fetchone()
     return dict(row) if row else None
 
 
 async def revoke_refresh_token(jti: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
         await conn.commit()
 
@@ -602,15 +601,15 @@ def _opt_int(v: Any) -> Optional[int]:
     return n if n > 0 else None
 
 
-def _row_to_llm(row: aiosqlite.Row) -> dict[str, Any]:
+def _row_to_llm(row: sqlcompat.Row) -> dict[str, Any]:
     d = dict(row)
     d["is_default"] = bool(d.get("is_default"))
     return d
 
 
 async def list_llm_configs(user_id: str) -> list[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM user_llm_configs WHERE user_id=? ORDER BY is_default DESC, created_at ASC", (user_id,)
         )
@@ -619,8 +618,8 @@ async def list_llm_configs(user_id: str) -> list[dict[str, Any]]:
 
 
 async def get_llm_config(user_id: str, config_id: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM user_llm_configs WHERE id=? AND user_id=?", (config_id, user_id)
         )
@@ -639,8 +638,8 @@ async def get_default_llm_config(user_id: str) -> Optional[dict[str, Any]]:
 
     "可用" = 有 api_key + model + base_url。
     """
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM user_llm_configs WHERE user_id=? AND is_default=1 LIMIT 1", (user_id,)
         )
@@ -675,8 +674,8 @@ async def create_llm_config(user_id: str, **f: Any) -> dict[str, Any]:
     cid = new_id("llm")
     ts = now_ms()
     is_default = 1 if f.get("is_default") else 0
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         if is_default:
             await conn.execute("UPDATE user_llm_configs SET is_default=0 WHERE user_id=?", (user_id,))
         await conn.execute(
@@ -709,8 +708,8 @@ async def update_llm_config(user_id: str, config_id: str, **f: Any) -> Optional[
     sets.append("updated_at=?")
     vals.append(now_ms())
     vals.extend([config_id, user_id])
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         if f.get("is_default"):
             await conn.execute("UPDATE user_llm_configs SET is_default=0 WHERE user_id=?", (user_id,))
         await conn.execute(f"UPDATE user_llm_configs SET {', '.join(sets)} WHERE id=? AND user_id=?", vals)
@@ -721,14 +720,14 @@ async def update_llm_config(user_id: str, config_id: str, **f: Any) -> Optional[
 
 
 async def delete_llm_config(user_id: str, config_id: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute("DELETE FROM user_llm_configs WHERE id=? AND user_id=?", (config_id, user_id))
         await conn.commit()
     return cur.rowcount > 0
 
 
 # ---------------- user mcp servers ----------------
-def _row_to_mcp(row: aiosqlite.Row) -> dict[str, Any]:
+def _row_to_mcp(row: sqlcompat.Row) -> dict[str, Any]:
     d = dict(row)
     d["enabled"] = bool(d.get("enabled"))
     for k, default in (("headers", {}), ("env", {}), ("args", [])):
@@ -740,8 +739,8 @@ def _row_to_mcp(row: aiosqlite.Row) -> dict[str, Any]:
 
 
 async def list_mcp_servers(user_id: str) -> list[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM user_mcp_servers WHERE user_id=? ORDER BY created_at ASC", (user_id,)
         )
@@ -750,8 +749,8 @@ async def list_mcp_servers(user_id: str) -> list[dict[str, Any]]:
 
 
 async def get_mcp_server(user_id: str, server_id: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute(
             "SELECT * FROM user_mcp_servers WHERE id=? AND user_id=?", (server_id, user_id)
         )
@@ -768,8 +767,8 @@ async def create_mcp_server(user_id: str, **f: Any) -> dict[str, Any]:
             v = default
         return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
 
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute(
             "INSERT INTO user_mcp_servers(id,user_id,name,transport,command,args,url,headers,env,enabled,created_at,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -800,8 +799,8 @@ async def update_mcp_server(user_id: str, server_id: str, **f: Any) -> Optional[
     sets.append("updated_at=?")
     vals.append(now_ms())
     vals.extend([server_id, user_id])
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         await conn.execute(f"UPDATE user_mcp_servers SET {', '.join(sets)} WHERE id=? AND user_id=?", vals)
         await conn.commit()
         cur = await conn.execute("SELECT * FROM user_mcp_servers WHERE id=? AND user_id=?", (server_id, user_id))
@@ -810,15 +809,15 @@ async def update_mcp_server(user_id: str, server_id: str, **f: Any) -> Optional[
 
 
 async def delete_mcp_server(user_id: str, server_id: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with sqlcompat.connect(DB_PATH) as conn:
         cur = await conn.execute("DELETE FROM user_mcp_servers WHERE id=? AND user_id=?", (server_id, user_id))
         await conn.commit()
     return cur.rowcount > 0
 
 
 async def get_message(message_id: str) -> Optional[dict[str, Any]]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with sqlcompat.connect(DB_PATH) as conn:
+        conn.row_factory = sqlcompat.Row
         cur = await conn.execute("SELECT * FROM messages WHERE id=?", (message_id,))
         row = await cur.fetchone()
     return _row_to_message(row) if row else None
