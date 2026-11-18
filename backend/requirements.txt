@@ -24,6 +24,9 @@ aiosqlite==0.22.0
 # PostgreSQL backend (optional). Only imported when HLZ_DB_URL points at
 # postgres; the SQLite path never touches it. See docs/20261119-*.md
 asyncpg==0.31.0
+# Multi-instance coordination (optional). Only imported when HLZ_REDIS_URL is
+# set; single-instance deployments degrade to in-process locks. See app/cluster/.
+redis==6.4.0
 pydantic==2.14.1
 # 从仓库根 .env 加载环境变量（backend/app/__init__.py 里最先执行）
 python-dotenv==1.2.2
