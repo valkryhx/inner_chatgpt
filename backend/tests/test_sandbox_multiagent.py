@@ -211,3 +211,74 @@ def test_write_file_uses_user_root_as_mount(ws_root=None, monkeypatch=None):
         wsmod.SANDBOX_WORKSPACE_USERS = old_users
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_manager_concurrent_agents_use_separate_dirs():
+    """走 manager 层的并发测试：多个 agent 的 cwd/产物必须各自隔离。
+
+    为什么要这条（真机测试已覆盖但不够）：真机测试直接调 runtime，
+    传什么参数由测试自己决定 —— 如果 manager 层传错了，真机测试照样绿。
+    这条强制走 manager，验证它真的把 write_root 换算对了。
+    """
+    import asyncio as _a
+    import pathlib
+    import tempfile
+    from app.sandbox import config as _cfg
+    from app.sandbox.manager import SandboxManager
+    import app.workspace as wsmod
+
+    tmp = pathlib.Path(tempfile.mkdtemp())
+    old = (wsmod.WORKSPACES_DIR, wsmod.SANDBOX_WORKSPACES_DIR,
+           wsmod.SANDBOX_WORKSPACE_USERS)
+    wsmod.WORKSPACES_DIR = tmp
+    wsmod.SANDBOX_WORKSPACES_DIR = tmp
+    wsmod.SANDBOX_WORKSPACE_USERS = ("u_x",)
+    try:
+        seen: list[dict] = []
+
+        class RT:
+            def exec_python(self, cid, code, *, timeout_s, cwd="/ws",
+                            host_workspace="", container_workspace=""):
+                seen.append({"cwd": cwd, "host": host_workspace,
+                             "mount": container_workspace})
+                async def _go():
+                    return sbx_runtime.ExecResult(0, "ok", "mk")
+                return _go()
+
+        class P:
+            runtime = RT()
+
+            async def acquire(self, uid, mount):
+                return sbx_pool.ContainerEntry(
+                    user_id=uid, container_id="c1", created_at=0, last_used=0,
+                    in_flight=1, host_workspace=mount)
+
+            async def release(self, entry):
+                return None
+
+        cfg = _cfg.SandboxConfig(mode="strict", mvp_users=("u_x",))
+        mgr = SandboxManager(cfg=cfg, pool=P())
+
+        async def one(agent: str):
+            await mgr.exec_code("u_x", f"print('{agent}')",
+                                root=f".subagents/s/{agent}")
+
+        async def _run_all():
+            await _a.gather(*[one(a) for a in ("a1", "a2", "a3")])
+
+        _a.run(_run_all())
+
+        assert len(seen) == 3
+        root = str(tmp / "u_x")
+        for rec, agent in zip(seen, ("a1", "a2", "a3")):
+            assert rec["mount"] == root, (
+                f"{agent} 的挂载点应是用户根 {root}，实际 {rec['mount']}")
+            assert rec["cwd"] == f"/ws/.subagents/s/{agent}", (
+                f"{agent} 的 cwd 错了：{rec['cwd']}")
+            assert ".subagents" in rec["host"] and agent in rec["host"], (
+                f"{agent} 的脚本落盘路径不对：{rec['host']}")
+    finally:
+        wsmod.WORKSPACES_DIR, wsmod.SANDBOX_WORKSPACES_DIR, \
+            wsmod.SANDBOX_WORKSPACE_USERS = old
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
