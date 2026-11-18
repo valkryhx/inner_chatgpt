@@ -17,6 +17,8 @@ from app import workspace
 from app.sandbox import config as sbx_config
 from app.sandbox import manager as sbx_manager
 from app.sandbox import policy as sbx_policy
+from app.sandbox import pool as sbx_pool
+from app.sandbox import runtime as sbx_runtime
 
 
 def run(coro):
@@ -206,3 +208,84 @@ def test_sandbox_exception_falls_back(ws_root, monkeypatch):
     t = tools_for("u_mvp")
     out = call(t["code_run"], code="print('survived')")
     assert "survived" in out, "沙箱异常后工具仍要能跑"
+
+# ---------------- 可观测性：分流必须留痕（自测/排查的唯一判据） ----------------
+
+
+def test_sandbox_path_emits_log(ws_root, monkeypatch, caplog):
+    """走沙箱时必须打一条 INFO 日志，写明工具/用户/去向。
+
+    为什么必须有：沙箱生效时**工具结果和用户界面完全看不出来**——
+    code_run 的输出一样、file_write 的文案一样。没有日志，
+    「到底走没走沙箱」只能靠猜，自测和线上排查都会失去判据。
+
+    这里**不用 fake_manager**：留痕是 SandboxManager 自己的行为，
+    换成假 manager 就测不到了。改为真实 manager + 假 pool/runtime。
+    """
+    import logging
+
+    monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
+    monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
+    sbx_config.get_config(reload=True)
+    monkeypatch.setattr(app_config, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
+
+    # 假 runtime：exec 直接返回固定结果，不起容器
+    class FakeRuntime:
+        def exec_python(self, cid, code, *, timeout_s, cwd="/ws", host_workspace=""):
+            async def _go():
+                return sbx_runtime.ExecResult(0, "container-output", "mk")
+            return _go()
+
+    class FakePool:
+        runtime = FakeRuntime()
+
+        async def acquire(self, uid, host_ws):
+            return sbx_pool.ContainerEntry(
+                user_id=uid, container_id="abc123456789", created_at=0, last_used=0,
+                in_flight=1, host_workspace=host_ws)
+
+        async def release(self, entry):
+            return None
+
+    real_mgr = sbx_manager.SandboxManager(cfg=sbx_config.get_config(), pool=FakePool())
+    monkeypatch.setattr(sbx_manager, "get_manager", lambda **_kw: real_mgr)
+
+    with caplog.at_level(logging.INFO, logger="app.sandbox"):
+        t = tools_for("u_mvp")
+        out = call(t["code_run"], code="print(1)")
+
+    assert out == "container-output"
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("沙箱分流" in m and "code_run" in m and "u_mvp" in m for m in msgs), \
+        f"走沙箱没有留痕，日志={msgs!r}"
+
+
+def test_in_process_path_emits_no_sandbox_log(ws_root, monkeypatch, caplog):
+    """不白名单的用户不该产生任何沙箱日志（负对照）。"""
+    import logging
+
+    monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
+    monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
+    sbx_config.get_config(reload=True)
+    monkeypatch.setattr(app_config, "SANDBOX_WORKSPACE_USERS", ())
+
+    with caplog.at_level(logging.INFO, logger="app.sandbox"):
+        t = tools_for("u_other")
+        call(t["code_run"], code="print('local')")
+
+    assert not [r for r in caplog.records if "code_run" in r.getMessage()], \
+        "白名单外用户不该产生沙箱日志"
+
+
+def test_off_mode_emits_no_sandbox_log(ws_root, monkeypatch, caplog):
+    """off 模式零日志 —— 这是「零影响」的一部分。"""
+    import logging
+
+    monkeypatch.setenv("HLZ_SANDBOX_MODE", "off")
+    sbx_config.get_config(reload=True)
+
+    with caplog.at_level(logging.INFO, logger="app.sandbox"):
+        t = tools_for("u_mvp")
+        call(t["code_run"], code="print('off')")
+
+    assert not [r for r in caplog.records if "code_run" in r.getMessage()]

@@ -101,6 +101,21 @@ class SandboxManager:
         logger.warning("沙箱降级（mode=auto）：%s", reason)
         return DEGRADED_PREFIX.format(reason=reason)
 
+    # ---------------- 可观测性 ----------------
+
+    def _log_routed(self, tool: str, user_id: str, target: str, detail: str = "") -> None:
+        """记录一次分流去向。
+
+        沙箱生效时**工具结果和用户界面完全看不出来** —— `code_run` 的输出一样、
+        `file_write` 的文案一样。没有这条日志，「到底走没走沙箱」只能靠猜，
+        自测和线上排查都会失去判据。
+
+        用固定前缀 ``沙箱分流`` 便于 grep：
+            grep '沙箱分流' backend/data/logs/*.log
+        """
+        logger.info("沙箱分流 tool=%s user=%s -> %s%s",
+                    tool, user_id, target, f"（{detail}）" if detail else "")
+
     # ---------------- code_run ----------------
 
     async def exec_code(
@@ -140,6 +155,8 @@ class SandboxManager:
         try:
             entry = await self.pool.acquire(user_id, host_ws)
             timeout_s = min(float(timeout or 60), self.cfg.exec_timeout_s)
+            self._log_routed("code_run", user_id, f"container {entry.container_id[:12]}",
+                             f"{ctype}, timeout={timeout_s:.0f}s")
             if ctype in _PY_TYPES:
                 res = await self.pool.runtime.exec_python(
                     entry.container_id, code, timeout_s=timeout_s, host_workspace=host_ws
@@ -232,6 +249,8 @@ class SandboxManager:
         entry = None
         try:
             entry = await self.pool.acquire(user_id, host_ws)
+            self._log_routed("file_write", user_id, f"container {entry.container_id[:12]}",
+                             f"{rel}, mode={mode}")
             res = await self.pool.runtime.exec_python(
                 entry.container_id, code, timeout_s=60.0, host_workspace=host_ws
             )
@@ -302,6 +321,8 @@ class SandboxManager:
         entry = None
         try:
             entry = await self.pool.acquire(user_id, host_ws)
+            self._log_routed("file_patch", user_id, f"container {entry.container_id[:12]}",
+                             f"{rel}, 1 处替换")
             res = await self.pool.runtime.exec_python(
                 entry.container_id, code, timeout_s=60.0, host_workspace=host_ws
             )
