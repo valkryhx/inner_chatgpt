@@ -147,7 +147,8 @@ class ContainerRuntime:
         *,
         timeout_s: float,
         cwd: str = WORKSPACE_MOUNT,
-        host_workspace: str = "",
+        host_workspace: str,
+        container_workspace: str = "",
     ) -> ExecResult:
         """在容器内执行一段 Python 代码。
 
@@ -160,21 +161,48 @@ class ContainerRuntime:
         | ``put_archive`` 写容器内 ``/tmp`` | ❌ **tmpfs 上的 archive 解包失效**：返回 True 但 `ls` 为空 |
         | **写宿主 workspace 下的临时文件（bind mount 双向可见）** | ✅ 稳定 |
 
-        临时目录放在 workspace 的 ``.hlz_tmp/`` 下并**执行完立即删除**。
-        这会在用户的 ``list_files`` 里短暂出现，但 ``.`` 前缀已被项目惯例用作隐藏目录
-        （``.subagents`` / ``.tmp``），且清理在 finally 里，正常路径不留痕。
+        **两个 host 路径参数的区别（多智能体的正确性关键）**：
+
+        - ``host_workspace``: 脚本**真正写到**的宿主目录（含子代理的 write_root）。
+          如 ``D:\\sandbox\\u_a\\.subagents\\sess\\a1``
+        - ``container_workspace``: 容器 ``/ws`` **挂载的**宿主根目录。
+          如 ``D:\\sandbox\\u_a``
+
+        容器只挂根目录（见 ``manager._mount_root`` 的说明），所以脚本的
+        容器内路径必须由「相对根目录的子路径」算出来，不能直接取
+        ``WORKSPACE_MOUNT + 文件名``。
+
+        ``container_workspace`` 为空时退化为「把 host_workspace 当挂载根」，
+        保持向后兼容（单 agent 场景下两者相同）。
         """
         import os
-        import tempfile
 
         if not host_workspace:
             raise SandboxExecError("exec_python 需要 host_workspace（宿主 workspace 路径）")
+
+        mount_root = container_workspace or host_workspace
 
         marker = uuid.uuid4().hex
         host_dir = os.path.join(host_workspace, ".hlz_tmp")
         os.makedirs(host_dir, exist_ok=True)
         host_path = os.path.join(host_dir, f"_hlz_{marker}.py")
-        remote = f"{WORKSPACE_MOUNT}/.hlz_tmp/_hlz_{marker}.py"
+
+        # 容器内路径 = /ws + (脚本相对挂载根的路径)
+        try:
+            rel = os.path.relpath(host_path, mount_root).replace(os.sep, "/")
+        except ValueError:
+            # Windows 上跨盘符会 ValueError —— 说明挂载根与脚本位置不在同一棵树
+            raise SandboxExecError(
+                f"脚本路径 {host_path} 不在挂载根 {mount_root} 之下，"
+                "容器内无法访问（检查 write_root 与容器挂载点是否一致）"
+            ) from None
+        if rel.startswith("../") or rel == "..":
+            raise SandboxExecError(
+                f"脚本路径 {host_path} 不在挂载根 {mount_root} 之下，"
+                "容器内无法访问（检查 write_root 与容器挂载点是否一致）"
+            )
+        remote = f"{WORKSPACE_MOUNT}/{rel}"
+
         with open(host_path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(code)
         try:
@@ -196,7 +224,10 @@ class ContainerRuntime:
     ) -> ExecResult:
         """在容器内执行一段 shell 代码（``sh -c``）。
 
-        ⚠️ ``python:3.12-slim`` 基于 Debian，有 ``bash`` 与 ``sh``；
+        ``cwd`` 决定工作目录。多智能体场景下会传
+        ``/ws/.subagents/<session>/<agent>``，让子代理的相对路径落在自己目录里。
+
+        ⚠️ ``hlz-sandbox`` 基于 Debian，有 ``bash`` 与 ``sh``；
         若换 Alpine 镜像则只有 ``sh``（设计文档 §10.1）。
         """
         marker = uuid.uuid4().hex

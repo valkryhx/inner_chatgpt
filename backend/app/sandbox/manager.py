@@ -25,6 +25,7 @@ from .config import SandboxConfig, get_config
 from .errors import SandboxError, SandboxExecError, SandboxTimeout, SandboxUnavailable
 from . import policy, probe
 from .pool import ContainerPool, get_pool, reap_loop
+from .runtime import WORKSPACE_MOUNT
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +37,44 @@ _PY_TYPES = {"python", "py"}
 _SH_TYPES = {"bash", "sh", "shell"}
 
 
+def _mount_root(user_id: str) -> str:
+    """容器**唯一**挂载的宿主目录：该用户的 workspace 根。
+
+    ⚠️ 这是多智能体正确性的关键约束，不要改成 `write_root`。
+
+    为什么：容器是按 `user_id` 一个（`pool._entries` 的 key 是 user_id），
+    而子代理各有不同的 `write_root`（`.subagents/<session>/<agent>`）。
+    如果容器挂的是某个具体的 write_root，那么：
+      - 主 agent 建容器时挂根目录 → 子代理的脚本写到子目录下，
+        容器里 `/ws/.hlz_tmp/` 找不到（2026-11-18 真机复现：
+        `can't open file '/ws/.hlz_tmp/xxx.py'`）
+      - 子代理建容器时挂子目录 → 主 agent 反而看不到自己的文件
+
+    正确做法：容器**始终**挂用户根目录到 `/ws`，
+    `write_root` 变成容器内的**子路径**（`/ws/.subagents/<sess>/<agent>`）。
+    这样所有 agent 共享一个挂载点、一个容器，且各自目录互不干扰。
+    """
+    from ..workspace import user_workspace
+    return str(user_workspace(user_id))
+
+
+def _container_subpath(user_id: str, root: str = "") -> str:
+    """把 ``write_root`` 换算成容器内的相对路径（相对 /ws）。
+
+    ``""`` -> ``""``（就是 /ws 本身）
+    ``.subagents/s/a1`` -> ``.subagents/s/a1``
+    """
+    if not (root or "").strip():
+        return ""
+    return root.strip().strip("/")
+
+
 def _host_workspace(user_id: str, root: str = "") -> str:
-    """解析宿主的 workspace 绝对路径（与进程内读工具同一套逻辑）。"""
+    """解析宿主的 workspace 绝对路径（与进程内读工具同一套逻辑）。
+
+    注意与 ``_mount_root`` 的区别：这里**带 write_root**，用于把文件
+    真正落到子代理自己的目录；而容器挂载点永远用 ``_mount_root``。
+    """
     from ..workspace import write_root_for
     return str(write_root_for(user_id, root))
 
@@ -150,20 +187,29 @@ class SandboxManager:
                    "请改用 code_type=python 或 sh。")
             return True, msg, ""
 
-        host_ws = _host_workspace(user_id, root)
+        host_ws = _host_workspace(user_id, root)      # 文件真正落哪里（含 write_root）
+        mount = _mount_root(user_id)                  # 容器挂哪个（永远是根）
+        sub = _container_subpath(user_id, root)       # 容器内子路径
         entry = None
         try:
-            entry = await self.pool.acquire(user_id, host_ws)
+            entry = await self.pool.acquire(user_id, mount)
             timeout_s = min(float(timeout or 60), self.cfg.exec_timeout_s)
             self._log_routed("code_run", user_id, f"container {entry.container_id[:12]}",
-                             f"{ctype}, timeout={timeout_s:.0f}s")
+                             f"{ctype}, timeout={timeout_s:.0f}s"
+                             + (f", 子目录={sub}" if sub else ""))
             if ctype in _PY_TYPES:
                 res = await self.pool.runtime.exec_python(
-                    entry.container_id, code, timeout_s=timeout_s, host_workspace=host_ws
+                    entry.container_id, code, timeout_s=timeout_s,
+                    host_workspace=host_ws,    # 脚本落盘位置（含 write_root）
+                    container_workspace=mount,  # 容器里 /ws 对应的宿主根
+                    # cwd 也要跟着子目录走：脚本里 `open("a.txt","w")` 这类
+                    # 相对路径必须落在子代理自己的目录，而不是用户根目录。
+                    cwd=f"{WORKSPACE_MOUNT}/{sub}" if sub else WORKSPACE_MOUNT,
                 )
             elif ctype in _SH_TYPES:
                 res = await self.pool.runtime.exec_shell(
-                    entry.container_id, code, timeout_s=timeout_s
+                    entry.container_id, code, timeout_s=timeout_s,
+                    cwd=f"{WORKSPACE_MOUNT}/{sub}" if sub else WORKSPACE_MOUNT,
                 )
             else:
                 return True, f"[sandbox] 不支持的类型: {code_type}", ""
@@ -241,18 +287,22 @@ class SandboxManager:
             new_text = text
 
         import pathlib
-        host_ws = _host_workspace(user_id, root)
-        rel = target.relative_to(pathlib.Path(host_ws)).as_posix()
-        remote = f"/ws/{rel}"
+        host_ws = _host_workspace(user_id, root)      # 含 write_root，文件落这里
+        mount = _mount_root(user_id)                  # 容器挂这里（永远是根）
+        # 容器内路径必须相对**挂载根**算，不是相对 host_ws ——
+        # 否则子代理的 write_root 会被算两遍（/ws/.subagents/.../.subagents/...）
+        rel = target.relative_to(pathlib.Path(mount)).as_posix()
+        remote = f"{WORKSPACE_MOUNT}/{rel}"
 
         code = _write_py(remote, new_text)
         entry = None
         try:
-            entry = await self.pool.acquire(user_id, host_ws)
+            entry = await self.pool.acquire(user_id, mount)
             self._log_routed("file_write", user_id, f"container {entry.container_id[:12]}",
                              f"{rel}, mode={mode}")
             res = await self.pool.runtime.exec_python(
-                entry.container_id, code, timeout_s=60.0, host_workspace=host_ws
+                entry.container_id, code, timeout_s=60.0,
+                host_workspace=host_ws, container_workspace=mount,
             )
             if res.exit_code != 0:
                 return True, f"错误：写入失败（exit={res.exit_code}）\n{res.stdout}"
@@ -315,18 +365,20 @@ class SandboxManager:
         updated = full.replace(old_content, new_content, 1)
 
         import pathlib
-        host_ws = _host_workspace(user_id, root)
-        rel = target.relative_to(pathlib.Path(host_ws)).as_posix()
-        remote = f"/ws/{rel}"
+        host_ws = _host_workspace(user_id, root)      # 含 write_root
+        mount = _mount_root(user_id)                  # 容器挂载根
+        rel = target.relative_to(pathlib.Path(mount)).as_posix()
+        remote = f"{WORKSPACE_MOUNT}/{rel}"
 
         code = _write_py(remote, updated)
         entry = None
         try:
-            entry = await self.pool.acquire(user_id, host_ws)
+            entry = await self.pool.acquire(user_id, mount)
             self._log_routed("file_patch", user_id, f"container {entry.container_id[:12]}",
                              f"{rel}, 1 处替换")
             res = await self.pool.runtime.exec_python(
-                entry.container_id, code, timeout_s=60.0, host_workspace=host_ws
+                entry.container_id, code, timeout_s=60.0,
+                host_workspace=host_ws, container_workspace=mount,
             )
             if res.exit_code != 0:
                 return True, f"错误：修改失败（exit={res.exit_code}）\n{res.stdout}"

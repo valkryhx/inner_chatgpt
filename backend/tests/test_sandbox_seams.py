@@ -231,7 +231,7 @@ def test_sandbox_path_emits_log(ws_root, monkeypatch, caplog):
 
     # 假 runtime：exec 直接返回固定结果，不起容器
     class FakeRuntime:
-        def exec_python(self, cid, code, *, timeout_s, cwd="/ws", host_workspace=""):
+        def exec_python(self, cid, code, *, timeout_s, cwd="/ws", host_workspace="", container_workspace=""):
             async def _go():
                 return sbx_runtime.ExecResult(0, "container-output", "mk")
             return _go()
@@ -296,7 +296,7 @@ def test_off_mode_emits_no_sandbox_log(ws_root, monkeypatch, caplog):
 
 def _fake_pool():
     class FakeRuntime:
-        def exec_python(self, cid, code, *, timeout_s, cwd="/ws", host_workspace=""):
+        def exec_python(self, cid, code, *, timeout_s, cwd="/ws", host_workspace="", container_workspace=""):
             async def _go():
                 return sbx_runtime.ExecResult(0, "", "mk")
             return _go()
