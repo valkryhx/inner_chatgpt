@@ -31,6 +31,16 @@ logger = logging.getLogger(__name__)
 # 降级标记（会出现在工具结果首行，满足"绝不静默"）
 DEGRADED_PREFIX = "[sandbox] 本次未隔离：{reason}（当前模式 auto）"
 
+# 成功路径的容器标识。
+#
+# 为什么必须有：返回文案里的路径是**宿主**路径（``D:\sandbox\<uid>\...``），
+# 用户看到 ``D:\`` 会以为是在 Windows 宿主机上直接写的，从而怀疑沙箱没生效
+# （2026-11-18 用户自测时实际发生，是设计缺陷不是误解）。
+#
+# 路径必须保留 —— 模型靠它定位文件、也是用户在宿主机上找文件的依据；
+# 所以不是替换路径，而是补一个后缀说明执行位置。
+CONTAINER_NOTE = "沙箱容器内"
+
 # 容器内 shell 支持的类型（设计文档 §10.1）
 _PY_TYPES = {"python", "py"}
 _SH_TYPES = {"bash", "sh", "shell"}
@@ -256,8 +266,10 @@ class SandboxManager:
             )
             if res.exit_code != 0:
                 return True, f"错误：写入失败（exit={res.exit_code}）\n{res.stdout}"
-            # 返回文案与进程内路径保持一致（契约不变，设计文档 §7.2）
-            return True, f"已写入 {target}（{len(new_text)} 字符，mode={mode}）"
+            # 返回文案与进程内路径保持一致（契约不变，设计文档 §7.2），
+            # 但必须补上执行位置标识 —— 否则用户看到宿主 D:\ 路径会以为没走沙箱。
+            return True, (f"已写入 {target}（{len(new_text)} 字符，mode={mode}，"
+                          f"{CONTAINER_NOTE}）")
         except SandboxUnavailable as exc:
             return False, self._handle_unavailable(exc.reason)
         except SandboxError as exc:
@@ -328,7 +340,7 @@ class SandboxManager:
             )
             if res.exit_code != 0:
                 return True, f"错误：修改失败（exit={res.exit_code}）\n{res.stdout}"
-            return True, f"已局部修改 {target}（替换 1 处）"
+            return True, f"已局部修改 {target}（替换 1 处，{CONTAINER_NOTE}）"
         except SandboxUnavailable as exc:
             return False, self._handle_unavailable(exc.reason)
         except SandboxError as exc:

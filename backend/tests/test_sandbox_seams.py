@@ -227,7 +227,7 @@ def test_sandbox_path_emits_log(ws_root, monkeypatch, caplog):
     monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
     monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
     sbx_config.get_config(reload=True)
-    monkeypatch.setattr(app_config, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
+    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
 
     # 假 runtime：exec 直接返回固定结果，不起容器
     class FakeRuntime:
@@ -267,7 +267,7 @@ def test_in_process_path_emits_no_sandbox_log(ws_root, monkeypatch, caplog):
     monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
     monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
     sbx_config.get_config(reload=True)
-    monkeypatch.setattr(app_config, "SANDBOX_WORKSPACE_USERS", ())
+    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ())
 
     with caplog.at_level(logging.INFO, logger="app.sandbox"):
         t = tools_for("u_other")
@@ -289,3 +289,86 @@ def test_off_mode_emits_no_sandbox_log(ws_root, monkeypatch, caplog):
         call(t["code_run"], code="print('off')")
 
     assert not [r for r in caplog.records if "code_run" in r.getMessage()]
+
+
+def test_sandbox_write_result_marks_container(ws_root, monkeypatch):
+    """沙箱内写文件的返回文案必须能看出「这是在容器里执行的」。
+
+    为什么：文案里的路径是**宿主**路径（D:\sandbox\<uid>\...），
+    用户看到 `D:\` 会以为是在 Windows 宿主机上直接写的，从而怀疑沙箱没生效
+    （2026-11-18 用户自测时实际发生）。路径要保留（模型需要知道文件在哪），
+    但必须补一个容器标识。
+    """
+    monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
+    monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
+    sbx_config.get_config(reload=True)
+    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
+
+    class FakeRuntime:
+        def exec_python(self, cid, code, *, timeout_s, cwd="/ws", host_workspace=""):
+            async def _go():
+                return sbx_runtime.ExecResult(0, "", "mk")
+            return _go()
+
+    class FakePool:
+        runtime = FakeRuntime()
+
+        async def acquire(self, uid, host_ws):
+            return sbx_pool.ContainerEntry(
+                user_id=uid, container_id="abc123456789", created_at=0, last_used=0,
+                in_flight=1, host_workspace=host_ws)
+
+        async def release(self, entry):
+            return None
+
+    mgr = sbx_manager.SandboxManager(cfg=sbx_config.get_config(), pool=FakePool())
+    monkeypatch.setattr(sbx_manager, "get_manager", lambda **_kw: mgr)
+
+    t = tools_for("u_mvp")
+    out = call(t["file_write"], path="mark.txt", content="hi")
+
+    assert "已写入" in out, out
+    assert "沙箱" in out or "容器" in out, f"文案没有容器标识，用户会误判：{out!r}"
+    # 路径仍要保留（模型靠它定位文件）
+    assert "mark.txt" in out
+
+
+def test_sandbox_patch_result_marks_container(ws_root, monkeypatch):
+    """patch 同理。"""
+    monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
+    monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
+    sbx_config.get_config(reload=True)
+    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
+
+    base = ws_root / "sandbox" / "u_mvp"
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "p.txt").write_text("old-text", encoding="utf-8")
+
+    class FakeRuntime:
+        def exec_python(self, cid, code, *, timeout_s, cwd="/ws", host_workspace=""):
+            async def _go():
+                return sbx_runtime.ExecResult(0, "", "mk")
+            return _go()
+
+    class FakePool:
+        runtime = FakeRuntime()
+
+        async def acquire(self, uid, host_ws):
+            return sbx_pool.ContainerEntry(
+                user_id=uid, container_id="abc123456789", created_at=0, last_used=0,
+                in_flight=1, host_workspace=host_ws)
+
+        async def release(self, entry):
+            return None
+
+    mgr = sbx_manager.SandboxManager(cfg=sbx_config.get_config(), pool=FakePool())
+    monkeypatch.setattr(sbx_manager, "get_manager", lambda **_kw: mgr)
+
+    t = tools_for("u_mvp")
+    # 先读再改（写前必读门禁）
+    call(t["file_read"], path=str(base / "p.txt"))
+    out = call(t["file_patch"], path=str(base / "p.txt"),
+               old_content="old-text", new_content="new-text")
+
+    assert "已局部修改" in out, out
+    assert "沙箱" in out or "容器" in out, f"文案没有容器标识：{out!r}"
