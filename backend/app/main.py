@@ -59,7 +59,16 @@ async def lifespan(app: FastAPI):
     # would block that session forever.
     from . import team_store
     await team_store.init_tables()
-    await team_store.recover_stale_runtime("server restart")
+    # 多实例：只收敛**已死实例**遗留的 lease。把本集群存活实例的 owner
+    # 传进去，正在别的实例上跑着的 generation/task 不能被清掉 ——
+    # 否则 A 还在写、B 已判定它死了，状态分叉。
+    # 没配 Redis 时 live_owners() 返回空集合 => 全清（单实例语义不变）。
+    try:
+        from .cluster import instances as _inst
+        _live = await _inst.live_owners()
+    except Exception:  # noqa: BLE001
+        _live = set()
+    await team_store.recover_stale_runtime("server restart", live_owners=_live)
     # 记忆索引表（幂等）。正文永远在 backend/data/memories/<user_id>/private/*.md，
     # 这里只建「列举 / 排序 / 命中统计」用的索引表。
     try:

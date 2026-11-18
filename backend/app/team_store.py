@@ -171,6 +171,16 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _self_owner() -> str:
+    """本实例的 owner（`<host>:<pid>`）。
+
+    多实例下用来区分「这个 generation/task 是哪台机器哪个进程在跑」。
+    `recover_stale_runtime` 靠它只清已死实例的残留。
+    """
+    from .sandbox.identity import owner_id
+    return owner_id()
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(8)}"
 
@@ -193,6 +203,21 @@ async def init_tables() -> None:
                 "WHERE read_at=0 AND delivered_at>0")
         except Exception:
             pass
+        # 多实例：记录每个 generation / task 属于**哪个实例**。
+        #
+        # 为什么需要：`recover_stale_runtime` 原来无差别把 status='active'
+        # 全标 stale —— 单进程时这是对的（重启后不可能有别的进程在跑），
+        # 但多实例下会把**另一个实例正在跑**的 generation 杀掉。
+        # 有了 owner 就能只清「owner 已不在存活集合里」的行。
+        #
+        # 空串 = 老库数据，视为「不属于任何活实例」，恢复时会被清掉
+        # （正是我们想要的：升级前留下的 active 一定是残留）。
+        for table in ("session_generations", "team_tasks"):
+            try:
+                await conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN owner TEXT NOT NULL DEFAULT ''")
+            except Exception:
+                pass
         await conn.commit()
 
 
@@ -210,10 +235,13 @@ async def acquire_generation(user_id: str, session_id: str, generation_id: str) 
     async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         try:
+            # 记下 owner：多实例下 recover_stale_runtime 靠它区分
+            # 「别的实例正在跑」和「上一轮死掉的残留」。
+            from .sandbox.identity import owner_id as _owner
             await conn.execute(
-                "INSERT INTO session_generations(user_id,session_id,generation_id,status,started_at) "
-                "VALUES(?,?,?,'active',?)",
-                (user_id, session_id, generation_id, now_ms()),
+                "INSERT INTO session_generations(user_id,session_id,generation_id,"
+                "status,started_at,owner) VALUES(?,?,?,'active',?,?)",
+                (user_id, session_id, generation_id, now_ms(), _owner()),
             )
             await conn.commit()
             return True
@@ -520,9 +548,10 @@ async def claim_task(scope: TeamScope, task_id: str, *, expected_version: int) -
         if not await _deps_complete(conn, scope, task_id):
             return {"ok": False, "reason": "blocked"}
         cur = await conn.execute(
-            f"UPDATE team_tasks SET status='in_progress',owner_agent_id=?,version=version+1,updated_at=? "
+            f"UPDATE team_tasks SET status='in_progress',owner_agent_id=?,"
+            f"owner=?,version=version+1,updated_at=? "
             f"WHERE task_id=? AND {where} AND status='pending' AND owner_agent_id='' AND version=?",
-            (scope.agent_id, now_ms(), task_id, *args, int(expected_version)),
+            (scope.agent_id, _self_owner(), now_ms(), task_id, *args, int(expected_version)),
         )
         await conn.commit()
         ok = (cur.rowcount or 0) == 1
@@ -659,16 +688,17 @@ async def bind_task_owner(scope: TeamScope, task_id: str, owner_agent_id: str, *
                        previous_owner=str(row[1] or ""))
             cur = await conn.execute(
                 f"UPDATE team_tasks SET status='in_progress',owner_agent_id=?,"
-                f"version=version+1,updated_at=? WHERE task_id=? AND {where}",
-                (owner_agent_id, now_ms(), task_id, *args),
+                f"owner=?,version=version+1,updated_at=? WHERE task_id=? AND {where}",
+                (owner_agent_id, _self_owner(), now_ms(), task_id, *args),
             )
             await conn.commit()
             ok = (cur.rowcount or 0) == 1
         else:
             cur = await conn.execute(
-                f"UPDATE team_tasks SET status='in_progress',owner_agent_id=?,version=version+1,updated_at=? "
+                f"UPDATE team_tasks SET status='in_progress',owner_agent_id=?,"
+                f"owner=?,version=version+1,updated_at=? "
                 f"WHERE task_id=? AND {where} AND status='pending' AND owner_agent_id='' AND version=?",
-                (owner_agent_id, now_ms(), task_id, *args, int(expected_version)),
+                (owner_agent_id, _self_owner(), now_ms(), task_id, *args, int(expected_version)),
             )
             await conn.commit()
             ok = (cur.rowcount or 0) == 1
@@ -915,30 +945,70 @@ async def converge_orphaned_active_teams(user_id: str, session_id: str) -> int:
         return cur.rowcount or 0
 
 
-async def recover_stale_runtime(reason: str = "server restart") -> dict[str, int]:
-    """Converge leases left behind by a previous server process.
+async def recover_stale_runtime(reason: str = "server restart",
+                                live_owners: set[str] | None = None) -> dict[str, int]:
+    """收敛上一轮/已死实例遗留的 lease。
 
-    A single-process web deployment cannot still own an in-memory stop token or
-    asyncio task after restart, so keeping these rows active would permanently
-    block or misreport the next generation.  Tasks are returned to pending with
-    an incremented version, invalidating stale CAS holders.
+    ## 多实例下的正确性（2026-11-19 改）
+
+    原实现无差别 `UPDATE ... WHERE status='active'`。单进程时这是对的
+    （重启后不可能有别的进程还在跑）；但多实例时会**杀掉另一个实例正在跑的
+    generation**：
+
+        A 正在跑 g1（status='active'）
+        B 启动 -> recover_stale_runtime -> g1 被标 stale
+        -> A 还在写，B 认为它死了：状态分叉
+
+    现在每行都记了 `owner`（`<host>:<pid>`），恢复时只清
+    **owner 不在 `live_owners` 里**的行。
+
+    ## 参数
+
+    - ``live_owners``：本集群当前**活着**的 owner 集合
+      （`cluster.instances.live_owners()` 的结果）。
+    - 不传 / 传空集合：全清 —— 这正是单实例语义，也是迁移前的行为。
+      所以没配 Redis 时行为完全不变。
+
+    ## 为什么 task 也要按 owner 过滤
+
+    `team_tasks.status='in_progress'` 表示「有个活着的 agent 正在做」。
+    把它打回 pending 会让另一个实例重复执行同一件事。
     """
+    alive = {o for o in (live_owners or set()) if o}
     ts = now_ms()
     async with sqlcompat.connect(DB_PATH) as conn:
         await conn.execute("PRAGMA busy_timeout=5000;")
         await conn.execute("BEGIN IMMEDIATE")
         try:
+            # 存活过滤：SQL 侧用 NOT IN 会因参数个数不定而难写，
+            # 这里统一用「owner='' 或 owner NOT IN (...)」拼占位符。
+            if alive:
+                ph = ",".join("?" for _ in alive)
+                gen_where = f"status='active' AND (owner='' OR owner NOT IN ({ph}))"
+                task_where = f"status='in_progress' AND (owner='' OR owner NOT IN ({ph}))"
+                team_where = "status='active'"
+                gen_args = tuple(alive)
+                task_args = tuple(alive)
+            else:
+                gen_where = "status='active'"
+                task_where = "status='in_progress'"
+                team_where = "status='active'"
+                gen_args = ()
+                task_args = ()
+
             gen_cur = await conn.execute(
-                "UPDATE session_generations SET status='stale',finished_at=? "
-                "WHERE status='active'", (ts,)
+                f"UPDATE session_generations SET status='stale',finished_at=? "
+                f"WHERE {gen_where}",
+                (ts, *gen_args),
             )
             task_cur = await conn.execute(
-                "UPDATE team_tasks SET status='pending',owner_agent_id='',version=version+1,updated_at=? "
-                "WHERE status='in_progress'", (ts,)
+                f"UPDATE team_tasks SET status='pending',owner_agent_id='',owner='',"
+                f"version=version+1,updated_at=? WHERE {task_where}",
+                (ts, *task_args),
             )
             team_cur = await conn.execute(
-                "UPDATE team_runs SET status='stale',updated_at=?,closed_at=? "
-                "WHERE status='active'", (ts, ts)
+                f"UPDATE team_runs SET status='stale',updated_at=?,closed_at=? "
+                f"WHERE {team_where}", (ts, ts)
             )
             await conn.commit()
         except BaseException:
