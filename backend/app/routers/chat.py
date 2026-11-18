@@ -855,9 +855,18 @@ async def _try_queue_steer(user: dict, session_id: str,
     """
     active = await team_store.get_active_generation(user["id"], session_id)
     if not active or not is_generation_live(user["id"], session_id, active):
-        # 竞态：回合刚好结束。降级为普通发送（GA 的同一处理），
-        # 而不是塞进一个没人消费的队列。
-        return None
+        # 多实例：`is_generation_live` 只看本进程。如果 owner 是**别的还活着的
+        # 实例**，那这个回合是真的在跑 —— 插话应该走跨实例总线（steerbus），
+        # 不能降级成普通发送（那会另起一轮，用户的本意是"补充一句"）。
+        from .. import generation_owner as _gen_owner
+        if active and not await _gen_owner.is_generation_dead_elsewhere(
+                user["id"], session_id, active):
+            # owner 活着但不是本实例：仍然允许入队，泵会把它取回来
+            pass
+        else:
+            # 竞态：回合刚好结束。降级为普通发送（GA 的同一处理），
+            # 而不是塞进一个没人消费的队列。
+            return None
     if body.attachments:
         # 图片插话要重新走上传校验与 wire 展开，P0 先不支持，避免半截实现。
         raise HTTPException(status_code=400, detail={
@@ -907,14 +916,32 @@ async def send_message(session_id: str, body: SendMessageIn, user: dict = Depend
         # A DB lease is not proof that work is still running: the SSE task can
         # disappear after a client disconnect, proxy timeout or cancelled task.
         # Only the in-process task/reservation registry is authoritative.
+        #
+        # 多实例铁律（2026-11-19）：`is_generation_live` 是**进程内**判断。
+        # 别的实例正在跑的 generation，在我这里当然"不活"——但它没死。
+        # 只凭它判 stale 会写坏数据：
+        #     A 正在跑 g1 -> 请求落到 B -> B 判 g1 stale
+        #     -> A 还在写、B 已改记录：分叉
+        # 所以必须先问「那个 owner 还活着吗」，确认死了才允许收敛。
+        # 没配 Redis 时 `is_generation_dead_elsewhere` 退化为单实例语义
+        # （除自己外都算死），行为与迁移前一致。
+        from .. import generation_owner as _gen_owner
         if active and not is_generation_live(user["id"], session_id, active):
-            await team_store.converge_generation_facts(
-                user["id"], session_id, active, status="stale"
-            )
-            await db.mark_stale_streaming_stopped(session_id)
-            acquired = await team_store.acquire_generation(user["id"], session_id, generation_id)
-            if not acquired:
-                active = await team_store.get_active_generation(user["id"], session_id)
+            if await _gen_owner.is_generation_dead_elsewhere(
+                    user["id"], session_id, active):
+                await team_store.converge_generation_facts(
+                    user["id"], session_id, active, status="stale"
+                )
+                await db.mark_stale_streaming_stopped(session_id)
+                acquired = await team_store.acquire_generation(user["id"], session_id, generation_id)
+                if not acquired:
+                    active = await team_store.get_active_generation(user["id"], session_id)
+            else:
+                # owner 还活着：它在别的实例上正常跑着。这不是「陈旧租约」，
+                # 是「真的有人在做」——如实返回 409，让用户先停或等它结束。
+                logger.info(
+                    "拒绝并发生成（owner 仍存活）user=%s session=%s active_gen=%s",
+                    user["id"], session_id, active)
         if not acquired:
             raise HTTPException(status_code=409, detail={
                 "error": "generation_active",
