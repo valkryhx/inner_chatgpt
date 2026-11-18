@@ -1104,6 +1104,15 @@ async def stop_generation(session_id: str, body: StopIn, user: dict = Depends(ge
             await stop_code_runs(user["id"], session_id, generation_id)
         except Exception:
             pass
+    # 沙箱级联：容器内的代码不受宿主机 _kill_tree 管辖，必须单独杀。
+    # 只对白名单用户生效（policy 判定），非白名单用户这里 no-op。
+    try:
+        from ..sandbox import policy as sbx_policy
+        if sbx_policy.should_use_sandbox("code_run", user["id"]):
+            from ..sandbox.manager import get_manager as get_sandbox_manager
+            await get_sandbox_manager().stop_user(user["id"])
+    except Exception:
+        pass
 
     stop_result = StopResult(ok=True, stopped=n, subagents_stopped=subs)
     target_message_id = body.message_id

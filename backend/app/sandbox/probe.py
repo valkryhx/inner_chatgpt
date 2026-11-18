@@ -95,6 +95,9 @@ def cleanup_orphans() -> int:
     except SandboxUnavailable as exc:
         logger.debug("cleanup_orphans 跳过：%s", exc.reason)
         return 0
+    except Exception as exc:  # noqa: BLE001 - 契约是「清理失败绝不阻断启动」
+        logger.warning("cleanup_orphans 无法构造 docker 客户端：%s", exc)
+        return 0
     removed = 0
     try:
         containers = client.containers.list(

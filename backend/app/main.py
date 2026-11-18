@@ -70,6 +70,16 @@ async def lifespan(app: FastAPI):
     hub = RuntimeHub()
     await hub.startup()
     set_hub(hub)
+    # 沙箱管理器：自检 Docker/镜像 + 清扫上次进程残留容器 + 起 TTL 回收协程。
+    # 自检失败**不阻断启动**（auto 模式降级留痕、strict 模式在工具调用点报错），
+    # 这与设计文档 §6.5「沙箱故障不能拖垮主服务」一致。
+    try:
+        from .sandbox.manager import get_manager as get_sandbox_manager
+        sbx_ok, sbx_reason = await get_sandbox_manager().start()
+        if not sbx_ok:
+            logging.getLogger(__name__).warning("沙箱自检未通过：%s", sbx_reason)
+    except Exception:
+        logging.getLogger(__name__).warning("沙箱管理器启动失败", exc_info=True)
     dream_handle = None
     try:
         # 记忆合并巡检任务（M4.5）。默认 600s 醒一次，内置 24h / 5 会话三道闸。
@@ -91,6 +101,15 @@ async def lifespan(app: FastAPI):
             pass
         await hub.shutdown()
         set_hub(None)
+        # 沙箱放最后：前面的 turn_job / hub 收尾期间可能还有工具在跑，
+        # 容器必须先活着。这里销毁全部容器并停掉 TTL 回收协程。
+        try:
+            from .sandbox.manager import get_manager as get_sandbox_manager
+            n = await get_sandbox_manager().shutdown()
+            if n:
+                logging.getLogger(__name__).info("已销毁 %d 个沙箱容器", n)
+        except Exception:
+            logging.getLogger(__name__).warning("沙箱管理器关闭失败", exc_info=True)
 
 
 app = FastAPI(title="Hlaudz (self-built agent kernel)", version="0.3.0", lifespan=lifespan)

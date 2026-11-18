@@ -288,15 +288,41 @@ class ContainerRuntime:
     # ---------------- 停止 ----------------
 
     def _pkill_marker_sync(self, container_id: str, marker: str) -> None:
-        """按 marker 精确杀进程，避免误杀同容器里其它会话的进程。"""
+        """按 marker 精确杀进程，避免误杀同容器里其它会话的进程。
+
+        与 ``exec_shell_sync_killall`` 同理：镜像里没有 pkill，
+        改用遍历 ``/proc`` 匹配环境变量。读 ``/proc/<pid>/environ`` 找
+        ``HLZ_EXEC_MARKER=<marker>`` —— ``_exec`` 通过 ``environment=``
+        把它注入了每个执行进程。
+        """
+        needle = f"HLZ_EXEC_MARKER={marker}".encode()
+        script = (
+            "import os, signal, sys\n"
+            f"needle = {needle!r}\n"
+            "killed = 0\n"
+            "me = os.getpid()\n"
+            "for pid in os.listdir('/proc'):\n"
+            "    if not pid.isdigit() or int(pid) == me:\n"
+            "        continue\n"
+            "    try:\n"
+            "        with open('/proc/' + pid + '/environ', 'rb') as fh:\n"
+            "            env = fh.read()\n"
+            "    except OSError:\n"
+            "        continue\n"
+            "    if needle not in env:\n"
+            "        continue\n"
+            "    try:\n"
+            "        os.kill(int(pid), signal.SIGKILL)\n"
+            "        killed += 1\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "print(killed, flush=True)\n"
+        )
         client = None
         try:
             client = _client()
             container = client.containers.get(container_id)
-            container.exec_run(
-                ["sh", "-c", f"pkill -f 'HLZ_EXEC_MARKER={marker}' 2>/dev/null || true"],
-                demux=True,
-            )
+            container.exec_run(["python", "-c", script], demux=True)
         except Exception:  # noqa: BLE001
             logger.debug("pkill marker 失败（容器可能已消失）", exc_info=True)
         finally:
@@ -308,6 +334,69 @@ class ContainerRuntime:
 
     async def stop_processes(self, container_id: str, marker: str) -> None:
         await asyncio.to_thread(self._pkill_marker_sync, container_id, marker)
+
+    def exec_shell_sync_killall(self, container_id: str) -> int:
+        """杀掉容器内所有 python 子进程（/stop 级联用）。返回杀掉的进程数。
+
+        ⚠️ **不能用 pkill / ps**：``python:3.12-slim`` 是 Debian slim，
+        没有 procps 包，``pkill`` / ``ps`` / ``pgrep`` 全都不存在（2026-11-18
+        实测：``which pkill ps pgrep`` 全空）。第一版用 ``pkill -f``，
+        结果**永远返回 0** —— `/stop` 看起来成功，容器内进程照样跑完，
+        是彻底失效的假信号（§8.5「没报错 ≠ 有效信号」的又一实例）。
+
+        改为**纯 Python 遍历 `/proc`**，只依赖解释器本身：
+        - 读 ``/proc/<pid>/cmdline``；
+        - 命中「python 且命令行含 ``/ws/``」或含 ``HLZ_EXEC_MARKER`` 就 SIGKILL；
+        - 跳过自己（那个 ``python -c`` 进程）。
+
+        粗粒度：同用户多会话共享一个容器，这里会把该用户其它会话的执行也杀掉。
+        ``20261111`` 方案 §2.3 已承认「同用户共享容器」是已知取舍。
+        需要精确到单次执行时用 ``_pkill_marker_sync(marker)``。
+        """
+        script = (
+            "import os, signal\n"
+            "killed = 0\n"
+            "me = os.getpid()\n"
+            "for pid in os.listdir('/proc'):\n"
+            "    if not pid.isdigit() or int(pid) == me:\n"
+            "        continue\n"
+            "    try:\n"
+            "        parts = open('/proc/' + pid + '/cmdline', 'rb').read().split(b'\\x00')\n"
+            "    except OSError:\n"
+            "        continue\n"
+            "    # 任一 argv **以 /ws/ 开头**才算业务进程。\n"
+            "    # 为什么不是 parts[1]：真实调用是 `python -u /ws/x.py`，脚本在 argv[2]。\n"
+            "    # 为什么不会误杀查询脚本：`python -c <内联源码>` 的 argv[2] 以 'import' 开头，\n"
+            "    # 源码正文里虽然含 '/ws/' 但不以它开头。\n"
+            "    hit = any(p.startswith(b'/ws/') for p in parts)\n"
+            "    if not hit:\n"
+            "        hit = b'HLZ_EXEC_MARKER' in b' '.join(parts)\n"
+            "    if not hit:\n"
+            "        continue\n"
+            "    try:\n"
+            "        os.kill(int(pid), signal.SIGKILL)\n"
+            "        killed += 1\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "print(killed, flush=True)\n"
+        )
+        client = None
+        try:
+            client = _client()
+            container = client.containers.get(container_id)
+            res = container.exec_run(["python", "-c", script], demux=True)
+            out = (res.output[0] or b"") if hasattr(res, "output") else b""
+            text = (out or b"").decode("utf-8", errors="replace").strip()
+            return int(text) if text.isdigit() else 0
+        except Exception:  # noqa: BLE001
+            logger.debug("killall 失败（容器可能已消失）", exc_info=True)
+            return 0
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     # ---------------- 销毁 ----------------
 

@@ -16,7 +16,14 @@ import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from .config import BUILTIN_SKILLS_DIR, SHARED_SKILLS_DIR, SKILLS_DIR, WORKSPACES_DIR
+from .config import (
+    BUILTIN_SKILLS_DIR,
+    SANDBOX_WORKSPACES_DIR,
+    SANDBOX_WORKSPACE_USERS,
+    SHARED_SKILLS_DIR,
+    SKILLS_DIR,
+    WORKSPACES_DIR,
+)
 
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:/")
@@ -39,10 +46,30 @@ def _resolve_under(root: Path, candidate: Path) -> Path:
     return cand_r
 
 
+def workspaces_root(user_id: str) -> Path:
+    """该用户的 workspace **根目录**（不创建）。
+
+    白名单用户（MVP 沙箱用户）落在 ``D:\\sandbox/<user_id>``，
+    其余用户仍是 ``backend/data/workspaces/<user_id>``。
+
+    为什么必须让两边一致：容器挂载的是这个目录，而 ``file_read`` / ``file_glob``
+    等只读工具仍在**进程内**跑，读的也是这个目录。若两者指向不同位置，
+    就会出现「file_write 写进容器、file_read 读不到」的两套视图错位
+    （设计文档 §5.1、§7.2）。
+
+    这里直接读**本模块的全局名**（调用时求值，不是导入时快照），
+    因此测试可以用 ``monkeypatch.setattr(workspace, "WORKSPACES_DIR", tmp)``
+    把路径关进 tmp —— 全仓 20 处测试依赖这个行为。
+    """
+    _reject_unsafe_segment(user_id)
+    if user_id in SANDBOX_WORKSPACE_USERS:
+        return SANDBOX_WORKSPACES_DIR / user_id
+    return WORKSPACES_DIR / user_id
+
+
 def user_workspace(user_id: str, *, create: bool = True) -> Path:
     """Return (and optionally create) the user's workspace root."""
-    _reject_unsafe_segment(user_id)
-    root = WORKSPACES_DIR / user_id
+    root = workspaces_root(user_id)
     if create:
         root.mkdir(parents=True, exist_ok=True)
     return root

@@ -335,21 +335,61 @@ def build_builtin_tools(
         ))
 
     async def file_write(args: dict) -> str:
+        text = str(args.get("content", ""))
+        mode = str(args.get("mode", "overwrite") or "overwrite")
+        # 沙箱分流（设计文档 §7.2）：只改执行位置，校验仍在宿主进程做
+        try:
+            from .sandbox import policy as sbx_policy
+            if sbx_policy.should_use_sandbox("file_write", user_id):
+                from .sandbox.manager import get_manager
+                handled, note = await get_manager().write_file(
+                    user_id, str(args.get("path", "")), text,
+                    mode=mode, root=root, registry=read_registry,
+                )
+                if handled:
+                    return note
+                # 降级（auto）：把「未隔离」标记拼在进程内结果前面，绝不静默
+                return note + "\n" + _write_impl(
+                    user_id, str(args.get("path", "")), text, mode,
+                    root=root, registry=read_registry,
+                )
+        except Exception:  # noqa: BLE001 - 沙箱故障不能打断工具本身
+            import logging
+            logging.getLogger(__name__).warning("file_write 沙箱分流失败，回落进程内", exc_info=True)
         return _write_impl(
             user_id,
             str(args.get("path", "")),
-            args.get("content", ""),
-            str(args.get("mode", "overwrite") or "overwrite"),
+            text,
+            mode,
             root=root,
             registry=read_registry,
         )
 
     async def file_patch(args: dict) -> str:
+        old_c = str(args.get("old_content", ""))
+        new_c = str(args.get("new_content", ""))
+        try:
+            from .sandbox import policy as sbx_policy
+            if sbx_policy.should_use_sandbox("file_patch", user_id):
+                from .sandbox.manager import get_manager
+                handled, note = await get_manager().patch_file(
+                    user_id, str(args.get("path", "")), old_c, new_c,
+                    root=root, registry=read_registry,
+                )
+                if handled:
+                    return note
+                return note + "\n" + _patch_impl(
+                    user_id, str(args.get("path", "")), old_c, new_c,
+                    root=root, registry=read_registry,
+                )
+        except Exception:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).warning("file_patch 沙箱分流失败，回落进程内", exc_info=True)
         return _patch_impl(
             user_id,
             str(args.get("path", "")),
-            str(args.get("old_content", "")),
-            str(args.get("new_content", "")),
+            old_c,
+            new_c,
             root=root,
             registry=read_registry,
         )
@@ -363,11 +403,36 @@ def build_builtin_tools(
         )
 
     async def code_run(args: dict) -> str:
+        code = str(args.get("code", ""))
+        ctype = str(args.get("type", "python") or "python")
+        tmo = int(args.get("timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT)
+        # 沙箱分流（设计文档 §7.1）
+        try:
+            from .sandbox import policy as sbx_policy
+            if sbx_policy.should_use_sandbox("code_run", user_id):
+                from .sandbox.manager import get_manager
+                handled, out, _marker = await get_manager().exec_code(
+                    user_id, code, code_type=ctype, timeout=tmo,
+                    root=root, session_id=session_id,
+                    generation_id=generation_id, agent_id=agent_id,
+                )
+                if handled:
+                    return _with_budget(user_id, "code_run", out)
+                # 降级（auto）：标记 + 进程内真实执行
+                raw = await _run_code_impl(
+                    user_id, code, ctype, tmo,
+                    root=root, session_id=session_id,
+                    generation_id=generation_id, agent_id=agent_id,
+                )
+                return _with_budget(user_id, "code_run", out + "\n" + raw)
+        except Exception:  # noqa: BLE001 - 沙箱故障不能打断工具本身
+            import logging
+            logging.getLogger(__name__).warning("code_run 沙箱分流失败，回落进程内", exc_info=True)
         raw = await _run_code_impl(
             user_id,
-            str(args.get("code", "")),
-            str(args.get("type", "python") or "python"),
-            int(args.get("timeout", DEFAULT_TIMEOUT) or DEFAULT_TIMEOUT),
+            code,
+            ctype,
+            tmo,
             root=root,
             session_id=session_id,
             generation_id=generation_id,

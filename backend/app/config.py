@@ -27,6 +27,37 @@ DB_PATH = DATA_DIR / "app.db"
 # (file read/write/patch, code_run working directory).
 SKILLS_DIR = DATA_DIR / "skills"
 WORKSPACES_DIR = DATA_DIR / "workspaces"
+# 沙箱 workspace 根（D:\sandbox）。
+#
+# 为什么单独一个根，而不是继续用 backend/data/workspaces：
+# Docker Desktop 的镜像层与容器层实际落在 C 盘的 WSL2 vhdx 里，
+# 只有 **bind mount 的源目录** 才真正待在宿主磁盘上。把沙箱 workspace 放到
+# D:\sandbox，用户数据就不会随 Docker 数据一起占 C 盘。
+#
+# 每个用户一个独立子目录（D:\sandbox\<user_id>），互不混淆 ——
+# 这也是容器挂载的物理隔离基础（只挂自己那一个目录，不挂父目录）。
+#
+# 设计文档：docs/20261118-沙箱MVP设计与实施.md §6.3
+SANDBOX_WORKSPACES_DIR = Path(
+    os.environ.get("HLZ_SANDBOX_WORKSPACES_DIR") or r"D:\sandbox"
+).expanduser()
+# 哪些用户的 workspace 落在沙箱根下（而非 backend/data/workspaces）。
+# MVP 只放 2 个白名单用户；其余用户的路径完全不变。
+# 判据与 sandbox/policy.py 的白名单一致（同一份环境变量），
+# 避免"容器挂 D、进程读 C"这种两套视图的错位。
+#
+# ⚠️ 必须区分「未设置」与「显式空串」：显式空串 = 全部用户都走沙箱根，
+# 这是有意义的配置（本地全量验收用）。写成 `os.environ.get(...) or default`
+# 会把空串吞掉、悄悄退回 2 人白名单 —— sandbox/config.py 的同名逻辑
+# 已经踩过这个坑，两边必须一致。
+_raw_ws_users = (
+    os.environ["HLZ_SANDBOX_MVP_USERS"]
+    if "HLZ_SANDBOX_MVP_USERS" in os.environ
+    else "u_c56b8337dd09,u_343a46896bff"
+)
+SANDBOX_WORKSPACE_USERS = tuple(
+    u.strip() for u in _raw_ws_users.split(",") if u.strip()
+)
 # Per-user memory store: file-of-truth `<slug>.md` + DB index.
 # 正文永远在文件里（模型可直接读写），DB 只放索引。见
 # docs/20261112-Hlaudz记忆系统实施方案.md §2。
