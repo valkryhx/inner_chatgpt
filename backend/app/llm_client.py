@@ -335,12 +335,36 @@ def _prepare_tools(tools: Optional[list[dict]], api_mode: str) -> Optional[list[
     return out
 
 
-def _max_connections_from_env(default: int = 32) -> int:
-    """连接池初始上限。默认 32 而不是 8。
+# 连接池的硬上限（安全边界）。不可通过环境变量突破。
+#
+# 为什么不是 32767：**每条到上游的 TCP 连接占一个动态端口**，而
+# Windows 默认动态端口范围实测只有 13977（`netsh int ipv4 show dynamicport tcp`：
+# 起点 1024，数量 13977）。设成 32767 的结果不是「更快」，而是多用户并发时
+# **端口耗尽、连不上任何外部服务** —— 包括数据库与上游 API。
+#
+# 448 的由来：
+#   13977（端口总数） ÷ 2（给其它程序留一半） ≈ 7000 可用
+#   7000 ÷ 448 ≈ 15.6  →  约 15 个用户同时打满还不撞墙
+#   而单个用户真实并发 = user_teams(4) × team_subagents(4) + 主轮 + 重试余量
+#   ≈ 20~30，448 留了 15 倍余量，够用。
+#
+# 如果确实需要更大（例如跑在 Linux 上、或调高了 ulimit），
+# **先把操作系统的端口范围放大**，再改这个常量。
+POOL_HARD_CEILING = 448
 
-    8 是个危险的数字：`USER_MAX_ACTIVE_SUBAGENTS` 默认也是 8，主轮 + 8 个
-    teammate 同时调模型时必然排队。排队本身不致命，但配合下面那个 pool
-    超时缺陷就会变成「每次都要等 2 分钟」。
+
+def _max_connections_from_env(default: int = 64) -> int:
+    """连接池初始上限。默认 64。
+
+    为什么是 64 而不是 8 或 32：
+    - 8 太危险：`USER_MAX_ACTIVE_SUBAGENTS` 默认就是 8，主轮 + 8 个 teammate
+      同时调模型必然排队；
+    - 32 仍然偏紧：一个用户开 4 个 Team（`USER_MAX_ACTIVE_TEAMS=4`）、
+      每个 Team 4 个 teammate（`TEAM_MAX_ACTIVE_SUBAGENTS=4`），
+      峰值就是 4×4 + 4 个 lead + 1 个主轮 = 21 条，再加重试与工具调用
+      期间的并发取数，32 很容易被瞬间打满；
+    - 64 覆盖上述峰值仍有 3 倍余量，同时 64 × 15 用户 = 960 条，
+      远低于端口预算。
 
     注意这只是**起点**：真正在跑的时候会按需自动上调，见
     :meth:`LLMClient._grow_pool`。
@@ -349,25 +373,27 @@ def _max_connections_from_env(default: int = 32) -> int:
     if not raw:
         return default
     try:
-        return max(2, min(int(raw), 256))
+        return max(2, min(int(raw), POOL_HARD_CEILING))
     except (TypeError, ValueError):
         return default
 
 
-def _pool_ceiling_from_env(default: int = 128) -> int:
+def _pool_ceiling_from_env(default: int = POOL_HARD_CEILING) -> int:
     """自动扩容的硬上限。池可以涨，但不能无限涨。
 
-    为什么必须有上限：连接不是免费的。每条 TCP/TLS 连接都占内核缓冲区与端口，
-    上游网关通常也有每 key 的连接数限制。无限扩容的结果是把自己和上游一起打死。
-    128 的依据：单用户最坏并发 = user_teams(4) 个 lead + user_subagents(8)
-    + 重试余量，理论上个位数；128 留了一个数量级的安全余量，
-    同时又远低于「一个进程打开上千连接」这种会引发真正的资源问题的量级。
+    为什么必须有上限：连接不是免费的。每条 TCP/TLS 连接都占内核缓冲区与
+    一个动态端口，上游网关通常也有每 key 的连接数限制。无限扩容的结果是
+    把自己和上游一起打死。
+
+    上限的计算依据见 ``POOL_HARD_CEILING`` 的注释（端口预算）。
+    环境变量可以调**小**，但不能突破那个常量 —— 这是刻意的：
+    运维可能不清楚端口限制，把它设成 32767 会引发难排查的「全部超时」。
     """
     raw = (os.environ.get("HLZ_LLM_POOL_CEILING") or "").strip()
     if not raw:
         return default
     try:
-        return max(2, min(int(raw), 1024))
+        return max(2, min(int(raw), POOL_HARD_CEILING))
     except (TypeError, ValueError):
         return default
 

@@ -286,7 +286,7 @@ def test_connection_limit_env_override(monkeypatch):
     monkeypatch.setenv("HLZ_LLM_MAX_CONNECTIONS", "64")
     assert _max_connections_from_env() == 64
     monkeypatch.setenv("HLZ_LLM_MAX_CONNECTIONS", "bad")
-    assert _max_connections_from_env() == 32
+    assert _max_connections_from_env() == 64
     monkeypatch.setenv("HLZ_LLM_MAX_CONNECTIONS", "0")
     assert _max_connections_from_env() >= 2, "0 会被 clamp 到下限，不能真的关掉连接"
 
@@ -352,7 +352,9 @@ def test_pool_ceiling_is_bounded(monkeypatch):
     monkeypatch.setenv("HLZ_LLM_POOL_CEILING", "256")
     assert _pool_ceiling_from_env() == 256
     monkeypatch.setenv("HLZ_LLM_POOL_CEILING", "99999")
-    assert _pool_ceiling_from_env() == 1024, "必须硬性 clamp，不能无限涨"
+    # 硬性 clamp 到 POOL_HARD_CEILING（448）—— 不是 1024、更不是 32767。
+    # 原因：Windows 动态端口只有 13977，见 llm_client.POOL_HARD_CEILING 注释。
+    assert _pool_ceiling_from_env() == 448, "必须硬性 clamp，不能无限涨"
     monkeypatch.setenv("HLZ_LLM_POOL_CEILING", "0")
     assert _pool_ceiling_from_env() >= 2
 
@@ -591,3 +593,67 @@ def test_429_is_retryable_and_401_is_not():
     assert 429 in RETRYABLE_STATUS, "429 限流必须重试"
     assert 401 in NEVER_RETRY_STATUS, "401 鉴权失败重试没用"
     assert 401 not in RETRYABLE_STATUS
+
+
+# ---------------- 连接池上限：要够大，但不能超端口预算 ----------------
+#
+# 背景（2026-11-18）：用户要求「池子搞大，32767 或系统允许的大值」。
+# 但 32767 不可行 —— Windows 动态端口范围实测只有 13977
+# （`netsh int ipv4 show dynamicport tcp`），每条到上游的 TCP 连接占一个端口，
+# 多用户并发时直接撞端口耗尽，表现为连不上任何外部服务。
+#
+# 所以这里锁两条：
+#   1. 默认值要足够覆盖真实并发（单用户 4 teams x 4 subagents + 主轮）；
+#   2. 上限乘以「合理并发用户数」后，必须落在端口预算之内。
+
+
+def test_pool_default_covers_realistic_single_user_concurrency():
+    """单用户的真实并发 = 4 teams × 4 subagents + 主轮 + 重试余量 ≈ 20~30。
+
+    默认上限必须覆盖它，否则一跑多智能体就排队。
+    """
+    from app.llm_client import _max_connections_from_env
+    default = _max_connections_from_env()
+    assert default >= 64, (
+        f"默认池上限 {default} 太小：单用户 4 teams × 4 subagents = 16 个并发调用，"
+        "加上主轮与重试余量，64 才是安全起点")
+
+
+def test_pool_ceiling_fits_windows_port_budget():
+    """上限 × 并发用户数 不能超过 Windows 动态端口范围（13977）。
+
+    这是硬约束：超了不是「慢」，是**连不上任何外部服务**。
+    """
+    from app.llm_client import _pool_ceiling_from_env
+    ceiling = _pool_ceiling_from_env()
+    # Windows 实测动态端口约 13977，给其它程序留一半
+    usable_ports = 13977 // 2
+    max_users = usable_ports // ceiling
+    assert max_users >= 15, (
+        f"池上限 {ceiling} 太高：Windows 动态端口约 13977（留一半可用约 7000），"
+        f"只够 {max_users} 个用户同时打满。建议 <= 448")
+
+
+def test_pool_ceiling_is_not_absurdly_large():
+    """挡住「直接设成 32767」这类改动。"""
+    from app.llm_client import _pool_ceiling_from_env
+    ceiling = _pool_ceiling_from_env()
+    assert ceiling <= 512, (
+        f"池上限 {ceiling} 过大。Windows 动态端口只有 13977，"
+        "32767 会导致多用户并发时端口耗尽、连不上任何外部服务")
+
+
+def test_pool_env_override_still_clamped():
+    """环境变量能调，但不能突破上面的安全边界。"""
+    import os
+    from app.llm_client import _pool_ceiling_from_env, _max_connections_from_env
+    old = os.environ.get("HLZ_LLM_POOL_CEILING")
+    try:
+        os.environ["HLZ_LLM_POOL_CEILING"] = "32767"
+        ceiling = _pool_ceiling_from_env()
+        assert ceiling <= 512, f"环境变量绕过了安全上限：{ceiling}"
+    finally:
+        if old is None:
+            os.environ.pop("HLZ_LLM_POOL_CEILING", None)
+        else:
+            os.environ["HLZ_LLM_POOL_CEILING"] = old
