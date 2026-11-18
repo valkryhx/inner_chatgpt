@@ -101,7 +101,21 @@ class SandboxManager:
             logger.warning("沙箱自检失败：%s", reason)
             return False, reason
 
-        n = await asyncio.to_thread(probe.cleanup_orphans)
+        # 启动清扫：按**机器**过滤，不用精确 owner。
+        #
+        # 为什么不用精确 owner：owner_id 含 PID，进程重启后 PID 变了，
+        # 上一轮留下的容器 owner 是旧 PID，精确匹配永远清不到 ——
+        # 启动清扫就成了摆设，每次重启泄漏一批容器。
+        #
+        # 为什么按机器过滤是安全的：容器只存在于本机 Docker；启动这一刻，
+        # 本机「上一轮」的进程已经死了（否则端口会冲突，起不来第二个），
+        # 而本进程自己还没建任何容器。所以此刻本机的沙箱容器都是残留。
+        #
+        # 多进程/多机部署下是否安全：多进程时各实例的 PID 不同但机器相同，
+        # 会互相清 —— 所以真要跑多进程，必须配合「启动清扫只在第一个实例执行」
+        # （用 Redis leader election，见 LibreChat 的 LeaderElection 做法）。
+        # 在那之前，本项目的部署形态是单机单进程，这个假设成立。
+        n = await asyncio.to_thread(probe.cleanup_orphans, same_machine=True)
         if n:
             logger.info("启动时清理了 %d 个残留沙箱容器", n)
 

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from .config import SandboxConfig, get_config
 from .errors import SandboxExecError, SandboxTimeout, SandboxUnavailable
 from .probe import SANDBOX_LABEL, SANDBOX_LABEL_VALUE
+from .identity import OWNER_LABEL, owner_id as _self_owner
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +27,32 @@ CONTAINER_PREFIX = "hlz_sbx_"
 WORKSPACE_MOUNT = "/ws"
 
 
-def container_name(user_id: str) -> str:
-    """容器名。用户 id 形如 ``u_c56b8337dd09``，本身已是安全字符集。"""
-    safe = "".join(ch for ch in user_id if ch.isalnum() or ch in "_-")
-    return f"{CONTAINER_PREFIX}{safe}"
+def container_name(user_id: str, *, owner: str | None = None) -> str:
+    """容器名：``hlz_sbx_<user>_<owner>``。
+
+    **为什么要带 owner**（2026-11-18 扩容前的准备）：
+
+    - 原实现是 ``hlz_sbx_<user_id>``，单进程没问题；
+    - 一旦同机跑两个后端进程（或多机共用一个 Docker daemon），
+      两个进程为同一用户建容器时会撞名 —— Docker 直接拒绝：
+      ``Conflict. The container name "/hlz_sbx_u_x" is already in use``；
+    - 更糟的是 ``_remove_by_name`` 会先删同名再建，于是**进程 A 会把进程 B
+      正在用的容器删掉**，表现为「任务跑到一半容器没了」。
+
+    带 owner 后，不同实例天然隔离，谁也不会碰谁的容器。
+
+    **为了人工排查方便**，user_id 保留在名字里，且 ``docker ps`` 一眼能看出
+    归属。owner 里含主机名，多机时也能区分。
+
+    ``owner`` 省略时取本进程的 owner_id —— 保持调用方简洁。
+    """
+    from .identity import _SAFE, owner_id as _owner_id
+
+    safe_user = "".join(ch for ch in user_id if ch.isalnum() or ch in "_-")
+    if owner is None:
+        owner = _owner_id()
+    safe_owner = _SAFE.sub("-", owner)[:64]
+    return f"{CONTAINER_PREFIX}{safe_user}_{safe_owner}"
 
 
 @dataclass
@@ -91,7 +114,12 @@ class ContainerRuntime:
                 ["sleep", "infinity"],
                 name=name,
                 detach=True,
-                labels={SANDBOX_LABEL: SANDBOX_LABEL_VALUE},
+                labels={
+                    SANDBOX_LABEL: SANDBOX_LABEL_VALUE,
+                    # 归属标签：清扫时靠它区分「我的」和「别人的」。
+                    # 没有这个标签，新进程启动会把其它进程正在用的容器删掉。
+                    OWNER_LABEL: _self_owner(),
+                },
                 # —— 隔离（设计文档 §6.3）——
                 network_mode="none",
                 cap_drop=["ALL"],

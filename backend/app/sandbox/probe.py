@@ -9,6 +9,7 @@ import logging
 
 from .config import SandboxConfig, get_config
 from .errors import SandboxUnavailable
+from .identity import OWNER_LABEL, owner_id, owner_machine
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +84,32 @@ def check(cfg: SandboxConfig | None = None) -> tuple[bool, str]:
     return True, ""
 
 
-def cleanup_orphans() -> int:
-    """删除上次进程遗留的沙箱容器。返回删除数量。
+def cleanup_orphans(*, all_owners: bool = False, same_machine: bool = False) -> int:
+    """删除**属于本进程**的残留沙箱容器。返回删除数量。
 
-    只删带 ``hlz.sandbox=1`` 标签的容器 —— 这是本方案独占的命名空间。
-    ⚠️ 多 worker 部署时会误删其它 worker 的容器（设计文档 §10.5），
-    届时需给标签加 worker_id；MVP 单 worker，安全。
+    ## 为什么默认只清自己的（2026-11-18 改）
+
+    原实现只按 ``hlz.sandbox=1`` 过滤，**把全机的沙箱容器都删了**。
+    单进程时这没错（那些容器确实是自己上一轮留下的）；但一旦扩容：
+
+    - 同机跑两个后端进程 -> 新进程启动时会把**另一个进程正在用**的容器删掉；
+    - 多机共用一个 Docker daemon -> 会跨机误删。
+
+    现在按 ``hlz.owner`` 标签过滤，默认只清 ``<hostname>:<pid>`` 自己的。
+    注意：本进程刚启动时 pid 是新的，所以严格说清不到"上一次自己"——
+    上一轮的容器 owner 是旧 pid，属于"别人的"。这类残留由：
+
+    1. ``same_machine=True``（清本机所有）手动处理；
+    2. TTL 回收协程（`pool.reap_idle`）自然清掉；
+    3. 运维显式 ``all_owners=True``。
+
+    这里选择的默认值偏保守：**宁可留残留，也不能删掉正在干活的容器**。
+
+    ## 参数
+
+    - ``all_owners=True``：清全部沙箱容器（运维手动清场用）；
+    - ``same_machine=True``：只按主机名过滤，清本机所有实例的（介于两者之间）；
+    - 都不传：只清本进程自己的（最安全）。
     """
     try:
         client = _client()
@@ -98,12 +119,24 @@ def cleanup_orphans() -> int:
     except Exception as exc:  # noqa: BLE001 - 契约是「清理失败绝不阻断启动」
         logger.warning("cleanup_orphans 无法构造 docker 客户端：%s", exc)
         return 0
+
+    # 构造 label 过滤：始终要求是本方案的沙箱容器，再按归属收窄。
+    label_filters = [f"{SANDBOX_LABEL}={SANDBOX_LABEL_VALUE}"]
+    if not all_owners:
+        if same_machine:
+            # docker 标签过滤不支持前缀匹配，只能在取回后自己筛。
+            pass
+        else:
+            label_filters.append(f"{OWNER_LABEL}={owner_id()}")
+
     removed = 0
     try:
-        containers = client.containers.list(
-            all=True, filters={"label": f"{SANDBOX_LABEL}={SANDBOX_LABEL_VALUE}"}
-        )
+        containers = client.containers.list(all=True, filters={"label": label_filters})
         for c in containers:
+            if same_machine and not all_owners:
+                got = (getattr(c, "labels", None) or {}).get(OWNER_LABEL, "")
+                if not got.startswith(f"{owner_machine()}:"):
+                    continue
             try:
                 c.remove(force=True)
                 removed += 1

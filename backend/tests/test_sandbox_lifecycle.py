@@ -148,7 +148,11 @@ def test_reap_idle_cleans_dead_entries():
 
 
 def test_cleanup_orphans_calls_docker(monkeypatch):
-    """启动清扫：把所有带 hlz.sandbox 标签的容器删掉。"""
+    """启动清扫：删掉沙箱容器，且**按 owner 收窄**（不碰别人的）。
+
+    2026-11-18 改：原来只按 hlz.sandbox=1 过滤，扩容后会误删
+    其它进程正在用的容器。现在必须带上 hlz.owner 过滤。
+    """
     destroyed: list[str] = []
 
     class FakeContainer:
@@ -158,11 +162,13 @@ def test_cleanup_orphans_calls_docker(monkeypatch):
         def remove(self, force=False):
             destroyed.append(self.id)
 
+    captured: dict = {}
+
     class FakeClient:
         class containers:
             @staticmethod
             def list(all=False, filters=None):
-                assert filters == {"label": f"{sbx_probe.SANDBOX_LABEL}=1"}
+                captured["filters"] = filters
                 return [FakeContainer("old_1"), FakeContainer("old_2")]
 
         def close(self):
@@ -172,6 +178,11 @@ def test_cleanup_orphans_calls_docker(monkeypatch):
     n = sbx_probe.cleanup_orphans()
     assert n == 2
     assert destroyed == ["old_1", "old_2"]
+
+    labels = captured["filters"]["label"]
+    assert f"{sbx_probe.SANDBOX_LABEL}=1" in labels, "丢了沙箱命名空间过滤"
+    assert any("hlz.owner" in x for x in labels), (
+        f"没有 owner 过滤，扩容后会误删别的进程的容器：{labels}")
 
 
 def test_cleanup_orphans_swallows_errors(monkeypatch):
