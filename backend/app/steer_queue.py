@@ -49,25 +49,64 @@ class SteerQueue:
     _items: list[dict[str, Any]] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _seq: Any = field(default_factory=lambda: itertools.count(1))
+    # (user_id, session_id, generation_id)。Redis 模式与后台泵都要用。
+    # 用 field(default=None) 而不是构造参数，保持 SteerQueue() 无参可用
+    # （测试里大量这么用）。
+    _scope: Any = field(default=None, compare=False)
 
     def push(self, text: Any, *, source: str = "user", priority: str = "next") -> int:
-        """入队，返回队列深度；被拒绝时返回 0。"""
+        """入队，返回队列深度；被拒绝时返回 0。
+
+        ## 多实例行为（2026-11-19）
+
+        配了 Redis 时**只写 Redis**，不写本地 —— 生成可能跑在别的实例上，
+        写本地等于丢消息。本实例（如果它正是生成方）由一个后台泵把条目
+        搬回本地队列（见 `cluster/steerbus.py`）。
+
+        没配 Redis 时走原来的「直接写本地」路径，行为与迁移前完全一致。
+        """
         clean = " ".join(str(text or "").split()) if str(text or "").strip() else ""
         if not clean:
             return 0
         if len(clean) > MAX_STEER_CHARS:
             clean = clean[:MAX_STEER_CHARS]
+
+        item = {
+            "id": "steer_" + uuid.uuid4().hex[:12],
+            "seq": 0,                 # Redis 模式下由泵在本地分配
+            "text": clean,
+            "source": source,
+            "priority": priority,
+            "created_at": time.time(),
+        }
+
+        try:
+            from .cluster import steerbus
+            if steerbus.enabled():
+                # 深度要先看本地（泵可能已经搬了一些）+ 远端
+                if len(self) >= MAX_QUEUE_DEPTH:
+                    return 0
+                _spawn_remote_push(self._scope, item)
+                # 立即返回一个乐观深度：确切的远端深度要 await，
+                # 而 push 是同步的。前端只用它判断「有没有排上」。
+                return len(self) + 1
+        except Exception:  # noqa: BLE001 - 总线不可用时退回本地
+            pass
+
+        return self._adopt(item)
+
+    def _adopt(self, item: dict[str, Any]) -> int:
+        """把一条（来自本地或 Redis 泵的）条目真正放进本地队列。
+
+        返回入队后的深度；队列满时返回 0。
+        """
         with self._lock:
             if len(self._items) >= MAX_QUEUE_DEPTH:
                 return 0
-            self._items.append({
-                "id": "steer_" + uuid.uuid4().hex[:12],
-                "seq": next(self._seq),
-                "text": clean,
-                "source": source,
-                "priority": priority,
-                "created_at": time.time(),
-            })
+            if not item.get("seq"):
+                item = dict(item)
+                item["seq"] = next(self._seq)
+            self._items.append(item)
             return len(self._items)
 
     def drain(self, limit: int = 5) -> list[dict[str, Any]]:
@@ -103,6 +142,52 @@ class SteerQueue:
 # generation 注册表实现，避免两处生命周期纠缠：这里只需要「取得到同一个对象」。
 _queues: dict[tuple[str, str, str], SteerQueue] = {}
 _registry_lock = threading.Lock()
+# 每个 scope 的后台泵（Redis -> 本地）。多实例下必须有它，
+# 否则在别的实例上入队的内容永远进不了本实例的队列。
+_pumps: dict[tuple[str, str, str], Any] = {}
+
+
+def _spawn_remote_push(scope, item: dict[str, Any]) -> None:
+    """把一条插话发到 Redis（同步函数里的 fire-and-forget）。"""
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    from .cluster import steerbus
+
+    async def _go():
+        try:
+            await steerbus.push(*scope, item)
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        loop.create_task(_go())
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _start_pump(key, queue: SteerQueue) -> None:
+    """给这个 scope 起后台泵（幂等）。没配 Redis 时什么都不做。"""
+    import asyncio
+
+    try:
+        from .cluster import steerbus
+        if not steerbus.enabled():
+            return
+    except Exception:  # noqa: BLE001
+        return
+    if key in _pumps:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    pump = steerbus.SteerPump(queue, *key)
+    pump.start()
+    _pumps[key] = pump
 
 
 def get_queue(user_id: str, session_id: str, generation_id: str) -> SteerQueue:
@@ -111,8 +196,14 @@ def get_queue(user_id: str, session_id: str, generation_id: str) -> SteerQueue:
         q = _queues.get(key)
         if q is None:
             q = SteerQueue()
+            q._scope = key
             _queues[key] = q
-        return q
+            created = True
+        else:
+            created = False
+    if created:
+        _start_pump(key, q)
+    return q
 
 
 def peek_queue(user_id: str, session_id: str,
@@ -123,8 +214,27 @@ def peek_queue(user_id: str, session_id: str,
 
 
 def drop_queue(user_id: str, session_id: str, generation_id: str) -> int:
+    key = (user_id or "", session_id or "", generation_id or "")
     with _registry_lock:
-        q = _queues.pop((user_id or "", session_id or "", generation_id or ""), None)
+        q = _queues.pop(key, None)
+        pump = _pumps.pop(key, None)
+    if pump is not None:
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(pump.stop())
+        except RuntimeError:
+            pass
+    # 清掉 Redis 侧的残留，避免同 id 复用拿到上一轮的插话
+    try:
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        from .cluster import steerbus
+        loop.create_task(steerbus.clear(*key))
+    except (RuntimeError, Exception):  # noqa: BLE001
+        pass
     return q.clear() if q is not None else 0
 
 
