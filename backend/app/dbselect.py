@@ -101,3 +101,37 @@ def reset_for_tests() -> None:
     global _cached, _cached_raw
     _cached = None
     _cached_raw = None
+
+
+# ---------------------------------------------------------------- PG schema 映射
+#
+# ## 为什么需要这个
+#
+# 测试用 `monkeypatch DB_PATH -> tmp_path/app.db` 实现隔离，每个用例一个
+# 独立 SQLite 文件。迁到 PG 后「文件」这个概念没了 —— 如果所有用例共享
+# 一个 PG 数据库，`isolated_db` 立刻互相污染，1269 条测试根本跑不起来。
+#
+# 解法：把 `DB_PATH` 的**路径字符串**映射成 PG 里的一个 schema。
+# 同一个路径 -> 同一个 schema；不同 tmp 路径 -> 不同 schema。
+# 生产下 `HLZ_PG_SCHEMA_PER_PATH` 不设，永远是 `public`，行为不变。
+#
+# 这样 `connect(path)` 的签名一个字不用改，测试隔离自动成立。
+
+import hashlib
+import re as _re
+
+_SAFE_SCHEMA = _re.compile(r"[^a-z0-9_]")
+
+
+def schema_per_path_enabled() -> bool:
+    return os.environ.get("HLZ_PG_SCHEMA_PER_PATH", "") not in ("", "0", "false", "False")
+
+
+def pg_schema_for(path) -> str:
+    """`path` 对应的 PG schema 名；生产下恒为 `public`。"""
+    if not schema_per_path_enabled():
+        return "public"
+    raw = str(path or "default")
+    # Windows 路径大小写不敏感，统一小写再哈希，避免同一目录算出两个 schema
+    digest = hashlib.sha1(raw.replace("\\", "/").lower().encode("utf-8")).hexdigest()
+    return "hlz_" + _SAFE_SCHEMA.sub("", digest[:16])

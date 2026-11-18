@@ -90,9 +90,17 @@ class HistoryStore:
                 # SQLite cannot add a composite PK in place: rebuild once.
                 await conn.execute("ALTER TABLE session_history RENAME TO session_history_old")
                 await conn.executescript(_CREATE_TABLE)
+                # 用标准 ON CONFLICT（两个后端都支持）；`INSERT OR REPLACE` 只有
+                # SQLite 认，PG 会报 syntax error at or near "OR"。
+                #
+                # ⚠️ `WHERE 1` 不能省：SQLite 规定 `INSERT ... SELECT` 后接
+                # `ON CONFLICT` 时必须有 WHERE，否则报 `near "DO": syntax error`。
                 await conn.execute(
-                    "INSERT OR REPLACE INTO session_history(user_id, session_id, history, updated_at) "
-                    "SELECT '', session_id, history, updated_at FROM session_history_old"
+                    "INSERT INTO session_history(user_id, session_id, history, updated_at) "
+                    "SELECT '', session_id, history, updated_at FROM session_history_old "
+                    "WHERE 1 "
+                    "ON CONFLICT(user_id, session_id) DO UPDATE SET "
+                    "history=EXCLUDED.history, updated_at=EXCLUDED.updated_at"
                 )
                 await conn.execute("DROP TABLE session_history_old")
             # Backfill ownership for the pre-multi-user history.  sessions is the
