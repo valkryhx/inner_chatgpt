@@ -38,8 +38,37 @@ WORKSPACES_DIR = DATA_DIR / "workspaces"
 # 这也是容器挂载的物理隔离基础（只挂自己那一个目录，不挂父目录）。
 #
 # 设计文档：docs/20261118-沙箱MVP设计与实施.md §6.3
+#
+# ## 平台差异（2026-11-19 真机事故）
+#
+# 原来这里写死 `or r"D:\sandbox"`，不考虑平台。windows 下没问题，
+# **但 Linux 容器里它变成相对路径**，被拼到 `/app/backend` 下面：
+#
+#     /app/backend/D:\sandbox/u_c56b8337dd09/.subagents/co_xxx/worker_c
+#
+# 名字里带反斜杠的畸形目录。它真的被创建出来了，所以多数工具靠
+# 「能在里面读写」侥幸工作 —— 直到 shell 的 `cd` 踩上去（hx 的
+# worker_c 卡在 `cd '/app/backend/D:\sandbox/...'`）。
+#
+# 所以默认值按平台走：Windows 保持 D:\sandbox（避免占 C 盘），
+# 其它平台落在 DATA_DIR 下（容器里那个 appdata 卷，天然可写）。
+def default_sandbox_root(is_windows: bool | None = None) -> Path:
+    """按平台给沙箱 workspace 根的默认值。
+
+    抽成函数是为了能测：本机是 Windows，但必须验证 Linux 分支
+    （事故就发生在 Linux 容器里）。
+    """
+    if is_windows is None:
+        is_windows = os.name == "nt"
+    if is_windows:
+        return Path(r"D:\sandbox")
+    # 容器里 DATA_DIR 是挂载的 appdata 卷，可写且跟着卷走，
+    # 不需要额外挂载点。
+    return DATA_DIR / "sandbox"
+
+
 SANDBOX_WORKSPACES_DIR = Path(
-    os.environ.get("HLZ_SANDBOX_WORKSPACES_DIR") or r"D:\sandbox"
+    os.environ.get("HLZ_SANDBOX_WORKSPACES_DIR") or default_sandbox_root()
 ).expanduser()
 # 哪些用户的 workspace 落在沙箱根下（而非 backend/data/workspaces）。
 # MVP 只放 2 个白名单用户；其余用户的路径完全不变。

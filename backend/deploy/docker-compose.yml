@@ -99,6 +99,19 @@ services:
       # 多实例部署建议先关闭沙箱（工具退回进程内执行），或每个实例
       # 独占一台机器后再打开。
       HLZ_SANDBOX_MODE: ${HLZ_SANDBOX_MODE:-off}
+      # 沙箱 workspace 根。**必须显式给容器内路径**。
+      #
+      # 原来不设这个变量，于是 app/config.py 用了默认值 `D:\sandbox` ——
+      # 那是 Windows 宿主机路径，在 Linux 容器里被当成相对路径拼到
+      # `/app/backend` 下面，得到名字带反斜杠的畸形目录
+      # `/app/backend/D:\sandbox/<uid>/...`。
+      #
+      # 它真的会被创建出来，所以多数工具靠「能在里面读写」侥幸工作，
+      # 直到 shell 的 `cd` 踩上去（2026-11-19：hx 的 worker_c 卡在
+      # `cd '/app/backend/D:\sandbox/...'`）。
+      #
+      # 这里落在 appdata 卷里，天然可写、跟着卷走。
+      HLZ_SANDBOX_WORKSPACES_DIR: /app/backend/data/sandbox
       # 多实例下必须关：这个开关让「路径 -> PG schema」，是测试隔离用的
       HLZ_PG_SCHEMA_PER_PATH: "0"
     volumes:

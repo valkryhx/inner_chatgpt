@@ -44,17 +44,29 @@ RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' \
         file tree \
         # 搜索。find/grep 已有，ripgrep 对模型更友好（.gitignore 感知、更快）
         ripgrep \
+        # 中文字体：**画图必需**。不装的话模型写 plt.xlabel("月份")
+        # 会渲染成方块，而且不报错 —— 用户拿到一张废图，极难发现。
+        # fontconfig 让 matplotlib 的 fontManager 能发现这些字体。
+        fontconfig fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/* \
     # vim-tiny 只提供 `vi`，但模型习惯写 `vim`；补个别名避免它以为编辑器不存在
     && ln -sf /usr/bin/vi /usr/local/bin/vim
+# 刷新字体缓存：装完不刷的话 matplotlib 的 fontManager 仍可能读不到新字体。
+RUN fc-cache -fv > /dev/null 2>&1 || true
 
 # ---- Python 依赖 -----------------------------------------------------------
 # 全部预装。容器无网络，运行时安装不可能。
 # 分组说明（后续要裁剪就按组裁）：
-#   报表/数据处理：pandas numpy openpyxl tabulate
-#   文档生成：python-docx python-pptx
+#   数据处理：pandas numpy scipy
+#   报表：openpyxl xlrd tabulate
+#   文档生成：python-docx python-pptx reportlab jinja2
 #   HTTP 与解析：requests beautifulsoup4 lxml
-#   绘图：matplotlib
+#   绘图：matplotlib pillow
+#
+# ⚠️ 这份清单必须与 backend/requirements.txt 的能力保持一致。
+# 漂移的后果是「一打开沙箱就坏」：现在沙箱关着（HLZ_SANDBOX_MODE=off），
+# 跑的是 app 镜像；一旦打开，同一个任务会因为缺包失败。
+# tests/test_image_dependencies.py 会双向校验这两份清单。
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -63,11 +75,16 @@ RUN pip install --no-cache-dir \
         requests \
         pandas \
         numpy \
+        scipy \
         openpyxl \
+        xlrd \
         tabulate \
         python-docx \
         python-pptx \
+        reportlab \
+        jinja2 \
         matplotlib \
+        pillow \
         beautifulsoup4 \
         lxml
 

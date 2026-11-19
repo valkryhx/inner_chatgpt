@@ -104,4 +104,14 @@ def workspace_env(cwd: Path) -> dict[str, str]:
     env["TEMP"] = str(tmp)
     env["TMPDIR"] = str(tmp)
     env["INNER_AGENT_WRITE_ROOT"] = str(cwd.resolve())
+    # matplotlib 的缓存目录**必须在 workspace 内**。
+    #
+    # 镜像里设的 MPLCONFIGDIR=/tmp/.mpl 对普通进程够用，但 code_run 的子进程
+    # 被 `WORKSPACE_PYTHON_GUARD` 的审计钩子限制成「只能写 workspace」——
+    # /tmp 在 workspace 外，于是每次 import matplotlib 都被拦：
+    #     mkdir -p failed for path /tmp/.mpl: 写入越界
+    # 然后它降级到 workspace 内的临时目录（能跑，但每次重建缓存，慢）。
+    #
+    # 所以这里覆盖掉镜像的环境变量，指到 workspace 内的 `.tmp/mpl`。
+    env["MPLCONFIGDIR"] = str(tmp / "mpl")
     return env

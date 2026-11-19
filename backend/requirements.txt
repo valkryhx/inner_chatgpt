@@ -36,6 +36,37 @@ python-dotenv==1.2.2
 python-docx==1.1.2
 openpyxl==3.1.5
 python-pptx==1.0.2
+# 旧版 .xls：openpyxl 只支持 .xlsx，读 .xls 必须用 xlrd
+xlrd==2.0.2
+
+# ---- 数据 / 绘图 / 报表 ----
+#
+# ## 为什么这些必须预装（2026-11-19 真机事故）
+#
+# hx 让 4 个 sub 做「先 2 并行后 2 串行」的示例，worker_c 要画图，于是
+# 执行 `pip install matplotlib` —— **反复失败**（19:14/15/19/21/22 五次），
+# 每次卡在慢网络超时，整轮停了 10 分钟、turns 一直是 0。
+#
+# 沙箱镜像的注释早写了这条原则：「容器无网络，运行时 pip install 必然失败，
+# 包必须预先装好」。但那条原则只落在沙箱镜像里，app 镜像没有 ——
+# 而 `HLZ_SANDBOX_MODE=off` 时 code_run 走的就是 app 容器的 python。
+#
+# ⚠️ 这份清单必须与 backend/sandbox/Dockerfile 保持一致，
+# 否则「一打开沙箱就坏」。tests/test_image_dependencies.py 会双向校验。
+matplotlib==3.10.8
+pandas==2.3.3
+numpy==2.3.5
+scipy==1.16.3
+pillow==13.0.0          # PIL；python-pptx 已间接依赖，显式声明避免被移除
+tabulate==0.9.0
+jinja2==3.1.6
+reportlab==4.4.4        # 生成 PDF
+
+# 文本 / 网页解析：扒表格、清洗 HTML 时几乎必用
+beautifulsoup4==4.14.2
+# 模型写的脚本普遍 `import requests`（而不是 httpx）。
+# 后端自己用 httpx，但 code_run 里跑的是模型代码，得按模型的习惯来。
+requests==2.32.5
 
 # auth
 pyjwt==2.12.1

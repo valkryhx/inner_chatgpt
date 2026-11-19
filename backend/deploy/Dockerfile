@@ -5,11 +5,19 @@
 FROM python:3.12-slim
 
 # 时区与中文：DB 里存的是毫秒时间戳，但日志/文件名会用本地时间。
+#
+# MPLCONFIGDIR：matplotlib 的缓存目录。**必须指到可写位置**，
+# 否则它会去写 /root/.config/matplotlib —— 而 code_run 的 workspace
+# 路径守卫会拦下这次写入（日志里是「写入越界」），然后它降级到
+# workspace 内的临时目录，每次 import 都重建缓存（实测日志见
+# work/verify_deps.py 的输出）。指到 /tmp 后一次建立、后续复用。
+# 与 backend/sandbox/Dockerfile 保持一致。
 ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    MPLCONFIGDIR=/tmp/.mpl
 
 # 清华源：国内构建速度差一个数量级。
 # 用 `sed` 而不是 ADD sources.list，避免多一层。
@@ -19,9 +27,19 @@ RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' \
 
 # git：部分 skill / MCP 工具需要；tini：让 SIGTERM 正确传给 uvicorn
 # （否则容器停止时 lifespan shutdown 不跑，实例不从心跳表注销）。
+#
+# fonts-noto-cjk：**中文字体，画图必需**（2026-11-19 实测发现）。
+# 不装的后果：模型写 `plt.xlabel("月份")` 会渲染成方块 —— 用户拿到一张废图，
+# 而且没有任何报错，极难发现。基础镜像 python:3.12-slim 里 fc-list 为 0。
+#
+# fontconfig：matplotlib 靠它发现字体（没装的话 fc-list / font_manager
+# 都看不到装好的字体）。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl ca-certificates tini \
+        fontconfig fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
+# 刷新字体缓存：装完不刷的话 matplotlib 的 fontManager 仍可能读不到新字体。
+RUN fc-cache -fv > /dev/null 2>&1 || true
 
 WORKDIR /app/backend
 
