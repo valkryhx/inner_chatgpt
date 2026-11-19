@@ -333,8 +333,15 @@ async def _cluster_snapshot():
             elif enabled:
                 # 配了 Redis 但选举循环没跑：`leader` 值不可信。
                 # 如实报 false + 状态，而不是让运维以为高可用正常。
+                #
+                # 2026-11-19：`LeaderElector` 目前**没有任何生产消费者**
+                # （`start()` 从未被调用，`on_become_leader` 从未注册；
+                # 启动清扫用的是 sandbox.manager 自己的独立租约）。
+                # 所以这里报 "disabled" 而不是 "starting" —— 后者会让人以为
+                # 「选举马上就好」，实际含义是「永远不会」。
+                # 详见 docs/20261119-多实例正确性审计.md §11.1。
                 is_leader = False
-                election = "starting"
+                election = "disabled"
             else:
                 # 单实例：本来就是唯一实例
                 is_leader = True

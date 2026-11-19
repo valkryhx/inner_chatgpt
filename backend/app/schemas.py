@@ -153,10 +153,14 @@ class ClusterHealthOut(BaseModel):
     leader: bool = True            # 本实例是不是 leader
     instance_id: str = ""          # 本实例的注入标识（K8s pod name 等）
     # leader 选举的真实状态。`leader=false` 时运维要能一眼看出是
-    # 「我确实不是 leader」还是「选举根本没启动」。
+    # 「我确实不是 leader」还是「选举根本没启用」。
     #   on       选举在跑（leader 值可信）
     #   off      没配 Redis（单实例，本来就该是 leader）
-    #   starting 配了 Redis 但选举未启动（leader 值不可信）
+    #   disabled 配了 Redis 但选举未启用（leader 值不可信）
+    #
+    # 2026-11-19：`disabled` 原叫 `starting`，那个措辞会让人以为「马上就好」，
+    # 实际含义是「永远不会」—— `LeaderElector` 目前没有生产消费者。
+    # 见 docs/20261119-多实例正确性审计.md §11.1。
     leader_election: str = "off"
 
 

@@ -106,8 +106,13 @@ def test_health_leader_reflects_elector_state(monkeypatch):
         assert cluster_body["leader"] is False, (
             f"选举没启动却报 leader=true：{cluster_body}")
         # 要能让运维看出「为什么不是 leader」
-        assert cluster_body.get("leader_election") in ("off", "starting"), \
+        assert cluster_body.get("leader_election") in ("off", "disabled", "on"), \
             f"缺少 leader 选举状态的说明：{cluster_body}"
+        # 配了 Redis 且选举没跑 -> 必须是 disabled。
+        # **不能是 "starting"**：那措辞让人以为「马上就好」，实际含义是
+        # 「永远不会」—— LeaderElector 目前没有生产消费者（审计 §11.1）。
+        assert cluster_body.get("leader_election") == "disabled", \
+            f"配了 Redis 但选举未启用时应报 disabled，实际 {cluster_body.get('leader_election')!r}"
     finally:
         cluster.reset_for_tests()
         leader.reset_for_tests()
