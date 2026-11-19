@@ -15,6 +15,15 @@ backend/logs/
 # 测试与手工脚本不进镜像（生产容器不跑它们）
 backend/tests/
 
+# 前端依赖与产物：**必须排除**。
+#
+# `COPY frontend/ ./` 会把主机的 node_modules 一起复制进来，覆盖掉容器内
+# `npm ci` 装好的那一份。Windows 主机的 node_modules 里是 .cmd / node.exe
+# 这类 shim，于是构建时报 `exec: node.exe: not found`（实际踩过）。
+# dist 也一样：镜像里要的是**容器内构建**出来的产物，不是本机留下的。
+frontend/node_modules/
+frontend/dist/
+
 # 本地 Python 产物
 **/__pycache__/
 **/*.pyc
