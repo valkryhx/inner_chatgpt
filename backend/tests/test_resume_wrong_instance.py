@@ -241,3 +241,69 @@ def test_wrong_instance_does_not_rely_on_status_field(iso, monkeypatch):
 
 async def _await(value):
     return value
+
+
+# ============================================================ owner 是自己
+
+def test_own_generation_without_local_job_is_finished(iso, monkeypatch):
+    """owner 是**我自己**但本进程没有这个 job -> 当成结束，不能报 wrong_instance。
+
+    ## 这个 bug 是真机发现的（2026-11-19 多实例验证）
+
+    三个实例全返回 `409 wrong_instance`，包括**拥有那个 generation 的实例自己**。
+    原因是 `is_generation_dead_elsewhere` 对「owner 是我」刻意返回 False
+    （它的语义是「别人那边死没死」，自己的情况交给调用方用进程内状态判断）——
+    而 `_resume_decision` 把 False 一律解释成「别人还活着」。
+
+    后果不只是报错文案不准：客户端会去换 cookie 重试，而重试还会落到同一个
+    实例（那本来就是 owner），于是**重试永远无效**，用户看到死循环。
+
+    ## 正确语义
+
+    owner 是我 + 本进程没有 job = 这一轮在我这里已经结束/崩溃了。
+    这也是最常见的情形：用户点了停止、release_generation 还没落库。
+    """
+    from app.routers import chat
+
+    run(_seed(iso))
+
+    monkeypatch.setattr(chat.turn_job, "get_live_job_for_session",
+                        lambda *a, **kw: None)
+    from app import generation_owner
+    # 真实行为：owner 是自己时 is_generation_dead_elsewhere 返回 False
+    monkeypatch.setattr(generation_owner, "is_generation_dead_elsewhere",
+                        lambda *a, **kw: _await(False))
+    from app import team_store
+    monkeypatch.setattr(team_store, "get_active_generation",
+                        lambda *a, **kw: _await("g1"))
+
+    async def go():
+        from app.sandbox.identity import owner_id
+        await _set_gen_owner(iso, owner=owner_id())     # owner 就是我
+        return await chat._resume_decision("u1", "s1")
+
+    decision = run(go())
+    assert decision["kind"] == "finished", \
+        f"owner 是自己且无本地 job 时应当当成结束，实际 {decision}"
+
+
+def test_other_generation_still_reports_wrong_instance(iso, monkeypatch):
+    """对照：owner 是**别人**且活着 -> 仍然是 wrong_instance（不能因上一条改坏）。"""
+    from app.routers import chat
+
+    run(_seed(iso))
+
+    monkeypatch.setattr(chat.turn_job, "get_live_job_for_session",
+                        lambda *a, **kw: None)
+    from app import generation_owner
+    monkeypatch.setattr(generation_owner, "is_generation_dead_elsewhere",
+                        lambda *a, **kw: _await(False))
+    from app import team_store
+    monkeypatch.setattr(team_store, "get_active_generation",
+                        lambda *a, **kw: _await("g1"))
+
+    async def go():
+        await _set_gen_owner(iso, owner="other-host:9")
+        return await chat._resume_decision("u1", "s1")
+
+    assert run(go())["kind"] == "wrong_instance"

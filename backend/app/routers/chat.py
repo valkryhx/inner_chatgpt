@@ -1056,9 +1056,32 @@ async def _resume_decision(user_id: str, session_id: str) -> dict:
 
     from .. import generation_owner as _gen_owner
     active = await team_store.get_active_generation(user_id, session_id)
-    if active and not await _gen_owner.is_generation_dead_elsewhere(
+    if not active:
+        return {"kind": "finished"}
+
+    # ⚠️ 必须先判「owner 是不是我自己」（2026-11-19 真机发现）。
+    #
+    # `is_generation_dead_elsewhere` 的语义是「**别人**那边死没死」——owner 是
+    # 自己时它刻意返回 False（自己的情况由调用方用进程内状态判断）。如果直接
+    # 拿这个 False 当「别人还活着」，就会推出一个荒谬结论：**我是 owner，
+    # 但我应该去别的实例上找这条流**。
+    #
+    # 实测后果（三实例全 409，包括 owner 自己）：客户端换 cookie 重试，
+    # 而重试仍会落到同一实例（那本来就是 owner），于是**重试永远无效**，
+    # 表现为死循环。
+    #
+    # 正确语义：owner 是我 + 本进程没有这个 job = 这一轮在我这里已经结束
+    # 或崩溃了。这是最常见的情形（用户点停止，release_generation 尚未落库）。
+    owner = await _gen_owner.owner_of(user_id, session_id, active)
+    from ..sandbox.identity import owner_id as _my_owner
+    if owner and owner == _my_owner():
+        logger.info("续看：owner 是本实例但已无 job，按结束处理 user=%s session=%s gen=%s",
+                    user_id, session_id, active)
+        return {"kind": "finished", "active_generation_id": active}
+
+    if not await _gen_owner.is_generation_dead_elsewhere(
             user_id, session_id, active):
-        # owner 还活着 -> 它在别的实例上正常跑着。这不是结束，是「你连错了」。
+        # owner 是别人且还活着 -> 它在别的实例上正常跑着。这不是结束，是「你连错了」。
         logger.info("续看请求连错实例（owner 仍存活）user=%s session=%s active_gen=%s",
                     user_id, session_id, active)
         return {"kind": "wrong_instance", "active_generation_id": active}
