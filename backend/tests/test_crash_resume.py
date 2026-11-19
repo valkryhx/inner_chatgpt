@@ -225,17 +225,28 @@ def test_startup_marks_crashed_before_converging(isolated_db):
     结果真机验证发现标记永远是 0：因为 `db.init_db()` **内部**就把
     streaming 收敛成 stopped 了，标记跑在它后面看不到证据。
 
-    修法是把标记挪进 `init_db` 内部、夹在那条 UPDATE 之前。所以这里
+    修法是把标记挪进收敛逻辑内部、夹在 UPDATE 之前。所以这里
     改为断言源码里的**顺序**，而不是断言某个函数被调用。
+
+    ⚠️ 2026-11-19 起，收敛逻辑从 `init_db` 挪进了
+    `db.converge_stale_streaming`（多实例下要按 owner 过滤，见
+    `test_startup_converge_scope.py`）。断言目标跟着移动，**意图不变**：
+    标记必须写在 UPDATE 之前。
     """
     import inspect as _inspect
 
     from app import db
 
-    src = _inspect.getsource(db.init_db)
-    assert "_mark_crashed_before_converge" in src, "init_db 必须先建标记"
-    assert "status='stopped'" in src, "init_db 仍要收敛"
-    assert src.index("_mark_crashed_before_converge") < src.index("status='stopped'"), \
+    # 收敛仍必须挂在 init_db 上（启动路径不变）
+    init_src = _inspect.getsource(db.init_db)
+    assert "converge_stale_streaming" in init_src, \
+        "init_db 必须调用收敛函数，否则启动自愈就断了"
+
+    # 顺序断言的目标改成收敛函数本身
+    src = _inspect.getsource(db.converge_stale_streaming)
+    assert "mark_crashed" in src, "收敛前必须先建标记"
+    assert "status='stopped'" in src, "仍要收敛"
+    assert src.index("mark_crashed") < src.index("status='stopped'"), \
         "建标记必须在收敛之前，否则证据被抹掉"
 
 

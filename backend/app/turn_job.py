@@ -361,6 +361,32 @@ def live_job_count() -> int:
     return sum(1 for j in _JOBS.values() if not j.finished)
 
 
+def has_live_job_for_session(session_id: str, user_id: Optional[str] = None) -> bool:
+    """本进程是否有**这个会话**正在跑的 job。
+
+    ## 为什么需要它（2026-11-19）
+
+    `get_live_job_for_session` 要求同时给出 `user_id`，而启动收敛
+    （`db.converge_stale_streaming`）手上只有 messages 表里的 `session_id` ——
+    那张表没有 user_id 列。为了它去 JOIN sessions 表不值得，而且收敛是同步上下文。
+
+    这里的语义更弱但足够：**「本进程有没有这个会话的 job」**。
+    启动收敛用它来判断「streaming 消息的 owner 是我 → 我这边真有 job 在跑吗」。
+    只有 owner 已经是「我自己」时才会走到这里，所以不存在跨用户串扰
+    （session_id 是 `s_<hex>` 唯一生成）。
+
+    `user_id` 可选：传了就再收窄一层。
+    """
+    sid = str(session_id)
+    for (uid, s, _gid), job in list(_JOBS.items()):
+        if s != sid or job.finished:
+            continue
+        if user_id is not None and uid != str(user_id):
+            continue
+        return True
+    return False
+
+
 def start_job(job: TurnJob,
               runner: Callable[[TurnJob], Awaitable[None]]) -> TurnJob:
     """建 job 表项并启动任务。

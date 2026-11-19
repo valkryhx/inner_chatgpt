@@ -177,43 +177,144 @@ async def init_db() -> None:
                 cand = f"{base}{n}"
             await conn.execute("UPDATE users SET username=? WHERE id=?", (cand, uid))
         # 启动自愈：服务重启后，上一进程遗留的 assistant 消息会永远停在 streaming，
-        # 前端会一直显示“正在思考”。进程刚启动时不可能有真实生成在跑，全部收敛为 stopped。
+        # 前端会一直显示"正在思考"。
         #
-        # ⚠️ 顺序至关重要（持久化第二步）：**先**把「有 streaming 消息的会话」
-        # 标成崩溃中断，**再**收敛。反过来的话，「这一轮没走完」的证据就被
-        # 抹掉了，之后就再也分不出「用户主动停止」和「进程崩溃」——
-        # 而这两者的正确处置完全不同（前者可以重放工具，后者绝不能）。
+        # ⚠️ 多实例（2026-11-19 修）：**「进程刚启动不可能有真实生成在跑」只对本进程
+        # 成立，不对整个集群成立。** 原实现无条件 `UPDATE ... WHERE status='streaming'`，
+        # 于是每次 `docker compose up -d --scale app=N` 都会把现存实例正在跑的会话
+        # 全部标成 stopped（实测复现：tests/manual/probe_initdb_cross_instance_wipe.py，
+        # SQLite 与 PG 两种后端都是 FAIL）。
         #
-        # 这一步放在 init_db 内部而不是 main.py 里，正是因为它必须夹在
-        # 这条 UPDATE 之前。
-        try:
-            await _mark_crashed_before_converge(conn)
-        except Exception:  # noqa: BLE001 - 标记失败不该阻止启动
-            import logging
-            logging.getLogger(__name__).warning("崩溃标记建立失败", exc_info=True)
-        await conn.execute(
-            "UPDATE messages SET status='stopped' WHERE role='assistant' AND status='streaming'"
-        )
+        # 现在的判据与 `team_store.recover_stale_runtime` 完全一致：
+        # 只收敛「owner 不在存活集合里」的行。没配 Redis 时存活集合为空
+        # => 全清（单实例语义与迁移前完全一致）。
+        #
+        # 注意时序：本函数在 `main.py:48` 执行，而 `session_generations` 表要到
+        # `main.py:68`（team_store.init_tables）才建。所以这里在**本函数内**取存活
+        # 集合，否则拿不到；表不存在时按「没有 active generation」处理（收敛）。
+        await converge_stale_streaming(conn=conn)
         await conn.commit()
 
 
-async def _mark_crashed_before_converge(conn) -> int:
-    """在把 streaming 收敛为 stopped **之前**，把这些会话标成崩溃中断。
+async def converge_stale_streaming(conn=None, *, live_owners: set[str] | None = None,
+                                  my_owner: str | None = None) -> int:
+    """把**已死实例**遗留的 streaming 消息收敛为 stopped，返回处理条数。
 
-    只建表 + 写标记，不改 messages —— 收敛由调用方紧接着做。
-    返回标记的会话数（启动日志用）。
+    ## 判据
+
+    一条 streaming 消息该不该收敛，看它所属会话当前有没有「活着的」generation：
+
+    | 该会话的 active generation | 处置 |
+    | --- | --- |
+    | 没有（表不存在 / 该会话无 active 行） | **收敛** —— 最常见的历史数据形态 |
+    | 有，owner 为空串 | **收敛** —— 升级前遗留，不可能有活实例在跑 |
+    | 有，owner 是我且本进程有这个 job | **保留** —— 正常在跑 |
+    | 有，owner 是我但本进程没有这个 job | **收敛** —— 上个进程崩溃遗留 |
+    | 有，owner 是别人且在存活集合里 | **保留** —— 别的实例正在跑（本 bug 的核心） |
+    | 有，owner 是别人但不在存活集合 | **收敛** —— 那个实例死了 |
+
+    ## 必须先标记、后收敛
+
+    顺序反了「这一轮没走完」的证据就没了，之后分不出「用户主动停止」和
+    「进程崩溃」—— 而这两者的正确处置完全不同（前者可以重放工具，后者绝不能）。
+
+    ## 参数
+
+    - ``conn``：已有连接（init_db 内调用时传，避免再开一条）；不传则自己开。
+    - ``live_owners``：本集群活着的 owner 集合。不传则现场查
+      （`cluster.instances.live_owners()`，没配 Redis 返回空集合）。
+    - ``my_owner``：本实例标识。不传则现场取（`sandbox.identity.owner_id()`）。
     """
-    from . import turn_marker
+    if live_owners is None:
+        try:
+            from .cluster import instances as _inst
+            live_owners = await _inst.live_owners()
+        except Exception:  # noqa: BLE001
+            live_owners = set()
+    if my_owner is None:
+        try:
+            from .sandbox.identity import owner_id as _owner
+            my_owner = _owner()
+        except Exception:  # noqa: BLE001
+            my_owner = ""
 
-    await turn_marker.init_tables()   # 幂等
+    alive = {o for o in (live_owners or set()) if o}
+
+    async def _run(c) -> int:
+        doomed = await _sessions_to_converge(c, alive, my_owner)
+        if not doomed:
+            return 0
+        # 先标记（证据），再收敛（动作）。顺序不能反。
+        from . import turn_marker
+        try:
+            await turn_marker.init_tables()
+            for sid in doomed:
+                await turn_marker.mark_crashed(sid)
+        except Exception:  # noqa: BLE001 - 标记失败不该阻止收敛
+            import logging
+            logging.getLogger(__name__).warning("崩溃标记建立失败", exc_info=True)
+
+        ph = ",".join("?" for _ in doomed)
+        cur = await c.execute(
+            f"UPDATE messages SET status='stopped' "
+            f"WHERE role='assistant' AND status='streaming' "
+            f"AND session_id IN ({ph})",
+            tuple(doomed),
+        )
+        return cur.rowcount or 0
+
+    if conn is not None:
+        return await _run(conn)
+    async with sqlcompat.connect(DB_PATH) as c:
+        n = await _run(c)
+        await c.commit()
+    return n
+
+
+async def _sessions_to_converge(conn, alive: set[str], my_owner: str) -> list[str]:
+    """算出哪些会话的 streaming 消息**应当**收敛。
+
+    返回 session_id 列表。空列表 = 一条都不该动。
+    """
     cur = await conn.execute(
         "SELECT DISTINCT session_id FROM messages "
         "WHERE role='assistant' AND status='streaming'"
     )
     sessions = [r[0] for r in await cur.fetchall()]
+    if not sessions:
+        return []
+
+    # session_generations 由 team_store 建，可能还不存在（启动早期）。
+    try:
+        cur = await conn.execute(
+            "SELECT session_id, owner FROM session_generations WHERE status='active'"
+        )
+        rows = await cur.fetchall()
+        owner_by_session = {str(r[0]): str(r[1] or "") for r in rows}
+    except Exception:  # noqa: BLE001 - 表不存在 = 没有任何 active generation
+        owner_by_session = {}
+
+    from . import turn_job
+
+    doomed: list[str] = []
     for sid in sessions:
-        await turn_marker.mark_crashed(sid)
-    return len(sessions)
+        if sid not in owner_by_session:
+            doomed.append(sid)          # 没有 active generation -> 收敛
+            continue
+        owner = owner_by_session[sid]
+        if not owner:
+            doomed.append(sid)          # 老库 / 没记 owner -> 收敛
+            continue
+        if owner == my_owner:
+            # 我自己的：看本进程有没有真在跑这个会话的 job。
+            # 没有 -> 上个进程崩溃遗留（重启后 _JOBS 必然空）-> 收敛。
+            if not turn_job.has_live_job_for_session(sid):
+                doomed.append(sid)
+            continue
+        # 别人的：还活着就保留，死了才收敛。
+        if owner not in alive:
+            doomed.append(sid)
+    return doomed
 
 
 def _row_to_session(row: sqlcompat.Row) -> dict[str, Any]:

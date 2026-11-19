@@ -107,7 +107,21 @@ async def main() -> int:
 
         await db.init_db()
 
+        # 建 session_generations（真实场景里由 team_store.init_tables 建，
+        # 「实例 A 在跑」必然伴随一条 active + owner=A 的记录）。
+        from app import team_store
+        old_ts_path = team_store.DB_PATH
+        team_store.DB_PATH = target
+        try:
+            await team_store.init_tables()
+        finally:
+            team_store.DB_PATH = old_ts_path
+
         user_id, session_id, msg_id = "u_probe", "s_probe", "m_probe"
+        gen_id = "g_probe"
+        # 「实例 A」的标识。用真实的 owner_id() 形状 `<host>:<tag>`。
+        owner_a = "probe-host-a:111"
+        owner_b = "probe-host-b:222"
 
         async with sqlcompat.connect(target) as conn:
             await conn.execute(
@@ -125,6 +139,13 @@ async def main() -> int:
                 "VALUES(?,?,?,?,?,?)",
                 (msg_id, session_id, "assistant", "", db.now_ms(), "streaming"),
             )
+            # 关键：A 抢到了 generation 租约，owner 记成 A。
+            await conn.execute(
+                "INSERT INTO session_generations"
+                "(user_id,session_id,generation_id,status,started_at,owner) "
+                "VALUES(?,?,?,'active',?,?)",
+                (user_id, session_id, gen_id, db.now_ms(), owner_a),
+            )
             await conn.commit()
 
         async def read_status() -> str:
@@ -134,23 +155,31 @@ async def main() -> int:
             return str(row[0]) if row else "<missing>"
 
         before = await read_status()
-        print(f"实例 A 正在跑：status = {before!r}")
+        print(f"实例 A（{owner_a}）正在跑：status = {before!r}")
 
-        # 模拟「实例 B 启动」：再跑一次 init_db（新进程会这么做）
+        # 模拟「实例 B 启动」：再跑一次 init_db（新进程会这么做）。
+        #
+        # 关键点：B 启动时**A 还活着**，所以存活集合里应当有 A。
+        # 真实链路上 `main.py:48` 的 init_db 早于本实例注册，那时 live_owners()
+        # 查到的正是「别的活实例」（本实例还没登记，不影响：本实例本来也没有生成）。
         from app import turn_job
-        assert not turn_job._JOBS, "本进程应当没有 job（模拟新实例）"
-        await db.init_db()
+        assert not turn_job._JOBS, "本进程应当没有 job（模拟新实例 → B）"
+
+        # 直接调收敛函数并显式传存活集合，行为等价于 B 启动时的 init_db，
+        # 但不依赖 Redis 是否可连（探针要能离线跑）。
+        n = await db.converge_stale_streaming(
+            live_owners={owner_a}, my_owner=owner_b)
 
         after = await read_status()
-        print(f"实例 B 启动后：status = {after!r}")
+        print(f"实例 B（{owner_b}）启动后：status = {after!r}，收敛 {n} 条")
         print()
 
-        ok = after == "streaming"
+        ok = (after == "streaming") and n == 0
         if ok:
             print("PASS：新实例启动没有误伤别的实例正在跑的生成")
         else:
             print("FAIL：新实例启动把别的实例正在跑的生成标成了 stopped")
-            print("      根因：db.py:194-196 的启动自愈没有 owner / leader 过滤")
+            print("      根因：启动自愈没有按 owner + 存活集合过滤")
         return 0 if ok else 1
     finally:
         db.DB_PATH = old_db_path
