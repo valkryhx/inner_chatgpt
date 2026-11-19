@@ -1,0 +1,36 @@
+# 构建上下文裁剪。
+#
+# 没有这个文件时上下文是 346 MB —— 其中 328 MB 是 backend/data/
+# （记忆正文、工作区、日志），它在运行时由 `appdata` 卷提供，
+# 镜像里那份会被卷完全覆盖，纯属白传。
+#
+# 而且 data/ 里有用户写入的文件带异常权限位，docker 的 tar 打包
+# 直接报 `archive/tar: unknown file mode ?rwxr-xr-x`，构建失败。
+
+# 运行时数据：挂卷，不进镜像
+backend/data/
+backend/work/
+backend/logs/
+
+# 测试与手工脚本不进镜像（生产容器不跑它们）
+backend/tests/
+
+# 本地 Python 产物
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# 编辑器 / 系统垃圾
+**/.DS_Store
+**/Thumbs.db
+**/.idea/
+**/.vscode/
+**/*.log
+
+# 版本控制与部署辅助
+.git/
+.gitignore
+.gitattributes

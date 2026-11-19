@@ -56,8 +56,13 @@ services:
 
   app:
     build:
-      context: ..
-      dockerfile: deploy/Dockerfile
+      # ⚠️ compose 的路径（相对路径）是相对**本文件所在目录**（deploy/）解析的，
+      # 不是相对执行命令时的 cwd。Dockerfile 里写的是 `COPY backend/...`，
+      # 所以上下文必须是**仓库根**（deploy/ 的上一级的上一级）。
+      # 写 `..` 会指向 backend/，导致 `"/backend": not found`。
+      context: ../..
+      # `dockerfile` 相对**上下文**（仓库根）解析，所以要从根写全路径
+      dockerfile: backend/deploy/Dockerfile
     restart: unless-stopped
     depends_on:
       postgres:
