@@ -569,7 +569,7 @@ class EventTransport(Protocol):   # attach / publish / sync_frames / finish
 | 发布 + 序号重写 | `turn_job.py:296 publish`、`:216 _rewrite_seq` |
 | 三态续看（最新 / 增量 / sync 快照） | `turn_job.py:252 sync_frames` |
 | 续看决策函数（三选一） | `backend/app/routers/chat.py:1018 _resume_decision` |
-| 续看端点 | `backend/app/routers/chat.py:1070 resume_stream` |
+| 续看端点 | `backend/app/routers/chat.py:1093 resume_stream` |
 | 决策函数查进程内 job | `chat.py:1053` |
 | 并发生成 409 + 诚实判活 | `chat.py:937`（判活）、`:954`（抛 409） |
 | 停止信号（已跨实例） | `backend/app/cluster/stopsignal.py` |

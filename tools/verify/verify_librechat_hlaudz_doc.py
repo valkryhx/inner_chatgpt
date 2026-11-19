@@ -169,7 +169,7 @@ CASES: list[tuple[str, Path, int, str]] = [
     ("决策函数查进程内 job", HLAUDZ / "backend/app/routers/chat.py",
      1053, "job = turn_job.get_live_job_for_session(user_id, session_id)"),
     ("续看端点", HLAUDZ / "backend/app/routers/chat.py",
-     1070, "async def resume_stream(session_id: str, after: int = 0,"),
+     1093, "async def resume_stream(session_id: str, after: int = 0,"),
     ("并发租约", HLAUDZ / "backend/app/routers/chat.py",
      921, 'acquired = await team_store.acquire_generation(user["id"], session_id, generation_id)'),
     ("诚实判活", HLAUDZ / "backend/app/routers/chat.py",
