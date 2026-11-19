@@ -155,6 +155,48 @@ def mcp_call_timeout_s() -> float:
     return v
 
 
+# MCP 并发槽位的**排队**等待时长。
+#
+# ## 为什么原来硬编码 2 秒是个缺陷（2026-11-19 事故）
+#
+# `_call` 里写的是 `mcp_call(user_id, timeout_s=2.0)`：拿不到槽位就 2 秒放弃、
+# 直接抛 `capacity_exceeded`。事故里两个子代理占满槽位，父代理想自己补搜，
+# 连续两次都在 2 秒后被拒 —— **唯一的自救路径被掐掉了**
+# （docs/20261119-子代理卡死事故分析-MCP调用无超时.md §4）。
+#
+# 语义上「槽位满」应该是**排队**，不是**失败**：一次 MCP 调用本身允许 300 秒
+# （见 mcp_call_timeout_s），排队 2 秒就放弃完全没有道理。
+#
+# ## 为什么是 30 秒
+#
+# 要显著大于「一次正常的 MCP 调用耗时」（实测 exa 约 0.9s，慢的几十秒），
+# 又明显小于用户能感知的「卡住」。真正想快速失败时用环境变量调小。
+_DEFAULT_MCP_QUEUE_WAIT_S = 30.0
+_MCP_QUEUE_WAIT_ENV = "MCP_CALL_QUEUE_WAIT_S"
+_MCP_QUEUE_WAIT_MIN_S = 0.1
+_MCP_QUEUE_WAIT_MAX_S = 600.0
+
+
+def mcp_call_queue_wait_s() -> float:
+    """拿不到 MCP 并发槽位时，最多排队等多久（`MCP_CALL_QUEUE_WAIT_S` 可覆盖）。
+
+    坏配置一律退回默认：宁可等久一点，也不能因为环境变量写错就退回
+    「2 秒即失败」那套把用户自己锁死的行为。
+    """
+    import os
+
+    raw = os.environ.get(_MCP_QUEUE_WAIT_ENV)
+    if raw is None or not str(raw).strip():
+        return _DEFAULT_MCP_QUEUE_WAIT_S
+    try:
+        v = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_MCP_QUEUE_WAIT_S
+    if v < _MCP_QUEUE_WAIT_MIN_S or v > _MCP_QUEUE_WAIT_MAX_S:
+        return _DEFAULT_MCP_QUEUE_WAIT_S
+    return v
+
+
 class _McpCallTimeout(Exception):
     """单次 MCP 工具调用超时（内部信号，不外泄给模型）。
 
@@ -492,11 +534,15 @@ class MCPToolset:
                 text = await _invoke(payload)
             else:
                 # Keep the semaphore scope user-wide: several sessions or agents for
-                # the same user must share USER_MAX_MCP_CALLS.  Timeout is converted
-                # into a normal tool observation so the model can continue.
+                # the same user must share USER_MAX_MCP_CALLS.
+                #
+                # 槽位满时**排队**而不是 2 秒就失败：原来硬编码 `timeout_s=2.0`
+                # 在事故里掐掉了父代理的自救路径（见 mcp_call_queue_wait_s 的说明）。
+                # 排队超时仍转成正常 tool observation，模型能继续。
                 from .quota import QuotaExceeded, get_quota
                 try:
-                    async with get_quota().mcp_call(user_id, timeout_s=2.0):
+                    async with get_quota().mcp_call(
+                            user_id, timeout_s=mcp_call_queue_wait_s()):
                         text = await _invoke(payload)
                 except QuotaExceeded as exc:
                     return f"[工具执行错误] {exc}"

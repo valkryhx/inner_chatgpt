@@ -35,7 +35,19 @@ class Limits:
     global_subagents: int = _env_int("GLOBAL_MAX_ACTIVE_SUBAGENTS", 64)
     user_code_runs: int = _env_int("USER_MAX_CODE_RUNS", 2)
     global_code_runs: int = _env_int("GLOBAL_MAX_CODE_RUNS", 8)
-    user_mcp_calls: int = _env_int("USER_MAX_MCP_CALLS", 2)
+    # 用户级 MCP 并发：**不是**「一次模型调用能调几个工具」。
+    #
+    # 原来默认 2，含义是「同一用户同时最多 2 个 MCP 调用在飞」。这条在事故里
+    # 直接把用户自己锁死（2026-11-19，见 docs/20261119-子代理卡死事故分析-MCP调用无超时.md §4）：
+    #   2 个子代理各占 1 个槽位 → 父代理想自己补搜拿不到槽位 → capacity_exceeded。
+    # 而子代理上限默认 8（USER_MAX_ACTIVE_SUBAGENTS），两者自相矛盾：
+    # 允许开 8 个子代理，却只给 2 个 MCP 并发。
+    #
+    # 现在放到 8，与 USER_MAX_ACTIVE_SUBAGENTS 对齐 —— 「每个子代理同时能有一个
+    # MCP 调用在飞」是最自然的心智模型，父代理再占一个也够。
+    # 真正的护栏仍在：GLOBAL_MAX_MCP_CALLS=32 防单机打爆上游，
+    # 加上单次调用 300s 超时（mcp_client.mcp_call_timeout_s），不会无限占用。
+    user_mcp_calls: int = _env_int("USER_MAX_MCP_CALLS", 8)
     global_mcp_calls: int = _env_int("GLOBAL_MAX_MCP_CALLS", 32)
     user_acp_active: int = _env_int("INNER_ACP_MAX_ACTIVE_USER", 4)
     global_acp_active: int = _env_int("INNER_ACP_MAX_ACTIVE_GLOBAL", 80)
@@ -169,11 +181,28 @@ class QuotaManager:
 
     @asynccontextmanager
     async def mcp_call(self, user_id: str, *, timeout_s: float = 0.0) -> AsyncIterator[Lease]:
-        sems = [
-            self._global_mcp_calls,
-            self._user(self._user_mcp_calls, user_id, self.limits.user_mcp_calls),
-        ]
-        lease = await self._acquire_many(sems, timeout_s)
+        """用户级 + 全局 MCP 并发闸门。
+
+        拿不到槽位时的报错要能自查：只说 `capacity_exceeded` 时，
+        用户分不清是「自己多开」还是「槽位泄漏」——两者处置方式完全不同。
+        """
+        gates = (
+            ("全局 MCP", self._global_mcp_calls, self.limits.global_mcp_calls),
+            ("用户 MCP",
+             self._user(self._user_mcp_calls, user_id, self.limits.user_mcp_calls),
+             self.limits.user_mcp_calls),
+        )
+        sems = [sem for _, sem, _ in gates]
+        try:
+            lease = await self._acquire_many(sems, timeout_s)
+        except QuotaExceeded as exc:
+            # 水位取在失败**之后**，才是导致这次失败的真实状态。
+            snapshot = "，".join(
+                f"{label} {sem._value}/{limit}" for label, sem, limit in gates
+            )
+            raise QuotaExceeded(
+                f"{exc} [{snapshot}；user={user_id}]"
+            ) from exc
         try:
             yield lease
         finally:

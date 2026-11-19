@@ -273,9 +273,11 @@ npm run build        # 生成 frontend/dist
 |---|---|---|
 | `USER_MAX_CODE_RUNS` | 每个用户并发 `code_run` 上限 | 2 |
 | `GLOBAL_MAX_CODE_RUNS` | 全进程并发 `code_run` 上限 | 8 |
-| `USER_MAX_MCP_CALLS` | 每个用户并发 MCP 调用上限 | 2 |
+| `USER_MAX_MCP_CALLS` | 每个用户并发 MCP 调用上限 | 8 |
 | `GLOBAL_MAX_MCP_CALLS` | 全进程并发 MCP 调用上限 | 32 |
 | `MCP_CONNECT_TIMEOUT` | 单个用户 MCP server 连接超时（秒），超时/失败自动跳过 | 12 |
+| `MCP_CALL_TIMEOUT_S` | 单次 MCP 工具调用超时（秒）。**未设置时 SDK 是无限等待**，详见事故分析 doc | 300 |
+| `MCP_CALL_QUEUE_WAIT_S` | 拿不到 MCP 并发槽位时最多排队等多久（秒） | 30 |
 
 ### 文件下载
 
