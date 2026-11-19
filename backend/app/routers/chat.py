@@ -884,6 +884,14 @@ async def _try_queue_steer(user: dict, session_id: str,
     team_event("steer_queued", agent="root", team_id="", session_id=session_id,
                generation_id=active, queue_depth=depth,
                text_chars=len(body.text))
+    # 多实例：push 在 Redis 模式下是后台写。**返回 202 之前必须等它落盘**，
+    # 否则会出现「前端显示已排队，但服务端重启后那条消息从没进过 Redis」。
+    # 没配 Redis 时这个调用是空操作（本地写入是同步的）。
+    try:
+        from ..steer_queue import flush_pending
+        await flush_pending()
+    except Exception:  # noqa: BLE001
+        pass
     return JSONResponse(status_code=202, content={
         "queued": True,
         "generation_id": active,

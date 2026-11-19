@@ -82,3 +82,7 @@ skill_assets/
 # 崩溃时可能残留；它不是源码，不该入库）。
 backend/_probe_mw_boot.py
 work/probe_verify/
+
+# nginx E2E 每次运行会重写这份配置（tests/manual/nginx_sticky_e2e.py），
+# 内容随端口/容器名变化；正式配置是 deploy/nginx.conf。
+backend/deploy/_nginx_e2e.conf

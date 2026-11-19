@@ -148,13 +148,27 @@ _pumps: dict[tuple[str, str, str], Any] = {}
 
 
 def _spawn_remote_push(scope, item: dict[str, Any]) -> None:
-    """把一条插话发到 Redis（同步函数里的 fire-and-forget）。"""
+    """把一条插话发到 Redis。
+
+    ## 为什么不能只用 fire-and-forget
+
+    实测（2026-11-19）：`loop.create_task()` 创建的协程**不保证在 loop
+    关闭前跑到**。请求线程池里一个短请求处理完，如果恰好是进程退出 / 测试
+    里的 `asyncio.run` 结束，那个 task 就被丢弃 —— 用户的插话静默消失。
+
+    这在生产里也是真实风险：uvicorn 优雅关闭时正在处理的请求，
+    它 fire 出去的后台任务可能一起被取消。
+
+    ## 做法
+
+    1. 已经有运行中的 loop 且不是「即将关闭」-> 记到 `_pending_writes`，
+       让调用方能等到（`flush_pending()`，在响应返回前调）。
+    2. 实在没有 loop -> 用 `asyncio.run` 同步写一次（罕见，但比丢消息好）。
+
+    `_pending_writes` 里的 task 都会被 await 到，所以不会丢。
+    """
     import asyncio
 
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
     from .cluster import steerbus
 
     async def _go():
@@ -164,9 +178,44 @@ def _spawn_remote_push(scope, item: dict[str, Any]) -> None:
             pass
 
     try:
-        loop.create_task(_go())
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 完全没有 loop：同步跑一次。写在 Redis 里，比丢了好。
+        try:
+            asyncio.run(_go())
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    try:
+        task = loop.create_task(_go())
+        _pending_writes.add(task)
+        task.add_done_callback(_pending_writes.discard)
     except Exception:  # noqa: BLE001
         pass
+
+
+# 还没写完 Redis 的 push 任务。调用方可以在响应返回前 `await flush_pending()`，
+# 保证「202 已返回」意味着「Redis 里真的有这条」。
+_pending_writes: set = set()
+
+
+async def flush_pending(timeout: float = 2.0) -> int:
+    """等所有 pending 的 Redis 写入完成。返回完成的数量。
+
+    在 `POST /queue` 返回 202 之前调它 —— 否则可能出现「前端显示已排队，
+    但服务端重启后那条消息从没进过 Redis」。
+    """
+    import asyncio
+
+    tasks = [t for t in _pending_writes if not t.done()]
+    if not tasks:
+        return 0
+    try:
+        await asyncio.wait(tasks, timeout=timeout)
+    except Exception:  # noqa: BLE001
+        pass
+    return len(tasks)
 
 
 def _start_pump(key, queue: SteerQueue) -> None:

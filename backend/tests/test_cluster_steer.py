@@ -50,6 +50,7 @@ def no_redis(monkeypatch):
     cluster.reset_for_tests()
     steer_queue._queues.clear()
     steer_queue._pumps.clear()
+    steer_queue._pending_writes.clear()
     yield
     cluster.reset_for_tests()
     steer_queue._queues.clear()
@@ -64,6 +65,7 @@ def with_redis(monkeypatch):
     cluster.reset_for_tests()
     steer_queue._queues.clear()
     steer_queue._pumps.clear()
+    steer_queue._pending_writes.clear()
     yield
     cluster.reset_for_tests()
     steer_queue._queues.clear()
@@ -152,6 +154,9 @@ def test_local_push_goes_to_redis(with_redis):
     async def go():
         q = get_queue("u1", "s1", "g_push")
         q.push("本地补充")
+        # push 在 Redis 模式下是后台写，必须等它落盘才能查深度
+        from app.steer_queue import flush_pending
+        await flush_pending()
         # 等 fire-and-forget 的写入完成
         for _ in range(20):
             n = await steerbus.depth("u1", "s1", "g_push")
@@ -171,6 +176,8 @@ def test_pump_moves_item_to_redis_to_local(with_redis):
     async def go():
         q = get_queue("u1", "s1", "g_round")
         q.push("绕一圈回来")
+        from app.steer_queue import flush_pending
+        await flush_pending()
         for _ in range(40):
             got = q.drain()
             if got:
@@ -192,7 +199,8 @@ def test_drop_queue_clears_redis(with_redis):
     async def go():
         q = get_queue("u1", "s1", "g_drop")
         q.push("要丢掉的")
-        await asyncio.sleep(0.5)
+        from app.steer_queue import flush_pending
+        await flush_pending()
         drop_queue("u1", "s1", "g_drop")
         await asyncio.sleep(0.5)
         return await steerbus.depth("u1", "s1", "g_drop")
