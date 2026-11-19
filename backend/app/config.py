@@ -27,66 +27,34 @@ DB_PATH = DATA_DIR / "app.db"
 # (file read/write/patch, code_run working directory).
 SKILLS_DIR = DATA_DIR / "skills"
 WORKSPACES_DIR = DATA_DIR / "workspaces"
-# 沙箱 workspace 根（D:\sandbox）。
+# ---- workspace：单根（2026-11-19 收敛）----
 #
-# 为什么单独一个根，而不是继续用 backend/data/workspaces：
-# Docker Desktop 的镜像层与容器层实际落在 C 盘的 WSL2 vhdx 里，
-# 只有 **bind mount 的源目录** 才真正待在宿主磁盘上。把沙箱 workspace 放到
-# D:\sandbox，用户数据就不会随 Docker 数据一起占 C 盘。
+# 这里**曾经**还有一个 `SANDBOX_WORKSPACES_DIR` + `SANDBOX_WORKSPACE_USERS`，
+# 让白名单用户的 workspace 落到 `D:\sandbox/<uid>`。已整块删除。
 #
-# 每个用户一个独立子目录（D:\sandbox\<user_id>），互不混淆 ——
-# 这也是容器挂载的物理隔离基础（只挂自己那一个目录，不挂父目录）。
+# 删除的两个理由：
 #
-# 设计文档：docs/20261118-沙箱MVP设计与实施.md §6.3
+# 1. **它本来就不成立。** 双根是 Docker 方案的遗留（那时沙箱是一个容器，
+#    需要 `docker run -v D:\sandbox\<uid>:/ws` 挂「容器专属」目录）。
+#    bwrap 用 `--bind <workspace> /ws`，同一路径进出，任意目录都能 bind；
+#    容器里两个根又都在同一个 appdata 卷上，没有「哪个盘」的区别。
 #
-# ## 平台差异（2026-11-19 真机事故）
+# 2. **它已经在生产里造成错位了。** 2026-11-19 实测：
 #
-# 原来这里写死 `or r"D:\sandbox"`，不考虑平台。windows 下没问题，
-# **但 Linux 容器里它变成相对路径**，被拼到 `/app/backend` 下面：
+#        app     thinks u_c56b8337dd09 -> .../data/workspaces/u_c56b8337dd09
+#        sandbox thinks u_c56b8337dd09 -> .../data/sandbox/u_c56b8337dd09
 #
-#     /app/backend/D:\sandbox/u_c56b8337dd09/.subagents/co_xxx/worker_c
+#    成因是 `HLZ_SANDBOX_MVP_USERS` 在两个容器的 compose 里默认值写法不同
+#    （`${VAR-}` vs `${VAR-u_xxx,u_yyy}`），compose 在宿主各自插值。
+#    这就是设计文档 `20261118` §6.3 警告的「写进 A、读 B」。
 #
-# 名字里带反斜杠的畸形目录。它真的被创建出来了，所以多数工具靠
-# 「能在里面读写」侥幸工作 —— 直到 shell 的 `cd` 踩上去（hx 的
-# worker_c 卡在 `cd '/app/backend/D:\sandbox/...'`）。
+# **现在的不变量**：沙箱开关只决定「走不走沙箱」，不决定文件放哪。
+# `HLZ_SANDBOX_MVP_USERS` 仍然存在，但它只被 `sandbox/config.py` 用于
+# 「谁有权进沙箱」，不再影响路径。
 #
-# 所以默认值按平台走：Windows 保持 D:\sandbox（避免占 C 盘），
-# 其它平台落在 DATA_DIR 下（容器里那个 appdata 卷，天然可写）。
-def default_sandbox_root(is_windows: bool | None = None) -> Path:
-    """按平台给沙箱 workspace 根的默认值。
+# 历史背景（那个 D:\sandbox 默认值为什么曾是必需的）保留在
+# `docs/20261118-沙箱MVP设计与实施.md` §6.3，作为回滚参考。
 
-    抽成函数是为了能测：本机是 Windows，但必须验证 Linux 分支
-    （事故就发生在 Linux 容器里）。
-    """
-    if is_windows is None:
-        is_windows = os.name == "nt"
-    if is_windows:
-        return Path(r"D:\sandbox")
-    # 容器里 DATA_DIR 是挂载的 appdata 卷，可写且跟着卷走，
-    # 不需要额外挂载点。
-    return DATA_DIR / "sandbox"
-
-
-SANDBOX_WORKSPACES_DIR = Path(
-    os.environ.get("HLZ_SANDBOX_WORKSPACES_DIR") or default_sandbox_root()
-).expanduser()
-# 哪些用户的 workspace 落在沙箱根下（而非 backend/data/workspaces）。
-# MVP 只放 2 个白名单用户；其余用户的路径完全不变。
-# 判据与 sandbox/policy.py 的白名单一致（同一份环境变量），
-# 避免"容器挂 D、进程读 C"这种两套视图的错位。
-#
-# ⚠️ 必须区分「未设置」与「显式空串」：显式空串 = 全部用户都走沙箱根，
-# 这是有意义的配置（本地全量验收用）。写成 `os.environ.get(...) or default`
-# 会把空串吞掉、悄悄退回 2 人白名单 —— sandbox/config.py 的同名逻辑
-# 已经踩过这个坑，两边必须一致。
-_raw_ws_users = (
-    os.environ["HLZ_SANDBOX_MVP_USERS"]
-    if "HLZ_SANDBOX_MVP_USERS" in os.environ
-    else "u_c56b8337dd09,u_343a46896bff"
-)
-SANDBOX_WORKSPACE_USERS = tuple(
-    u.strip() for u in _raw_ws_users.split(",") if u.strip()
-)
 # Per-user memory store: file-of-truth `<slug>.md` + DB index.
 # 正文永远在文件里（模型可直接读写），DB 只放索引。见
 # docs/20261112-Hlaudz记忆系统实施方案.md §2。

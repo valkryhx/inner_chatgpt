@@ -18,8 +18,6 @@ from urllib.parse import unquote, urlparse
 
 from .config import (
     BUILTIN_SKILLS_DIR,
-    SANDBOX_WORKSPACES_DIR,
-    SANDBOX_WORKSPACE_USERS,
     SHARED_SKILLS_DIR,
     SKILLS_DIR,
     WORKSPACES_DIR,
@@ -49,21 +47,33 @@ def _resolve_under(root: Path, candidate: Path) -> Path:
 def workspaces_root(user_id: str) -> Path:
     """该用户的 workspace **根目录**（不创建）。
 
-    白名单用户（MVP 沙箱用户）落在 ``D:\\sandbox/<user_id>``，
-    其余用户仍是 ``backend/data/workspaces/<user_id>``。
+    ## 一个用户，一个根，不受任何沙箱开关影响
 
-    为什么必须让两边一致：容器挂载的是这个目录，而 ``file_read`` / ``file_glob``
-    等只读工具仍在**进程内**跑，读的也是这个目录。若两者指向不同位置，
-    就会出现「file_write 写进容器、file_read 读不到」的两套视图错位
-    （设计文档 §5.1、§7.2）。
+    这里**曾经**有两个根：白名单用户落 `D:\\sandbox/<uid>`，其余落
+    `backend/data/workspaces/<uid>`。那个分支已删除，理由是它本来就不成立：
+
+    - 它是 **Docker 方案**的遗留（那时沙箱是一个容器，需要
+      `docker run -v D:\\sandbox\\<uid>:/ws` 挂一个「容器专属」目录）
+    - bwrap 用 `--bind <workspace> /ws`，**同一路径进出**，任意目录都能 bind
+    - 容器里两个根都在同一个 appdata 卷上，没有「哪个盘」的区别
+
+    而它的成本是真的。2026-11-19 实测到生产错位：
+
+        app     thinks u_c56b8337dd09 -> .../data/workspaces/u_c56b8337dd09
+        sandbox thinks u_c56b8337dd09 -> .../data/sandbox/u_c56b8337dd09
+
+    成因是 `HLZ_SANDBOX_MVP_USERS` 在两个容器的 compose 默认值不同。
+    这就是设计文档 `20261118` §6.3 警告的「file_write 写进 A、file_read 读 B」
+    两套视图错位，只是恰好还没被真实用户踩到。
+
+    **现在的不变量**：沙箱开关（MODE / BACKEND / MVP_USERS）只决定
+    「走不走沙箱」，**不决定文件放哪**。两件事分开了，就不会再错位。
 
     这里直接读**本模块的全局名**（调用时求值，不是导入时快照），
     因此测试可以用 ``monkeypatch.setattr(workspace, "WORKSPACES_DIR", tmp)``
     把路径关进 tmp —— 全仓 20 处测试依赖这个行为。
     """
     _reject_unsafe_segment(user_id)
-    if user_id in SANDBOX_WORKSPACE_USERS:
-        return SANDBOX_WORKSPACES_DIR / user_id
     return WORKSPACES_DIR / user_id
 
 
