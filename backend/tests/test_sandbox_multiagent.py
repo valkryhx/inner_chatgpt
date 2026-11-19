@@ -168,10 +168,8 @@ def test_write_file_uses_user_root_as_mount(ws_root=None, monkeypatch=None):
     import tempfile, pathlib
 
     tmp = pathlib.Path(tempfile.mkdtemp())
-    old_ws, old_users = wsmod.WORKSPACES_DIR, wsmod.SANDBOX_WORKSPACE_USERS
+    old_ws = wsmod.WORKSPACES_DIR
     wsmod.WORKSPACES_DIR = tmp
-    wsmod.SANDBOX_WORKSPACES_DIR = tmp
-    wsmod.SANDBOX_WORKSPACE_USERS = ("u_x",)
     try:
         acquired: list[str] = []
 
@@ -207,8 +205,7 @@ def test_write_file_uses_user_root_as_mount(ws_root=None, monkeypatch=None):
             "（用 write_root 当挂载点会让子代理脚本写到容器看不到的位置）")
     finally:
         wsmod.WORKSPACES_DIR = old_ws
-        wsmod.SANDBOX_WORKSPACES_DIR = old_ws
-        wsmod.SANDBOX_WORKSPACE_USERS = old_users
+        wsmod.WORKSPACES_DIR = old_ws
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -228,11 +225,8 @@ def test_manager_concurrent_agents_use_separate_dirs():
     import app.workspace as wsmod
 
     tmp = pathlib.Path(tempfile.mkdtemp())
-    old = (wsmod.WORKSPACES_DIR, wsmod.SANDBOX_WORKSPACES_DIR,
-           wsmod.SANDBOX_WORKSPACE_USERS)
+    old = (wsmod.WORKSPACES_DIR,)
     wsmod.WORKSPACES_DIR = tmp
-    wsmod.SANDBOX_WORKSPACES_DIR = tmp
-    wsmod.SANDBOX_WORKSPACE_USERS = ("u_x",)
     try:
         seen: list[dict] = []
 
@@ -278,7 +272,6 @@ def test_manager_concurrent_agents_use_separate_dirs():
             assert ".subagents" in rec["host"] and agent in rec["host"], (
                 f"{agent} 的脚本落盘路径不对：{rec['host']}")
     finally:
-        wsmod.WORKSPACES_DIR, wsmod.SANDBOX_WORKSPACES_DIR, \
-            wsmod.SANDBOX_WORKSPACE_USERS = old
+        wsmod.WORKSPACES_DIR, = old
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)

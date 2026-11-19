@@ -98,6 +98,52 @@ def format_code_run_header(code_type: str, code: str, exit_code: int, cwd) -> st
     return f"[code_run {code_type}] exit={exit_code}{suffix} cwd={cwd}" + chr(10)
 
 
+def _sandbox_bypass_allowed(tool: str) -> bool:
+    """沙箱分流抛异常时，能不能回落进程内执行？
+
+    ## 这是一个安全判断，不是容错判断
+
+    原来三处沙箱分流都写成：
+
+        except Exception:   # noqa: BLE001 - 沙箱故障不能打断工具本身
+            logger.warning("...回落进程内")
+        return _impl(...)   # ← 无隔离执行
+
+    初衷是「别让沙箱的 bug 弄挂工具」，但它把 **strict 的安全承诺**一起吞了：
+    `manager._handle_unavailable` 在 strict 下刻意 `raise SandboxUnavailable`
+    （意思就是「不许跑」），这个裸 except 把异常接住后照跑不误。
+
+    实测（2026-11-19）：`HLZ_SANDBOX_MODE=strict` + 沙箱不可用，代码仍然在
+    app 进程里执行成功、文件真的落盘了。用户看不到任何提示 ——
+    **比 auto 更危险**，因为 auto 至少会在结果首行标「本次未隔离」。
+
+    ## 规则
+
+    - `strict`：**任何**沙箱分流异常都不回落。用户的明确选择是
+      「宁可失败也不能在无隔离下跑」，容错不能覆盖这个选择。
+    - `auto`：回落进程内（这是它的设计），但调用方必须把「未隔离」标记
+      放在结果首行，不能静默。
+    - `off`：压根不会走到分流分支。
+
+    Returns:
+        True 表示允许回落进程内；False 表示必须拒绝执行。
+    """
+    from .sandbox.config import get_config
+
+    mode = get_config().mode
+    if mode == "strict":
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "沙箱分流失败且 mode=strict：不回落进程内（tool=%s）。"
+            "这是安全语义，不是 bug —— 要允许降级请改用 auto。",
+            tool,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
 def _with_budget(user_id: str, tool_name: str, text: str) -> str:
     """统一结果预算：超限落盘到 workspace/.hlaudz/tool_results 并给回可读路径。"""
     from .tool_budget import apply_budget, budget_dir_for
@@ -412,7 +458,11 @@ def build_builtin_tools(
                     user_id, str(args.get("path", "")), text, mode,
                     root=root, registry=read_registry,
                 )
-        except Exception:  # noqa: BLE001 - 沙箱故障不能打断工具本身
+        except Exception as exc:  # noqa: BLE001
+            # strict 下不回落进程内（否则等于没有沙箱）。返回失败结果，不向上抛
+            # —— 抛异常会打断 agent 循环。
+            if not _sandbox_bypass_allowed("file_write"):
+                return f"[sandbox] 沙箱不可用，已按 strict 拒绝写入：{exc}"
             import logging
             logging.getLogger(__name__).warning("file_write 沙箱分流失败，回落进程内", exc_info=True)
         return _write_impl(
@@ -441,7 +491,11 @@ def build_builtin_tools(
                     user_id, str(args.get("path", "")), old_c, new_c,
                     root=root, registry=read_registry,
                 )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # strict 下不回落进程内（否则等于没有沙箱）。返回失败结果，不向上抛
+            # —— 抛异常会打断 agent 循环。
+            if not _sandbox_bypass_allowed("file_patch"):
+                return f"[sandbox] 沙箱不可用，已按 strict 拒绝修改：{exc}"
             import logging
             logging.getLogger(__name__).warning("file_patch 沙箱分流失败，回落进程内", exc_info=True)
         return _patch_impl(
@@ -484,7 +538,12 @@ def build_builtin_tools(
                     generation_id=generation_id, agent_id=agent_id,
                 )
                 return _with_budget(user_id, "code_run", out + "\n" + raw)
-        except Exception:  # noqa: BLE001 - 沙箱故障不能打断工具本身
+        except Exception as exc:  # noqa: BLE001
+            # strict 下不回落进程内（否则等于没有沙箱）。返回失败结果，不向上抛
+            # —— 抛异常会打断 agent 循环。这正是实测到的漏洞：
+            # strict + 沙箱不可用时代码仍然在 app 进程里执行了。
+            if not _sandbox_bypass_allowed("code_run"):
+                return f"[sandbox] 沙箱不可用，已按 strict 拒绝执行：{exc}"
             import logging
             logging.getLogger(__name__).warning("code_run 沙箱分流失败，回落进程内", exc_info=True)
         raw = await _run_code_impl(

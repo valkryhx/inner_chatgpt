@@ -27,22 +27,24 @@ def run(coro):
 
 @pytest.fixture()
 def ws_root(tmp_path, monkeypatch):
-    """把两个 workspace 根都指到 tmp，避免碰真实数据（尤其是真实的 D:\\sandbox）。
+    """把 workspace 根指到 tmp，避免碰真实数据。
 
     ``workspaces_root()`` 读的是 ``workspace`` 模块的全局名，所以这里 patch
     的是 ``workspace`` 而不是 ``app_config`` —— 全仓 20 处既有测试都这么写，
     不要改成 patch config（那会让它们全部失效）。
 
-    ⚠️ 必须同时 patch ``SANDBOX_WORKSPACES_DIR``：白名单用户解析到它，
-    只 patch ``WORKSPACES_DIR`` 会让测试用户落到真实 ``D:\\sandbox`` 下，
-    与上一轮测试留下的文件串味（曾因此让 read-before-write 门禁误触发）。
+    ## 2026-11-19 收敛后
+
+    只剩一个根，所以这里只 patch ``WORKSPACES_DIR``。
+    原来还要 patch ``SANDBOX_WORKSPACES_DIR`` / ``SANDBOX_WORKSPACE_USERS``
+    （双根 + 白名单），那两个常量已删除。
+
+    历史上必须同时 patch 两个根，是因为白名单用户会解析到真实
+    ``D:\\sandbox``，与上一轮测试留下的文件串味（曾让 read-before-write
+    门禁误触发）。收敛后这个陷阱本身消失了 —— 这也是单根的一个实际收益。
     """
     monkeypatch.setattr(workspace, "WORKSPACES_DIR", tmp_path / "ws")
-    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACES_DIR", tmp_path / "sandbox")
     monkeypatch.setattr(app_config, "WORKSPACES_DIR", tmp_path / "ws")
-    monkeypatch.setattr(app_config, "SANDBOX_WORKSPACES_DIR", tmp_path / "sandbox")
-    # 默认白名单为空：测试用户走普通 workspace，保持路径可预测
-    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ())
     return tmp_path
 
 
@@ -124,7 +126,6 @@ def test_strict_code_run_goes_to_container(ws_root, monkeypatch, fake_manager):
     monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
     monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
     sbx_config.get_config(reload=True)
-    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
 
     t = tools_for("u_mvp")
     out = call(t["code_run"], code="print(1)")
@@ -148,7 +149,6 @@ def test_strict_file_write_goes_to_container(ws_root, monkeypatch, fake_manager)
     monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
     monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
     sbx_config.get_config(reload=True)
-    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
 
     t = tools_for("u_mvp")
     out = call(t["file_write"], path="b.txt", content="content")
@@ -164,7 +164,6 @@ def test_auto_degrade_marks_result(ws_root, monkeypatch, fake_manager):
     monkeypatch.setenv("HLZ_SANDBOX_MODE", "auto")
     monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
     sbx_config.get_config(reload=True)
-    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
     # 模拟容器不可用：exec_code 返回 handled=False + 降级说明
     fake_manager["code"] = (False, "[sandbox] 本次未隔离：模拟原因（当前模式 auto）", "")
 
@@ -178,26 +177,32 @@ def test_auto_degrade_file_write_still_writes(ws_root, monkeypatch, fake_manager
     monkeypatch.setenv("HLZ_SANDBOX_MODE", "auto")
     monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
     sbx_config.get_config(reload=True)
-    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
     fake_manager["write"] = (False, "[sandbox] 本次未隔离：模拟原因（当前模式 auto）")
 
     t = tools_for("u_mvp")
     out = call(t["file_write"], path="fresh-degraded.txt", content="degraded-write")
     assert "未隔离" in out
-    # u_mvp 在沙箱白名单里 -> workspace 根是 sandbox/，降级后的进程内写入也该落在那里
-    f = ws_root / "sandbox" / "u_mvp" / "fresh-degraded.txt"
+    # 单根（2026-11-19 收敛）：白名单不影响路径，任何用户都落 ws/<uid>。
+    # 这条断言原来写的是 `ws_root / "sandbox" / "u_mvp"`（双根时代的路径），
+    # 收敛后变成普通根 —— 顺带证明了「白名单不再改变文件位置」。
+    f = ws_root / "ws" / "u_mvp" / "fresh-degraded.txt"
     assert f.exists() and f.read_text(encoding="utf-8") == "degraded-write"
 
 
-# ---------------- 沙箱抛异常不能打断工具 ----------------
+# ---------------- 沙箱异常：auto 回落 / strict 拒绝 ----------------
 
 
-def test_sandbox_exception_falls_back(ws_root, monkeypatch):
-    """沙箱层任何异常都必须回落进程内，不能把工具本身弄挂。"""
-    monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
+def test_sandbox_exception_falls_back_in_auto(ws_root, monkeypatch):
+    """`auto` 下沙箱层异常回落进程内，不能把工具本身弄挂。
+
+    ⚠️ 这条原来用的是 `strict`，断言「任何异常都必须回落进程内」——
+    那正是 2026-11-19 修掉的安全漏洞：strict 下回落 = 无隔离执行，
+    而用户选 strict 的意思就是「宁可失败也别无隔离跑」。
+    现在按 mode 分开测，见下一条。
+    """
+    monkeypatch.setenv("HLZ_SANDBOX_MODE", "auto")
     monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
     sbx_config.get_config(reload=True)
-    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
 
     class BoomMgr:
         async def exec_code(self, *a, **kw):
@@ -207,7 +212,33 @@ def test_sandbox_exception_falls_back(ws_root, monkeypatch):
 
     t = tools_for("u_mvp")
     out = call(t["code_run"], code="print('survived')")
-    assert "survived" in out, "沙箱异常后工具仍要能跑"
+    assert "survived" in out, "auto 下沙箱异常后工具仍要能跑"
+
+
+def test_sandbox_exception_does_not_fall_back_in_strict(ws_root, monkeypatch):
+    """★ `strict` 下沙箱异常**不许**回落进程内。
+
+    这是安全语义：strict 的承诺是「沙箱不可用就失败」。回落会让它
+    退化成「无隔离执行且不告警」—— 比 auto 还危险（auto 至少留痕）。
+    """
+    monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
+    monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
+    sbx_config.get_config(reload=True)
+
+    class BoomMgr:
+        async def exec_code(self, *a, **kw):
+            raise RuntimeError("沙箱炸了")
+
+    monkeypatch.setattr(sbx_manager, "get_manager", lambda **_kw: BoomMgr())
+
+    t = tools_for("u_mvp")
+    out = call(t["code_run"], code="print('SHOULD_NOT_RUN')")
+    assert "SHOULD_NOT_RUN" not in out, (
+        f"strict 下沙箱异常仍然执行了用户代码：{out[:200]!r}"
+    )
+    assert "sandbox" in out.lower() or "沙箱" in out, (
+        f"strict 失败必须明确告知，实际：{out[:200]!r}"
+    )
 
 # ---------------- 可观测性：分流必须留痕（自测/排查的唯一判据） ----------------
 
@@ -227,7 +258,6 @@ def test_sandbox_path_emits_log(ws_root, monkeypatch, caplog):
     monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
     monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
     sbx_config.get_config(reload=True)
-    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
 
     # 假 runtime：exec 直接返回固定结果，不起容器
     class FakeRuntime:
@@ -267,7 +297,6 @@ def test_in_process_path_emits_no_sandbox_log(ws_root, monkeypatch, caplog):
     monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
     monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
     sbx_config.get_config(reload=True)
-    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ())
 
     with caplog.at_level(logging.INFO, logger="app.sandbox"):
         t = tools_for("u_other")
@@ -325,7 +354,6 @@ def test_write_result_does_not_leak_host_path(ws_root, monkeypatch):
     monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")
     monkeypatch.setenv("HLZ_SANDBOX_MVP_USERS", "u_mvp")
     sbx_config.get_config(reload=True)
-    monkeypatch.setattr(workspace, "SANDBOX_WORKSPACE_USERS", ("u_mvp",))
 
     mgr = sbx_manager.SandboxManager(cfg=sbx_config.get_config(), pool=_fake_pool())
     monkeypatch.setattr(sbx_manager, "get_manager", lambda **_kw: mgr)

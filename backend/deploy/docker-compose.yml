@@ -69,6 +69,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # 注意：这里用 `service_started` 而不是 `service_healthy`。
+      #
+      # 为什么：沙箱服务挂了不该让 app 起不来。app 在 `mode=auto` 下
+      # 有能力降级（退回进程内 + 结果首行标「本次未隔离」），
+      # 在 `mode=off` 下根本不碰它。用 `service_healthy` 会把两个服务的
+      # 可用性绑死 —— 沙箱出问题 = 整个产品不可用，这比隔离失效更糟。
+      sandbox:
+        condition: service_started
     environment:
       HLZ_DB_URL: postgresql://hlz:${POSTGRES_PASSWORD}@postgres:5432/hlaudz
       HLZ_REDIS_URL: redis://redis:6379/0
@@ -95,28 +103,163 @@ services:
       #
       # 真撞了会被 `cluster.instances._claim_owner` 检测到并打 WARNING。
       HLZ_INSTANCE_ID: ${HLZ_INSTANCE_ID:-}
-      # 沙箱：容器里跑容器需要挂 docker socket，风险很大。
-      # 多实例部署建议先关闭沙箱（工具退回进程内执行），或每个实例
-      # 独占一台机器后再打开。
+      # ---- 沙箱（方案：docs/20261119-沙箱服务化方案-bwrap版.md）----
+      #
+      # 三个开关正交（方案 §6.2.1）：
+      #   MODE    = 用不用沙箱（off / auto / strict）
+      #   BACKEND = 走哪个实现（inproc = 旧 Docker 路径 / service = 独立服务）
+      #
+      # ⚠️ 回滚路径：出问题时把 BACKEND 改成 inproc，一个变量切回旧实现，
+      #    不用回滚镜像（方案 §6.3 硬要求）。
+      #
+      # ⚠️ MODE 保持 off 时，BACKEND 与下面的服务地址**完全被忽略**
+      #    （有测试钉死：off 模式下一个 HTTP 都不发）。
       HLZ_SANDBOX_MODE: ${HLZ_SANDBOX_MODE:-off}
-      # 沙箱 workspace 根。**必须显式给容器内路径**。
+      HLZ_SANDBOX_BACKEND: ${HLZ_SANDBOX_BACKEND:-service}
+      HLZ_SANDBOX_SERVICE_URL: http://sandbox:8021
+      HLZ_SANDBOX_SERVICE_TOKEN: ${HLZ_SANDBOX_SERVICE_TOKEN:-}
+      # 白名单：哪些用户**有权进沙箱**（不决定文件放哪，见下）。
       #
-      # 原来不设这个变量，于是 app/config.py 用了默认值 `D:\sandbox` ——
-      # 那是 Windows 宿主机路径，在 Linux 容器里被当成相对路径拼到
-      # `/app/backend` 下面，得到名字带反斜杠的畸形目录
-      # `/app/backend/D:\sandbox/<uid>/...`。
+      # ⚠️ 两侧（app / sandbox）的写法必须**逐字相同**。
+      #    compose 的 `${VAR-default}` / `${VAR:-default}` 是在**宿主**插值的，
+      #    两个服务各自求值 —— 只要写法不同，容器里看到的默认值就不同。
       #
-      # 它真的会被创建出来，所以多数工具靠「能在里面读写」侥幸工作，
-      # 直到 shell 的 `cd` 踩上去（2026-11-19：hx 的 worker_c 卡在
-      # `cd '/app/backend/D:\sandbox/...'`）。
+      #    2026-11-19 实测过这个坑：app 写 `${VAR-}`（空默认）、
+      #    sandbox 写 `${VAR-u_xxx,u_yyy}`（白名单默认），于是
+      #    app 认为白名单用户在 workspaces/、sandbox 认为在 sandbox/，
+      #    两套视图错位。现在路径已收敛成单根，但「谁有权进沙箱」
+      #    仍会因此不一致，所以写法必须一致。
       #
-      # 这里落在 appdata 卷里，天然可写、跟着卷走。
-      HLZ_SANDBOX_WORKSPACES_DIR: /app/backend/data/sandbox
+      # 空串 = 不限制 = **全部用户**都能进沙箱（`sandbox/config.py::user_in_scope`）。
+      HLZ_SANDBOX_MVP_USERS: ${HLZ_SANDBOX_MVP_USERS-}
+      # workspace 根。**只有一个根**，沙箱开关不影响它（2026-11-19 收敛）。
+      #
+      # 这里曾经还有一个 `HLZ_SANDBOX_WORKSPACES_DIR=/app/backend/data/sandbox`，
+      # 让白名单用户落到另一个目录。已删除：双根是 Docker 方案（容器要挂专属目录）
+      # 的遗留，bwrap 用 `--bind <workspace> /ws` 同路径进出，不需要。
+      #
+      # ★ 必须与 sandbox 服务的同一个变量**完全一致**，否则 app 读 A、沙箱写 B。
+      HLZ_WORKSPACES_DIR: /app/backend/data/workspaces
       # 多实例下必须关：这个开关让「路径 -> PG schema」，是测试隔离用的
       HLZ_PG_SCHEMA_PER_PATH: "0"
     volumes:
       - appdata:/app/backend/data
     # 不写 ports：多副本时固定端口会冲突。对外走下面的 nginx。
+
+  # ---- 一次性权限初始化：把沙箱需要写的两个子树交给 uid 1000 ----
+  #
+  # 为什么需要这个服务：
+  #   appdata 卷里 `workspaces/` 与 `sandbox/` 由 app 容器以 **root** 创建
+  #   （`drwxr-xr-x root root`），而沙箱服务按设计跑 uid 1000（非 root，
+  #   否则 RLIMIT_NPROC 失效、fork 炸弹拦不住）。直接起会：
+  #
+  #       PermissionError: [Errno 13] '/app/backend/data/workspaces'
+  #
+  #   **只 chown 这两个子树**是有意的：appdata 里还有 memories/、logs/ 等，
+  #   放宽整个卷的权限是拿安全换方便。沙箱服务只该碰 workspace。
+  #
+  # 用 `alpine` + `chown` 而不是给沙箱镜像加 entrypoint：
+  #   改镜像会让这个权限逻辑和业务代码混在一起，而且每次重建镜像都要重跑。
+  #   独立的一次性容器职责单一、可重复执行（幂等）。
+  sandbox-perms:
+    image: alpine:latest
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        mkdir -p /data/workspaces /data/sandbox /data/sandbox-archives
+        chown -R 1000:1000 /data/workspaces /data/sandbox /data/sandbox-archives
+        chmod 750 /data/workspaces /data/sandbox /data/sandbox-archives
+        echo "perms ok:"
+        ls -ld /data/workspaces /data/sandbox /data/sandbox-archives
+    volumes:
+      - appdata:/data
+
+  # ---- 沙箱服务：独立容器，bwrap 运行时 ----
+  #
+  # 方案：docs/20261119-沙箱服务化方案-bwrap版.md
+  #
+  # 与旧方案（app 里 docker.from_env）的关键差别：
+  #   1. **不挂 docker.sock** —— bwrap 只调内核原语，不需要容器运行时。
+  #      这是本方案相对 Docker 方案的核心收益（逃逸门槛从「一条命令」变成
+  #      「要内核漏洞」）。
+  #   2. **独立镜像** —— 用户代码要用的包装在**这个**镜像里，不进 app 镜像。
+  #   3. **跑非 root** —— 实测 RLIMIT_NPROC 在 root 下静默失效
+  #      （起满 60 个进程），非 root 才拦得住 fork 炸弹（拦在第 18 个）。
+  #
+  # ⚠️ 必须与 app 挂**同一个 appdata 卷**：
+  #   app 算 workspace 路径 → bwrap bind 那个目录 → 两边必须看到同一份。
+  #   实测三个 app 实例共享同一 inode，沙箱服务挂上去也看到同一份。
+  sandbox:
+    build:
+      context: ../..
+      dockerfile: backend/sandbox_service/Dockerfile
+    image: hlz-sandbox-svc:latest
+    restart: unless-stopped
+    depends_on:
+      # 必须先跑完权限初始化，否则非 root 写不进 workspace 目录
+      sandbox-perms:
+        condition: service_completed_successfully
+    environment:
+      # 服务间共享 token。**没配就拒绝服务**（503），不会裸奔。
+      HLZ_SANDBOX_SERVICE_TOKEN: ${HLZ_SANDBOX_SERVICE_TOKEN:?需要设置 HLZ_SANDBOX_SERVICE_TOKEN}
+      # ★ 池的四个开关（方案 §4.7 / §6.2.1）
+      #
+      # MAX_SLOTS：保护阀 = 同时能服务几个人（槽是专属的，换不了用户）。
+      #   实测：1 槽 27MB / 3 槽 143MB / 单槽边际 ≈53MB（预导入 pandas+matplotlib）。
+      #   当前单机测试最多 3 并发，所以设 3。
+      HLZ_SANDBOX_MAX_SLOTS: ${HLZ_SANDBOX_MAX_SLOTS:-3}
+      # OVERFLOW：槽满时的行为
+      #   queue  = 等一个槽空出来（单机槽少时推荐：淘汰要付 880ms 重建）
+      #   evict  = 淘汰最久未用的空闲槽（槽多时用）
+      #   reject = 立刻 503（上层已有队列时用）
+      HLZ_SANDBOX_OVERFLOW: ${HLZ_SANDBOX_OVERFLOW:-queue}
+      # 空闲多久回收槽。单机资源紧，5 分钟就收。
+      HLZ_SANDBOX_IDLE_TTL_S: ${HLZ_SANDBOX_IDLE_TTL_S:-300}
+      # 预导入清单：固定，不按请求动态 import（否则用户数据进父进程 → 跨租户泄漏）
+      HLZ_SANDBOX_PRELOAD: ${HLZ_SANDBOX_PRELOAD:-numpy,pandas,matplotlib}
+      # ★ 路径必须与 app 侧完全一致，否则「app 读 A、沙箱写 B」双视图错位。
+      #   单根（2026-11-19 收敛）：只有这一个 workspace 根，
+      #   不再有 `HLZ_SANDBOX_WORKSPACES_DIR`（那是 Docker 方案的遗留）。
+      HLZ_WORKSPACES_DIR: /app/backend/data/workspaces
+      # 白名单：写法必须与 app 服务上那条**逐字相同**（见 app 服务的注释）。
+      # 注意本服务其实不读它（路径已与白名单解耦），但保留同名同值是为了
+      # 让「两个容器看到的配置一致」这件事本身可断言。
+      HLZ_SANDBOX_MVP_USERS: ${HLZ_SANDBOX_MVP_USERS-}
+      # 归档目录（在 appdata 卷里，与 app 共享）
+      HLZ_SANDBOX_ARCHIVE_DIR: /app/backend/data/sandbox-archives
+    volumes:
+      # ★ 必须与 app 同一个卷，否则 workspace 对不上
+      - appdata:/app/backend/data
+    # ⚠️ 权限问题的现实：appdata 卷里的目录是 **app 容器以 root 创建**的
+    #    （`drwxr-xr-x root root`），而本服务按设计跑 uid 1000（非 root，
+    #    否则 RLIMIT_NPROC 静默失效）。于是 uid 1000 写不进去：
+    #
+    #        PermissionError: [Errno 13] '/app/backend/data/workspaces'
+    #
+    #    三个选项，选了第 3 个：
+    #      1. 服务跑 root —— **否决**：RLIMIT_NPROC 在 root 下失效，
+    #         fork 炸弹拦不住（实测起满 60 个）。
+    #      2. 给卷 chmod 777 —— 否决：appdata 里还有 DB 相关目录，
+    #         放宽整个卷的权限是拿安全换方便。
+    #      3. 只把**需要写的那两个子树**建出来给 uid 1000 用
+    #         （见下面的 `sandbox-perms` 一次性初始化服务）。
+    #
+    #    这个方案让权限范围最小：只有 workspaces/ 与 sandbox/ 可被沙箱服务写，
+    #    appdata 里其余部分（如 memories/、logs/）仍是 root-only。
+    user: "1000:1000"
+    # 不映射端口：只让 app 通过内部网络访问。
+    # 暴露到宿主机等于把「执行任意代码」的入口开到公网边上。
+    mem_limit: 2g
+    pids_limit: 512
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8021/v1/health', timeout=4)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 15s
 
   # ---- 入口：静态文件 + 粘性负载均衡 ----
   #

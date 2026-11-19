@@ -158,3 +158,64 @@ def _isolate_memory_env():
         if k.startswith(_MEMORY_ENV_PREFIX):
             os.environ.pop(k, None)
     os.environ.update(saved)
+
+# ---------------------------------------------------------------- 沙箱服务单例隔离
+#
+# `sandbox_service.main` 有两个**进程内单例**：`_pool` 与 `_executor`。
+# 它们是生产必需（daemon 就挂在执行器实例上，换实例 = 预热复不上），
+# 但对测试是跨测例污染源：
+#
+#   测例 A `monkeypatch.setattr(svc_main, "_get_executor", lambda: fake_a)`
+#   测例 B 没替换 → 直接拿到 fake_a（上一个测例的执行器）→ 断言全错
+#
+# 实测症状很误导：单跑 `test_sandbox_service_api.py` 全绿，混跑
+# `-k sandbox` 时 3 个测例红（`IndexError: list index out of range` =
+# fake_a.calls 是空的）。这与之前 `backends/base.py` 的模块级缓存
+# 是同一类问题——本次直接按 function 作用域清，避免复发。
+@pytest.fixture(autouse=True)
+def _reset_sandbox_service_singletons():
+    try:
+        from sandbox_service import main as svc_main
+    except Exception:  # noqa: BLE001 - 没装 sandbox_service 的测例不受影响
+        yield
+        return
+    svc_main._pool = None
+    svc_main._executor = None
+    yield
+    svc_main._pool = None
+    svc_main._executor = None
+
+
+# ---------------------------------------------------------------- 沙箱配置单例隔离
+#
+# `app.sandbox.config.get_config()` 与 `app.sandbox.manager.get_manager()`
+# 都是进程内单例，且它们的值在**第一次调用时固化**：
+#
+#   get_config()  → load_config() 读环境变量
+#   get_manager() → SandboxManager(cfg=get_config())
+#
+# 测例用 `monkeypatch.setenv("HLZ_SANDBOX_MODE", "strict")` + `get_config(reload=True)`
+# 改掉它们之后，monkeypatch 在测例结束时**只回滚环境变量**，不会 reload 单例。
+# 于是下一个测例拿到的是上一个测例留下的 strict manager。
+#
+# 实测症状：`test_skills_tools.py` 里 5 条 `code_run` 用例在混跑时红、
+# 单跑时绿 —— 因为它们看到一个 mode=strict + 空白名单的沙箱配置。
+#
+# 这里按 function 作用域统一重置，与 `_reset_sandbox_service_singletons`
+# （沙箱**服务**侧的单例）是同一类问题的两个地方。
+@pytest.fixture(autouse=True)
+def _reset_app_sandbox_singletons():
+    try:
+        from app.sandbox import config as sbx_config
+        from app.sandbox import manager as sbx_manager
+    except Exception:  # noqa: BLE001
+        yield
+        return
+
+    def _clear():
+        sbx_config._cached = None
+        sbx_manager._manager = None
+
+    _clear()
+    yield
+    _clear()

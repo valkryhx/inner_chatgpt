@@ -37,6 +37,29 @@ _PY_TYPES = {"python", "py"}
 _SH_TYPES = {"bash", "sh", "shell"}
 
 
+def _selected_backend():
+    """当前选中的 app 侧后端；`off` / 出错时返回 None。
+
+    为什么 `off` 要返回 None 而不是 OffBackend：
+    `exec_code` 在 mode=off 时**根本不会走到这里**（前面的 `_degrade_reason`
+    已经早退）。真走到这里还返回 OffBackend 的话会多一次无意义的间接调用，
+    而且 OffBackend 返回的 `handled=False` 会和「降级」在日志上混淆。
+
+    为什么出错要返回 None 而不是抛：
+    backend 配置错误已经在 `get_backend` 里报过一次了；这里再抛会打断
+    整个工具调用。返回 None 让它退回 inproc（**有隔离**，
+    比「无隔离的进程内」安全），并且记一条 warning 让人能发现。
+    """
+    try:
+        from .backends import get_backend
+
+        b = get_backend()
+        return None if b.name == "off" else b
+    except Exception:  # noqa: BLE001
+        logger.warning("选取 sandbox backend 失败，退回 inproc Docker 路径", exc_info=True)
+        return None
+
+
 def _mount_root(user_id: str) -> str:
     """容器**唯一**挂载的宿主目录：该用户的 workspace 根。
 
@@ -137,10 +160,23 @@ class SandboxManager:
             logger.info("沙箱未启用（HLZ_SANDBOX_MODE=off）")
             return True, ""
 
-        ok, reason = probe.check(self.cfg)
-        if not ok:
+        # 自检问当前后端，而不是无脑探 Docker（理由见 `_degrade_reason`）。
+        #
+        # ⚠️ 但下面还有一段**Docker 专属**的启动清扫。`backend=service` 时
+        # 本进程不创建 Docker 容器，也就不该去清扫别人的 —— 两件事分开判断。
+        reason = await self._degrade_reason()
+        if reason is not None:
             logger.warning("沙箱自检失败：%s", reason)
             return False, reason
+
+        backend = _selected_backend()
+        if backend is None or backend.name == "inproc":
+            # 只有 inproc（回滚路径）会在本进程建 Docker 容器 → 才需要清扫
+            pass
+        else:
+            logger.info("backend=%s：跳过 Docker 残留清扫（本进程不建容器）",
+                        backend.name)
+            return True, ""
 
         # 启动清扫：**只由集群 leader 执行**，且按机器过滤。
         #
@@ -207,12 +243,37 @@ class SandboxManager:
 
     # ---------------- 降级判断 ----------------
 
-    def _degrade_reason(self) -> str | None:
-        """容器当前是否可用；不可用返回原因。
+    async def _degrade_reason(self) -> str | None:
+        """**当前选中的后端**现在能不能干活；不可用返回原因。
 
-        只在 ``auto`` 模式下用于降级；``strict`` 会把它变成异常。
+        ## 为什么问后端而不是问 Docker（这是个真 bug）
+
+        原来这里调 `probe.check(self.cfg)`，而 `probe.py` 里全是
+        `docker.from_env()`。当前部署是 `backend=service`（HTTP 到独立服务），
+        根本不会用 Docker —— 探针检查的是一个**不会被使用的东西**。
+
+        实测两种错法都有：
+
+        - 容器里没装 docker SDK → 永远判「不可用」→ 每次都误降级
+        - 本机装了 docker SDK → 永远判「可用」→ 沙箱真挂了也当没事
+
+        所以判断必须问当前后端（`Backend.health()`）。
+
+        ## 为什么是 async
+
+        `ServiceBackend.health()` 要打一次 HTTP。判断可用性本身有 I/O，
+        做成同步函数就只能用「猜」。
         """
-        ok, reason = probe.check(self.cfg)
+        backend = _selected_backend()
+        if backend is None:
+            # `backend=inproc`（回滚路径）：那条路确实用 Docker，探针是对的。
+            ok, reason = probe.check(self.cfg)
+            return None if ok else reason
+        try:
+            ok, reason = await backend.health()
+        except Exception as exc:  # noqa: BLE001
+            # 自检本身抛异常 = 不可用。不能让一个坏掉的后端把判断变成「可用」。
+            return f"{type(exc).__name__}: {exc}"
         return None if ok else reason
 
     def _handle_unavailable(self, reason: str) -> str:
@@ -259,7 +320,7 @@ class SandboxManager:
 
         这个签名让 ``builtin_tools`` 的改动保持最小（§7.1）。
         """
-        reason = self._degrade_reason()
+        reason = await self._degrade_reason()
         if reason is not None:
             note = self._handle_unavailable(reason)
             return False, note, ""
@@ -271,6 +332,24 @@ class SandboxManager:
                    "请改用 code_type=python 或 sh。")
             return True, msg, ""
 
+        # ★ 阶段 2：按 backend 分发（方案 §6.3）
+        #
+        # 为什么在这里分发而不是在调用方：`builtin_tools.code_run` 已经调
+        # `get_manager().exec_code(...)` 并处理 (handled, output, marker) 三元组，
+        # 保持这个签名不变 → 调用点一行都不用改（方案 §9 阶段 2 的要求）。
+        #
+        # ⚠️ `backend=inproc` 时必须走**下面原有的 Docker 逻辑**，
+        # 不能绕一圈再回来（那会让回滚路径变得不可信）。
+        backend = _selected_backend()
+        if backend is not None and backend.name != "inproc":
+            handled, out, marker = await backend.exec_code(
+                user_id, code,
+                code_type=ctype, timeout=timeout, root=root,
+                session_id=session_id, generation_id=generation_id, agent_id=agent_id,
+            )
+            return handled, out, marker
+
+        # ---- 以下为 inproc（Docker）路径，与阶段 2 之前完全一致 ----
         host_ws = _host_workspace(user_id, root)      # 文件真正落哪里（含 write_root）
         mount = _mount_root(user_id)                  # 容器挂哪个（永远是根）
         sub = _container_subpath(user_id, root)       # 容器内子路径
@@ -337,7 +416,7 @@ class SandboxManager:
         - ``mode`` 合法性。
         容器只负责最终落盘 —— 容器内再校验是纵深，不是替代。
         """
-        reason = self._degrade_reason()
+        reason = await self._degrade_reason()
         if reason is not None:
             return False, self._handle_unavailable(reason)
 
@@ -418,7 +497,7 @@ class SandboxManager:
         **唯一性判定也在这里做**（不用容器内的 count），
         这样错误文案与进程内路径完全一致。
         """
-        reason = self._degrade_reason()
+        reason = await self._degrade_reason()
         if reason is not None:
             return False, self._handle_unavailable(reason)
 
