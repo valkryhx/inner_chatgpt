@@ -1,25 +1,31 @@
-"""反向确认：证明 verify_multi_instance_audit.py 的断言**会在问题被修好时变红**。
+"""反向确认：证明 verify_multi_instance_audit.py 的断言**会在修复被回退时变红**。
 
-## 为什么要（AGENTS.md §8.5 / §8.6）
+## 为什么（AGENTS.md §8.5 / §8.6）
 
-全绿不携带信息。如果引擎写错（比如永远 PASS），31 条全绿也说明不了任何事。
-所以把被测源码复制到临时目录、**模拟「有人修好了这个 bug」**，再要求对应断言变红。
+全绿不携带信息。如果引擎写错（永远 PASS），40 条全绿也说明不了任何事。
 
-这比「注入一条错误断言」更贴近真实：它模拟的正是未来的场景 —— 有人修好了，
-脚本必须提醒「文档要更新」，而不是继续全绿。
+## 注意：断言的**方向**已经变了
 
-## 这个脚本抓出过我自己的两处断言设计错误
+2026-11-19 之前，这份审计的断言是「问题仍然存在」；四个修复落地后，
+断言全部翻成「修复状态成立」。所以反向确认的 mutation 也要反过来：
 
-第一版写完跑，两条反向确认没变红。查清后是**断言选错了靶子**：
-
-| 我的断言 | 模拟修法 | 为什么测不到 |
+| | 修复前 | 修复后（现在） |
 | --- | --- | --- |
-| 「无条件收敛语句**仍在** db.py」 | 在原语句后追加 owner 条件 | needle 是新语句的**前缀**，依然匹配 → 仍然 PASS |
-| 「_ensure_sticky_cookie **只在 1 处**被调用」 | 挪进中间件 | 挪动不改次数，仍是 1 → 仍然 PASS |
+| 断言 | 「语句是无条件的」 | 「语句按 owner 过滤」 |
+| mutation | 加过滤 -> 应变红 | **去掉过滤 -> 应变红** |
 
-结论：这两条断言只能测「语句被删掉」，测不到「语句被收窄」。真正该变红的靶子是
-**「该语句没有 owner 过滤」**和**「调用点在 health 端点内」**。现在两边都测
-（两种修法各对应一条），覆盖才完整。
+这一步搞反过：第一版反向确认沿用旧 mutation，跑出来「期望变红，实际没红」，
+查了半天才发现是断言方向变了、mutation 没跟着变。
+
+## 这个脚本抓出过我自己的三处断言设计错误
+
+| 我的断言 | 为什么测不到 |
+| --- | --- |
+| 「无条件收敛语句**仍在**」 | 在原语句后追加条件时，needle 是新语句的**前缀**，仍匹配 |
+| 「`_ensure_sticky_cookie` **只在 1 处**被调用」 | 挪动位置不改次数 |
+| 前端静态断言「源码里出现 resumeRetryAction」 | 把调用改成 `if (false && ...)` 静态匹配照样成立 |
+
+结论：断言要对着**问题的本质**写，不是对着「问题的某一种表现」。
 """
 from __future__ import annotations
 
@@ -39,29 +45,23 @@ results: list[tuple[str, bool, str]] = []
 
 
 def load_module():
-    """加载被测脚本，但**不让它的顶层主流程跑**。
-
-    被测脚本是「顶层跑完再 sys.exit」的形态，直接 exec_module 会：
-    1. 往 stdout 打 31 条结果，把反向确认的输出淹没；
-    2. 执行到末尾 sys.exit()，把本进程杀掉。
-    """
+    """加载被测脚本，但**不让它的顶层主流程跑**（会淹没输出并 sys.exit）。"""
     spec = importlib.util.spec_from_file_location("auditor", TARGET)
     assert spec and spec.loader
     m = importlib.util.module_from_spec(spec)
-
     real_exit = sys.exit
     try:
         with contextlib.redirect_stdout(io.StringIO()):
             try:
                 spec.loader.exec_module(m)
             except SystemExit:
-                pass                      # 主流程正常退出，忽略
+                pass
     finally:
         sys.exit = real_exit
     return m
 
 
-def fresh_copy() -> tuple[Path, "module"]:
+def fresh_copy():
     """复制一份真实仓库到临时目录，返回 (root, 已指向该目录的模块)。"""
     tmp = Path(tempfile.mkdtemp(prefix="revconf_audit_"))
     be = tmp / "backend"
@@ -69,13 +69,15 @@ def fresh_copy() -> tuple[Path, "module"]:
     (be / "tests/manual").mkdir(parents=True)
     (tmp / "frontend/src").mkdir(parents=True)
     (tmp / "docs").mkdir(parents=True)
+    (tmp / "tools/verify").mkdir(parents=True)
 
     shutil.copytree(REAL / "backend/app", be / "app", dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copy(REAL / "backend/deploy/nginx.conf", be / "deploy/nginx.conf")
     shutil.copy(REAL / "frontend/src/App.tsx", tmp / "frontend/src/App.tsx")
-    for p in (REAL / "backend/tests/manual").glob("*.py"):
-        shutil.copy(p, be / "tests/manual" / p.name)
+    for p in (REAL / "backend/tests/manual").iterdir():
+        if p.is_file():
+            shutil.copy(p, be / "tests/manual" / p.name)
     for p in (REAL / "docs").glob("*.md"):
         shutil.copy(p, tmp / "docs" / p.name)
 
@@ -87,49 +89,63 @@ def fresh_copy() -> tuple[Path, "module"]:
 
 
 # ---------------------------------------------------------------- 重算逻辑
-# 每条对应「真实断言」的判定方式，用当前模块指向的目录重算。
+# 每条对应修复后的断言，返回「是否通过」。
 
-def _s1_stmt_exists(m) -> bool:
-    return m.line_of(
-        "app/db.py",
-        "UPDATE messages SET status='stopped' WHERE role='assistant' AND status='streaming'") > 0
+def _s1_owner_filtered(m) -> bool:
+    """§1：判据函数必须按 owner + 存活集合过滤。
 
-
-def _s1_no_owner_filter(m) -> bool:
-    """真断言：该 UPDATE 附近**没有** owner 过滤。"""
-    import re
-    n = m.line_of(
-        "app/db.py",
-        "UPDATE messages SET status='stopped' WHERE role='assistant' AND status='streaming'")
-    if n <= 0:
-        return True   # 语句都不在了，这条不适用
-    ctx = "\n".join(m.lines("app/db.py")[n - 4: n + 6])
-    return not re.search(r"\bowner\b|live_owners", ctx)
-
-
-def _s2_called_once(m) -> bool:
-    import re
-    return len(re.findall(r"^\s+_ensure_sticky_cookie\(", m.src("app/main.py"), re.M)) == 1
+    **落点**：过滤在 `_sessions_to_converge` 里，不在那条 UPDATE 附近
+    （UPDATE 是动态拼的）。第一版断言去查 UPDATE 上下文，被上方注释里的
+    `owner` 字样骗过 —— 反向确认（去掉过滤）没变红才发现。
+    """
+    db = m.src("app/db.py")
+    start = db.find("async def _sessions_to_converge")
+    if start < 0:
+        return False
+    seg = db[start: start + 3000]
+    # 必须测**循环体的四条分支**，不是「这些变量名出现过」。
+    # 第一版查变量名，mutation 把循环体换成 `for sid in []` 后变量名还在，
+    # 断言仍然 PASS —— 反向确认没变红才暴露。
+    return ("if sid not in owner_by_session:" in seg
+            and "if not owner:" in seg
+            and "if owner == my_owner:" in seg
+            and "if owner not in alive:" in seg)
 
 
-def _s2_call_inside_health(m) -> bool:
-    """真断言：调用点在 health 端点内（而不是中间件里）。"""
-    call = m.line_of("app/main.py", "_ensure_sticky_cookie(request, response)")
-    health = m.line_of("app/main.py", "async def health(")
-    return 0 < health < call
+def _s2_in_middleware(m) -> bool:
+    """§2：cookie 必须在中间件里下发。"""
+    main = m.src("app/main.py")
+    start = main.find("async def _instance_header")
+    seg = main[start: start + 2000] if start >= 0 else ""
+    return "_ensure_sticky_cookie" in seg
 
 
-def _s4_no_wrong_instance(m) -> bool:
-    return "wrong_instance" not in (
-        (m.HLAUDZ / "frontend/src/App.tsx").read_text(encoding="utf-8"))
+def _s4_decision_exists(m) -> bool:
+    """§4：必须有 _resume_decision 且返回 wrong_instance。"""
+    chat = m.src("app/routers/chat.py")
+    start = chat.find("async def _resume_decision")
+    seg = chat[start: start + 3000] if start >= 0 else ""
+    return bool(seg) and "wrong_instance" in seg
+
+
+def _s5_runner_exists(m) -> bool:
+    """§5：必须有一键入口脚本。"""
+    manual = m.BE / "tests/manual"
+    return bool(list(manual.glob("*.sh"))) if manual.exists() else False
+
+
+def _s4_frontend_retry(m) -> bool:
+    """§4 前端：必须处理 wrong_instance。"""
+    app = (m.HLAUDZ / "frontend/src/App.tsx").read_text(encoding="utf-8")
+    return "wrong_instance" in app or "isWrongInstanceError" in app
 
 
 CHECKS = {
-    "§1 无条件收敛语句仍在 db.py": _s1_stmt_exists,
-    "§1 该语句确实没有 owner 过滤": _s1_no_owner_filter,
-    "§2 它只在 1 处被调用": _s2_called_once,
-    "§2 调用点在 health 端点内": _s2_call_inside_health,
-    "§4 前端没有 wrong_instance": _s4_no_wrong_instance,
+    "§1 判据按 owner 与存活集合过滤": _s1_owner_filtered,
+    "§2 中间件里下发粘性 cookie": _s2_in_middleware,
+    "§4 _resume_decision 存在": _s4_decision_exists,
+    "§4 前端处理 wrong_instance": _s4_frontend_retry,
+    "§5 有一键入口脚本": _s5_runner_exists,
 }
 
 
@@ -147,73 +163,100 @@ def run_case(name: str, mutate, expect_red: list[str]) -> None:
 
 
 # ---------------------------------------------------------------- mutations
+# 全部是「回退到修复前的行为」——因为断言方向已经翻过来了。
 
 def no_change(_root):
     pass
 
 
-def inline_owner_filter(root: Path):
-    """修法 A：在原 UPDATE 里内联 owner 过滤（语句还在，但不再无条件）。"""
+def revert_s1_to_unconditional(root: Path):
+    """回退 §1：把整个 owner 判据循环体换成无条件全清。
+
+    ⚠️ 前两版 mutation 都是**无效的**，反向确认没变红才发现：
+
+    | 版本 | 改了什么 | 为什么没变红 |
+    | --- | --- | --- |
+    | v1 | 在 UPDATE 后追加 owner 条件 | 断言查的是 UPDATE 附近文本，被上方注释里的 `owner` 骗过 |
+    | v2 | 只把 `doomed` 初始化换成 `list(sessions)` | **循环体原封不动**，四条分支还在 |
+    | v3（本版） | 删掉整个循环体 | 四条分支真的没了 |
+
+    「mutation 没有真的改变被测行为」是反向确认本身的假阳性 ——
+    它会让你误以为断言太宽，实际是 mutation 太窄。
+    """
     p = root / "backend/app/db.py"
     t = p.read_text(encoding="utf-8")
-    old = ("UPDATE messages SET status='stopped' "
-           "WHERE role='assistant' AND status='streaming'")
-    new = (old + " AND session_id IN (SELECT session_id FROM session_generations "
-                 "WHERE status='active' AND owner<>'' AND owner NOT IN (%s))")
-    assert old in t
+    start = t.find("    doomed: list[str] = []")
+    end_marker = "    return doomed"
+    end = t.find(end_marker, start)
+    assert start > 0 and end > start, "mutation 前提不成立"
+    replacement = """    doomed: list[str] = list(sessions)   # 回退：无条件全清，不再看 owner
+"""
+    p.write_text(t[:start] + replacement + t[end:], encoding="utf-8")
+
+
+def revert_s2_to_health_only(root: Path):
+    """回退 §2：中间件里不再下发 cookie。"""
+    p = root / "backend/app/main.py"
+    t = p.read_text(encoding="utf-8")
+    old = """    try:
+        _ensure_sticky_cookie(request, response)
+    except Exception:  # noqa: BLE001 - 下发失败不该影响响应
+        pass"""
+    new = """    try:
+        pass   # 回退：只在 health 下发
+    except Exception:  # noqa: BLE001
+        pass"""
+    assert old in t, "mutation 前提不成立"
     p.write_text(t.replace(old, new), encoding="utf-8")
 
 
-def delete_wipe_stmt(root: Path):
-    """修法 B：把这条收敛整个删掉（挪进 recover_stale_runtime）。"""
-    p = root / "backend/app/db.py"
-    lines = p.read_text(encoding="utf-8").split("\n")
-    out = [ln for ln in lines
-           if "UPDATE messages SET status='stopped'" not in ln]
-    assert len(out) < len(lines), "mutation 前提不成立"
-    p.write_text("\n".join(out), encoding="utf-8")
-
-
-def move_cookie_to_middleware(root: Path):
-    """修 §2：cookie 从 health 挪进 _instance_header 中间件。"""
-    p = root / "backend/app/main.py"
+def revert_s4_removing_decision(root: Path):
+    """回退 §4：删掉 _resume_decision 函数（改成直接发 done 的老逻辑）。"""
+    p = root / "backend/app/routers/chat.py"
     t = p.read_text(encoding="utf-8")
-    # 删掉 health 里那一处（缩进 4 空格）
-    old = "    _ensure_sticky_cookie(request, response)\n"
-    assert old in t
-    t = t.replace(old, "", 1)
-    # 加进中间件
-    anchor = "    response = await call_next(request)"
-    assert anchor in t
-    t = t.replace(anchor, anchor + "\n" + old.rstrip("\n"), 1)
-    p.write_text(t, encoding="utf-8")
+    start = t.find("async def _resume_decision")
+    assert start > 0, "mutation 前提不成立"
+    # 找到下一个顶层 @router 装饰器作为结束点
+    end = t.find("@router.get", start)
+    assert end > start
+    p.write_text(t[:start] + t[end:], encoding="utf-8")
 
 
-def add_wrong_instance(root: Path):
-    """修 §4 前端配套：加 wrong_instance 处理。"""
+def revert_s5_removing_runner(root: Path):
+    """回退 §5：删掉一键入口脚本。"""
+    manual = root / "backend/tests/manual"
+    for f in list(manual.glob("*.sh")):
+        f.unlink()
+
+
+def revert_frontend_retry(root: Path):
+    """回退 §4 前端：去掉 wrong_instance 处理。"""
     p = root / "frontend/src/App.tsx"
     t = p.read_text(encoding="utf-8")
-    t = t.replace("const status = ev.status === 'stopped'",
-                  "if (ev.error === 'wrong_instance') { /* retry once */ }\n"
-                  "        const status = ev.status === 'stopped'", 1)
+    t = t.replace("isWrongInstanceError", "/* removed */")
+    t = t.replace("planResumeRetry", "/* removed */")
     p.write_text(t, encoding="utf-8")
 
 
 # ---------------------------------------------------------------- 执行
 
-run_case("不改源码：两条问题断言仍然 PASS（正向对照）", no_change, [])
+run_case("不改源码：修复状态断言全部 PASS（正向对照）", no_change, [])
 
-run_case("修法 A（内联 owner 过滤）-> 「没有 owner 过滤」该变红",
-         inline_owner_filter, ["§1 该语句确实没有 owner 过滤"])
+run_case("回退 §1（去掉 owner 过滤）-> 「按 owner 过滤」该变红",
+         revert_s1_to_unconditional, ["§1 判据按 owner 与存活集合过滤"])
 
-run_case("修法 B（删掉该语句）-> 「语句仍在」该变红",
-         delete_wipe_stmt, ["§1 无条件收敛语句仍在 db.py"])
+run_case("回退 §2（中间件不下发）-> 「中间件里下发」该变红",
+         revert_s2_to_health_only, ["§2 中间件里下发粘性 cookie"])
 
-run_case("修 §2（挪进中间件）-> 「调用点在 health 内」该变红",
-         move_cookie_to_middleware, ["§2 调用点在 health 端点内"])
+run_case("回退 §4（删掉决策函数）-> 两条 §4 该变红",
+         revert_s4_removing_decision,
+         ["§4 _resume_decision 存在"])
 
-run_case("修 §4（前端加 wrong_instance）-> 该断言变红",
-         add_wrong_instance, ["§4 前端没有 wrong_instance"])
+run_case("回退 §5（删掉一键脚本）-> 「一键入口」该变红",
+         revert_s5_removing_runner, ["§5 有一键入口脚本"])
+
+run_case("回退前端（去掉 wrong_instance）-> 该变红",
+         revert_frontend_retry, ["§4 前端处理 wrong_instance"])
 
 
 # ---------------------------------------------------------------- 汇总
@@ -233,5 +276,5 @@ if not any("正向对照" in r[0] for r in results):
 if bad:
     print("反向确认失败：断言引擎行为与预期不符")
     sys.exit(1)
-print("反向确认通过：该红的红了，该绿的绿了")
+print("反向确认通过：回退修复会变红，保持修复会变绿")
 sys.exit(0)

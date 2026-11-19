@@ -63,7 +63,7 @@ backend/app/turn_job.py:189    class TurnJob:   # seq / replay deque / subscribe
 读取侧只有一个入口：
 
 ```python
-# backend/app/routers/chat.py:1039
+# backend/app/routers/chat.py:1053（_resume_decision 里查进程内 job）
 job = turn_job.get_live_job_for_session(user["id"], session_id)
 if job is None:
     # 没有活着的 job -> 用库里的现状收尾
@@ -568,8 +568,9 @@ class EventTransport(Protocol):   # attach / publish / sync_frames / finish
 | `TurnJob` 状态（seq/replay/blocks_provider） | `turn_job.py:189`、`:206`、`:208`、`:212` |
 | 发布 + 序号重写 | `turn_job.py:296 publish`、`:216 _rewrite_seq` |
 | 三态续看（最新 / 增量 / sync 快照） | `turn_job.py:252 sync_frames` |
-| 续看端点 | `backend/app/routers/chat.py:1019 resume_stream` |
-| 「没有活 job」就走收尾 | `chat.py:1039` |
+| 续看决策函数（三选一） | `backend/app/routers/chat.py:1018 _resume_decision` |
+| 续看端点 | `backend/app/routers/chat.py:1070 resume_stream` |
+| 决策函数查进程内 job | `chat.py:1053` |
 | 并发生成 409 + 诚实判活 | `chat.py:937`（判活）、`:954`（抛 409） |
 | 停止信号（已跨实例） | `backend/app/cluster/stopsignal.py` |
 | 插话总线（已跨实例，200ms 轮询） | `backend/app/cluster/steerbus.py` |

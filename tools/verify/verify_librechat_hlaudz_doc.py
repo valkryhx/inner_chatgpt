@@ -162,10 +162,14 @@ CASES: list[tuple[str, Path, int, str]] = [
      337, "def get_live_job_for_session(user_id: str, session_id: str) -> Optional[TurnJob]:"),
 
     # ---------------------------------------------------- Hlaudz: chat 路由
+    # ⚠️ 2026-11-19：续看的「查 job」挪进了 _resume_decision，端点自身只做分派。
+    # 坐标随后移，断言跟着改 —— 但语义没变（端点不抢租约、不建消息）。
+    ("续看决策函数", HLAUDZ / "backend/app/routers/chat.py",
+     1018, "async def _resume_decision(user_id: str, session_id: str) -> dict:"),
+    ("决策函数查进程内 job", HLAUDZ / "backend/app/routers/chat.py",
+     1053, "job = turn_job.get_live_job_for_session(user_id, session_id)"),
     ("续看端点", HLAUDZ / "backend/app/routers/chat.py",
-     1019, "async def resume_stream(session_id: str, after: int = 0,"),
-    ("没有活 job 就查库收尾", HLAUDZ / "backend/app/routers/chat.py",
-     1039, 'job = turn_job.get_live_job_for_session(user["id"], session_id)'),
+     1070, "async def resume_stream(session_id: str, after: int = 0,"),
     ("并发租约", HLAUDZ / "backend/app/routers/chat.py",
      921, 'acquired = await team_store.acquire_generation(user["id"], session_id, generation_id)'),
     ("诚实判活", HLAUDZ / "backend/app/routers/chat.py",
