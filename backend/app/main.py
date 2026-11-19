@@ -220,6 +220,19 @@ async def _instance_header(request: Request, call_next):
     """
     import os
     response = await call_next(request)
+    # 粘性 cookie：**任何**响应都下发，不只 health（2026-11-19 审计 §2）。
+    #
+    # 原实现只在 `/api/health` 里调（全仓唯一调用点），而没访问过 health 的
+    # 客户端永远拿不到 cookie。而 `hash $cookie_hlz_sticky` 在**没有 cookie 时
+    # 不是随机打散，是所有无 cookie 请求落到同一个上游** —— 那批用户集中压在
+    # 单个实例上，续看时查不到进程内的 job。
+    #
+    # 真实触发场景：清空站点数据 / curl 直接打 API / 首屏 health 失败
+    # （App.tsx 里是 catch(() => null) 静默跳过）/ 扩缩容后 nginx 重启。
+    try:
+        _ensure_sticky_cookie(request, response)
+    except Exception:  # noqa: BLE001 - 下发失败不该影响响应
+        pass
     if (os.environ.get("HLZ_INSTANCE_HEADER", "1") or "1").strip() not in ("0", "false", "False"):
         try:
             from .sandbox.identity import owner_id
@@ -262,8 +275,9 @@ async def health(request: Request, response: Response):
     **只能读** cookie，没法设。所以由应用下发一个稳定的随机值，让同一个浏览器
     始终落到同一个后端实例。
 
-    为什么放在 health：它是前端启动第一个必然访问的端点，且不需要登录。
-    已经带了就不重复下发（避免每次心跳都刷 Set-Cookie）。
+    ⚠️ 2026-11-19 起，cookie 由 `_instance_header` 中间件在所有响应上下发，
+    **不再只在这里**（原本这里是全仓唯一调用点，导致没访问过 health 的客户端
+    永远没有粘性）。见 `docs/20261119-多实例正确性审计.md` §2。
 
     ## 多实例可观测性（2026-11-19 加）
 
@@ -271,7 +285,6 @@ async def health(request: Request, response: Response):
     这次请求落在谁身上、集群里还有谁活着、我是不是 leader。
     全部可安全公开 —— 不含 Redis URL / DB DSN / 密码。
     """
-    _ensure_sticky_cookie(request, response)
     model = ""
     if llm_yaml_available():
         try:
