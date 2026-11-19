@@ -75,7 +75,7 @@ async def _invalidate(user_id: str) -> None:
     from ..runtime import get_hub
     hub = get_hub()
     if hub:
-        await hub.invalidate(user_id)
+        await hub.invalidate_cluster(user_id)
 
 
 @router.get("/skills", response_model=list[SkillOut])

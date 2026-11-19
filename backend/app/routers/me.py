@@ -78,7 +78,7 @@ async def create_llm(body: LLMConfigIn, user: dict = Depends(get_current_user)):
     row = await db.create_llm_config(user["id"], **body.model_dump())
     hub = get_hub()
     if hub:
-        await hub.invalidate(user["id"])
+        await hub.invalidate_cluster(user["id"])
     return _llm_out(row)
 
 
@@ -95,7 +95,7 @@ async def update_llm(config_id: str, body: LLMConfigUpdate, user: dict = Depends
         raise HTTPException(status_code=404, detail="config not found")
     hub = get_hub()
     if hub:
-        await hub.invalidate(user["id"])
+        await hub.invalidate_cluster(user["id"])
     return _llm_out(row)
 
 
@@ -107,7 +107,7 @@ async def delete_llm(config_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="config not found")
     hub = get_hub()
     if hub:
-        await hub.invalidate(user["id"])
+        await hub.invalidate_cluster(user["id"])
     return {"ok": True}
 
 
@@ -182,7 +182,7 @@ async def create_mcp(body: MCPServerIn, user: dict = Depends(get_current_user)):
     row = await db.create_mcp_server(user["id"], **body.model_dump())
     hub = get_hub()
     if hub:
-        await hub.invalidate(user["id"])
+        await hub.invalidate_cluster(user["id"])
     return _mcp_out(row)
 
 
@@ -195,7 +195,7 @@ async def update_mcp(server_id: str, body: MCPServerUpdate, user: dict = Depends
         raise HTTPException(status_code=404, detail="mcp server not found")
     hub = get_hub()
     if hub:
-        await hub.invalidate(user["id"])
+        await hub.invalidate_cluster(user["id"])
     return _mcp_out(row)
 
 
@@ -207,7 +207,7 @@ async def delete_mcp(server_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="mcp server not found")
     hub = get_hub()
     if hub:
-        await hub.invalidate(user["id"])
+        await hub.invalidate_cluster(user["id"])
     return {"ok": True}
 
 
@@ -219,7 +219,7 @@ async def import_mcp_json(body: MCPJsonIn, user: dict = Depends(get_current_user
     result = await merge_mcp_json(user["id"], body.raw, enabled=body.enabled)
     hub = get_hub()
     if hub:
-        await hub.invalidate(user["id"])
+        await hub.invalidate_cluster(user["id"])
     return MCPImportResult(**result)
 
 

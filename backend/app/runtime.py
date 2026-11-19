@@ -38,6 +38,8 @@ class RuntimeHub:
         # 本代 ACP manager：key = (user_id, session_id, generation_id)
         # 与 subagent hosts 同构，用户 id 参与键，/stop 不能作用于别人的会话。
         self._acp_managers: dict[tuple[str, str, str], "object"] = {}
+        # 跨实例失效监听：key = user_id。缓存里有这个用户的 runtime 才需要监听。
+        self._invalidate_watchers: dict[str, object] = {}
 
     # ---------------- acp managers ----------------
     def register_acp_manager(self, user_id: str, session_id: str, generation_id: str,
@@ -134,7 +136,44 @@ class RuntimeHub:
             await ur.build(user_id, model_id or None)
             self._runtimes[key] = ur
             self._built_at[key] = time.monotonic()
+            # 起跨实例失效监听：这个用户的缓存现在存在本进程里了，
+            # 别的实例改配置时必须能让本进程清掉它。
+            await self._watch_invalidate(user_id)
             return ur
+
+    async def _watch_invalidate(self, user_id: str) -> None:
+        """给这个用户挂一个跨实例失效监听（幂等）。没配 Redis 时空操作。
+
+        ## 基线必须在这里**同步**读定
+
+        踩过的坑：一开始把「读当前版本号」交给 watcher 的第一个轮询迭代，
+        结果那 0~2s 内的广播被当成基线吞掉了 —— 用户在这 2 秒内改了配置，
+        本实例永远收不到。测试里 100% 复现（`seen=1` 却从未清缓存）。
+
+        所以改成：启动 watcher **之前**先 await 读一次版本作为基线。
+        剩下的窗口只有「读完基线到 start 之间」的微秒级。
+        """
+        if user_id in self._invalidate_watchers:
+            return
+        try:
+            from .cluster import invalidate as inv
+        except Exception:  # noqa: BLE001
+            return
+
+        baseline = await inv.current_version(user_id)
+
+        async def _on_change(uid: str) -> None:
+            # 只清本地缓存，不再广播（否则会形成来回广播的环）
+            logger.info("收到跨实例失效广播，清本地 runtime user=%s", uid)
+            await self.invalidate(uid)
+            self._invalidate_watchers.pop(uid, None)
+
+        try:
+            watcher = inv.InvalidateWatcher(user_id, _on_change)
+            watcher.start(baseline=baseline)
+            self._invalidate_watchers[user_id] = watcher
+        except Exception:  # noqa: BLE001
+            logger.debug("失效监听启动失败", exc_info=True)
 
     async def refresh_mcp_status(self, user_id: str, model_id: str = "",
                                  *, force: bool = False) -> list[dict]:
@@ -188,6 +227,32 @@ class RuntimeHub:
                 self._built_at.pop(key, None)
                 if ur is not None:
                     await ur.close()
+
+    async def invalidate_cluster(self, user_id: str) -> None:
+        """清本地缓存 **并广播给其他实例**。
+
+        ## 为什么需要
+
+        改了 MCP / LLM 配置或装了 skill 时，只清本进程的缓存不够：
+        别的实例手里还握着旧的 `UserRuntime`（含进程内 MCP 连接和烘焙好的
+        系统提示词）。那些连接跨进程无法共享，只能**各自失效重建**。
+
+        原来的兜底是 `MCP_STATUS_TTL_S`（60s）到期后的状态比对 ——
+        意味着「改了配置最多一分钟才生效，而且可能不生效」。
+        广播把这个延迟降到 2s 且确定生效。
+
+        ## 谁调用
+
+        `me.py` / `skills.py` 里所有原本调 `invalidate` 的地方都改调这个。
+        `invalidate` 保留给内部使用（例如 `refresh_mcp_status` 发现连接死了
+        要重建 —— 那是本进程的事，不该广播）。
+        """
+        await self.invalidate(user_id)
+        try:
+            from .cluster import invalidate as inv
+            await inv.publish(user_id)
+        except Exception:  # noqa: BLE001 - 广播失败不该让配置修改失败
+            logger.debug("跨实例失效广播失败", exc_info=True)
 
     async def invalidate_all(self) -> int:
         """Drop every cached runtime so the next turn rebuilds system prompts.
