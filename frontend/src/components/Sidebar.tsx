@@ -183,8 +183,12 @@ export default function Sidebar({
         )}
         {rest.map(row)}
       </div>
-      <button className="side-nav-item all-sessions" onClick={onOpenAllSessions}>
-        查看全部会话
+      {/* 独立样式类 all-sessions：不能只靠「比会话条目更灰」区分，
+          那会让它混在列表里被忽略。见 .all-sessions 的 CSS 注释。 */}
+      <button className="all-sessions" onClick={onOpenAllSessions}>
+        <span className="all-ico" aria-hidden="true">⌗</span>
+        <span className="all-text">查看全部会话</span>
+        <span className="all-arrow" aria-hidden="true">›</span>
       </button>
 
       <button
