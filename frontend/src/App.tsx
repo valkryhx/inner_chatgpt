@@ -12,6 +12,7 @@ import Composer from './components/Composer'
 import LoginPage from './components/LoginPage'
 import SettingsModal from './components/SettingsModal'
 import { mergeStart, mergeStatus } from './subagentView'
+import { isWrongInstanceError, planResumeRetry } from './resumeRetry'
 import TeamPanel from './components/TeamPanel'
 import WorkspacePanel from './components/WorkspacePanel'
 
@@ -381,7 +382,8 @@ export default function App() {
     loadTeam(activeId)
   }, [user, activeId, loadTeam])
 
-  const resumeIfRunning = useCallback(async (sid: string, msgs?: Message[]) => {
+  const resumeIfRunning = useCallback(async (sid: string, msgs?: Message[],
+                                             alreadyRetried = false) => {
     // 页面刚加载 / 切回某个会话时，如果库里那一条 assistant 还是 streaming，
     // 说明后端还有 turn job 在跑（刷新页面**不再**掐死生成，见
     // docs/20261115-…-持久化第三步.md）。这里自动接上，用户看不到「停在半截」。
@@ -412,6 +414,9 @@ export default function App() {
     let lastSeq = 0
     let blocks: any[] = target.blocks || []
     let current = target
+    // 本端是不是因为「连错实例」而中断的。声明在这里（onEvent 之前），
+    // 因为 onEvent 会写它；写在后面虽然靠 let 提升也能跑，但读起来像是 bug。
+    let wrongInstance = false
 
     const patch = (m: Message) => {
       current = m
@@ -453,6 +458,13 @@ export default function App() {
         setStreaming(false)
         setActiveStreamMsgId(null)
       } else if (ev.type === 'error') {
+        // 「连错实例」不是错误，是**连接落错了实例**（粘性 cookie 与哈希环不匹配，
+        // 常见于扩缩容后）。此时不能把错误显示给用户 —— 先换 cookie 再重试一次。
+        // 见 docs/20261119-多实例正确性审计.md §4。
+        if (isWrongInstanceError(ev.error)) {
+          wrongInstance = true
+          return
+        }
         setError(ev.error)
         patch({ ...current, status: 'error', run_finished_at: Date.now() })
       }
@@ -468,6 +480,17 @@ export default function App() {
       setStreaming(false)
       setActiveStreamMsgId(null)
       loadMessages(sid)
+    }
+
+    if (planResumeRetry(wrongInstance, alreadyRetried) === 'rehandshake-then-retry') {
+      // 重新握手：health 是唯一会下发 sticky cookie 的端点（main.py:274）。
+      // **不换 cookie 就重试会落到同一个错实例**，是无效动作。
+      try {
+        await api.health()
+      } catch {
+        /* 握手失败就算了，下面的重试会再次失败并如实报错 */
+      }
+      await resumeIfRunning(sid, undefined, true)
     }
   }, [loadMessages])
 

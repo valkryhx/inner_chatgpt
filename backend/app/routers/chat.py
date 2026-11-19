@@ -1015,6 +1015,57 @@ async def send_message(session_id: str, body: SendMessageIn, user: dict = Depend
     )
 
 
+async def _resume_decision(user_id: str, session_id: str) -> dict:
+    """续看请求该走哪条路。
+
+    返回三选一：
+
+    | kind | 含义 | 调用方动作 |
+    | --- | --- | --- |
+    | `stream` | 本进程有这个 job | 订阅它 |
+    | `finished` | 这一轮真的结束了 / owner 已死 | 发 `done` 并关闭 |
+    | `wrong_instance` | 别的实例正在跑 | 返回 409，让客户端重试 |
+
+    ## 为什么需要它（2026-11-19 审计 §4）
+
+    原实现只看 `turn_job.get_live_job_for_session(...) is None`，把两种情况混成一种：
+
+    1. 这一轮结束了；
+    2. 这一轮在**别的实例**上跑着（本进程当然查不到）。
+
+    第 2 种被当成结束发了 `done`，而对端 `done` 里的 `status` 往往还是
+    `'streaming'`，前端 `App.tsx:451` 又会把它映射成 `'complete'` ——
+    于是「正在跑」显示成「已完成」，用户看到内容停在半截。
+
+    ## 判据为什么不能看 messages.status
+
+    status 是**结果**，不是**原因**。别人在跑时 status 是 streaming，但
+    「刚崩溃、status 也还是 streaming」长得一模一样。只有
+    `generation_owner.is_generation_dead_elsewhere`（owner 是否还在存活集合里）
+    能区分 —— 这与 409 路径用的判据**完全一致**，只是那边早接上了、这边漏了。
+
+    ## 为什么 owner 已死要当成 finished 而不是报错
+
+    那个实例崩溃了，这一轮不可能再产出任何事件。此时收尾才是诚实的：
+    用户刷新看到的应该是「上一轮中断了（status=stopped）」，而不是
+    「连错实例」。报 wrong_instance 会让客户端反复重试一个永远不会来的流。
+    """
+    job = turn_job.get_live_job_for_session(user_id, session_id)
+    if job is not None:
+        return {"kind": "stream", "job": job}
+
+    from .. import generation_owner as _gen_owner
+    active = await team_store.get_active_generation(user_id, session_id)
+    if active and not await _gen_owner.is_generation_dead_elsewhere(
+            user_id, session_id, active):
+        # owner 还活着 -> 它在别的实例上正常跑着。这不是结束，是「你连错了」。
+        logger.info("续看请求连错实例（owner 仍存活）user=%s session=%s active_gen=%s",
+                    user_id, session_id, active)
+        return {"kind": "wrong_instance", "active_generation_id": active}
+
+    return {"kind": "finished"}
+
+
 @router.get("/sessions/{session_id}/stream", response_model=None)
 async def resume_stream(session_id: str, after: int = 0,
                         user: dict = Depends(get_current_user)):
@@ -1030,13 +1081,25 @@ async def resume_stream(session_id: str, after: int = 0,
       客户端直接用它替换本地状态，然后接实时；
     - job 已结束 → 检查消息是否已落终态，发 `done` 后关闭。
 
-    与 409 的关系：这个端点**不抢租约**，所以生成中也能调。
+    与 409 的关系：这个端点**不抢租约**，所以生成中也能调。但「生成跑在别的
+    实例上」时会返回 `409 wrong_instance` —— 那不是并发冲突，是**连接落错了实例**
+    （粘性 cookie 失效 / 扩缩容后 hash 环重算）。客户端应重新握手后重试一次，
+    见 `docs/20261119-多实例正确性审计.md` §4。
     """
     sess = await db.get_session(session_id, user["id"])
     if not sess:
         raise HTTPException(status_code=404, detail="session not found")
 
-    job = turn_job.get_live_job_for_session(user["id"], session_id)
+    decision = await _resume_decision(user["id"], session_id)
+
+    if decision["kind"] == "wrong_instance":
+        return JSONResponse(status_code=409, content={
+            "error": "wrong_instance",
+            "active_generation_id": decision.get("active_generation_id", ""),
+            "hint": "这一轮在另一个实例上运行。请刷新页面后重试（会自动回到正确实例）。",
+        })
+
+    job = decision.get("job")
     if job is None:
         # 没有活着的 job：把库里的现状告诉调用方，然后干净关闭。
         # 刷新页面时如果这一轮刚好跑完，走的就是这里 —— 不能返回 404，

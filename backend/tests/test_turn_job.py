@@ -308,13 +308,27 @@ def test_resume_endpoint_does_not_take_lease():
     """续看端点**不抢 generation 租约** —— 抢了就等于新开一轮。
 
     这是它与 `POST /messages` 的根本区别，必须钉住。
+
+    ⚠️ 2026-11-19 起，「查 job」这一步挪进了 `chat._resume_decision`
+    （多实例下要先区分「结束了」和「连错实例」，见
+    `test_resume_wrong_instance.py`）。所以这里分两段断言：
+    端点本身不许有租约/建消息；查 job 的职责在决策函数里。
     """
     from app.routers import chat
+
     src = inspect.getsource(chat.resume_stream)
     assert "acquire_generation" not in src, \
         "续看不能抢租约（那会变成新开一轮）"
     assert "add_message" not in src, "续看不能产生新消息"
-    assert "get_live_job_for_session" in src
+    # 接线：端点必须走决策函数（否则三条分支就不生效了）
+    assert "_resume_decision" in src, "续看端点必须调用 _resume_decision"
+
+    # 查 job 的职责已经下移
+    decision_src = inspect.getsource(chat._resume_decision)
+    assert "get_live_job_for_session" in decision_src
+    # 决策函数同样不许碰租约/消息
+    assert "acquire_generation" not in decision_src
+    assert "add_message" not in decision_src
 
 
 def test_resume_endpoint_exists_with_after_param():
