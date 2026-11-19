@@ -202,8 +202,8 @@ def test_same_process_reclaim_is_not_a_conflict(caplog):
 
     fake = FakeRedis()
     with caplog.at_level(logging.WARNING, logger=instances.logger.name):
-        run(instances._claim_owner(fake, "m1", "m1:pod-a", token="tok-a"))
-        run(instances._claim_owner(fake, "m1", "m1:pod-a", token="tok-a"))
+        run(instances._claim_owner(fake, "m1:pod-a", token="tok-a"))
+        run(instances._claim_owner(fake, "m1:pod-a", token="tok-a"))
     assert not [r for r in caplog.records if "实例标识冲突" in r.getMessage()]
 
 
@@ -216,8 +216,8 @@ def test_duplicate_instance_id_is_reported(caplog):
 
     fake = FakeRedis()
     with caplog.at_level(logging.WARNING, logger=instances.logger.name):
-        first = run(instances._claim_owner(fake, "m1", "m1:pod-a", token="tok-a"))
-        second = run(instances._claim_owner(fake, "m1", "m1:pod-a", token="tok-b"))
+        first = run(instances._claim_owner(fake, "m1:pod-a", token="tok-a"))
+        second = run(instances._claim_owner(fake, "m1:pod-a", token="tok-b"))
 
     assert first is True, "第一个认领不该被判成冲突"
     assert second is False, "第二个进程必须知道 owner 被别人占了"
@@ -232,8 +232,8 @@ def test_different_owners_do_not_conflict(caplog):
 
     fake = FakeRedis()
     with caplog.at_level(logging.WARNING, logger=instances.logger.name):
-        a = run(instances._claim_owner(fake, "m1", "m1:pod-a", token="tok-a"))
-        b = run(instances._claim_owner(fake, "m1", "m1:pod-b", token="tok-b"))
+        a = run(instances._claim_owner(fake, "m1:pod-a", token="tok-a"))
+        b = run(instances._claim_owner(fake, "m1:pod-b", token="tok-b"))
     assert (a, b) == (True, True)
     assert not [r for r in caplog.records if "实例标识冲突" in r.getMessage()]
 

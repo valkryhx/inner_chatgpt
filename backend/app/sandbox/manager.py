@@ -170,7 +170,9 @@ class SandboxManager:
                 alive: set[str] = set()
                 try:
                     from ..cluster import instances as inst
-                    alive = await inst.live_owners()
+                    # **本机范围**：容器只存在于本机 Docker 里，
+                    # 别的机器上活着的实例与「我要不要清这个容器」无关。
+                    alive = await inst.live_owners(machine=inst.owner_machine())
                 except Exception:  # noqa: BLE001 - 拿不到就按单实例处理
                     pass
                 n = await asyncio.to_thread(

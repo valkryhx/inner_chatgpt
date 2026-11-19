@@ -21,6 +21,31 @@ t=5  实例 B 启动，清扫 same_machine
 
 清扫时：本机上「owner 不在当前存活集合里」的容器才算残留。
 
+## 一个键还是按机器分键（2026-11-19 真跑 compose 后改）
+
+原实现用 `hlz:instances:<机器名>` 分键。单机多进程时没问题，但
+**`--scale` 下每个副本的 hostname 不同**，于是两个实例永远在各自的键里：
+
+```
+app-1 (hostname d1ae4fbe797e) -> zadd hlz:instances:d1ae4fbe797e
+app-2 (hostname 4c7af2741a10) -> zadd hlz:instances:4c7af2741a10
+```
+
+`live_owners()` 只返回自己那一个 -> `/api/health` 报 `live_instances=1`，
+`is_generation_dead_elsewhere` 看不见远程 owner -> **判活整个失效**。
+
+根因是一个函数承担了两种作用域：
+
+| 调用方 | 真正需要的作用域 |
+| --- | --- |
+| `probe.cleanup_orphans`（清残留容器） | **本机**（容器只在本机 Docker 里） |
+| `is_generation_dead_elsewhere`（判活） | **全集群** |
+| `recover_stale_runtime`（收敛） | **全集群** |
+
+所以改成**单一全局键** + 按 owner 的 `<机器名>:` 前缀过滤：
+`live_owners()` 默认给全集群，`live_owners("hostA")` 给本机。
+owner 里已经带了机器名，不需要再靠 key 编码这个维度。
+
 ## 没有 Redis 时
 
 单实例，`live_owners()` 返回空集合，调用方退化成「按机器名前缀匹配」
@@ -95,16 +120,28 @@ def reset_for_tests() -> None:
     _conflict_warned_at.clear()
 
 
-def _key(machine: str) -> str:
+def _key() -> str:
+    """**全集群唯一**的心跳表键。
+
+    ## 为什么不再按机器分键（2026-11-19）
+
+    原实现是 `{prefix}:instances:{machine}`。单机多进程没问题，但
+    `--scale` 下每个副本 hostname 不同 -> 各写各的键 -> `live_owners()`
+    只看得到自己 -> 跨实例判活整个失效（详见模块头）。
+
+    现在只有一个键，机器维度靠 owner 的 `<机器名>:` 前缀表达。
+    需要「只看本机」的调用方传 `live_owners(machine=...)`。
+    """
     prefix = os.environ.get("HLZ_REDIS_PREFIX", "hlz").strip() or "hlz"
-    return f"{prefix}:instances:{machine}"
+    return f"{prefix}:instances"
 
 
-def _claim_key(machine: str, owner: str) -> str:
-    return f"{_key(machine)}:claim:{owner}"
+def _claim_key(owner: str) -> str:
+    """认领键。同样**不带机器前缀** —— 同 owner 跨机也要能发现冲突。"""
+    return f"{_key()}:claim:{owner}"
 
 
-async def _claim_owner(redis: Any, machine: str, owner: str, *,
+async def _claim_owner(redis: Any, owner: str, *,
                        token: Optional[str] = None,
                        warn: bool = True) -> bool:
     """认领这个 owner，返回是否「没有冲突」。
@@ -112,7 +149,7 @@ async def _claim_owner(redis: Any, machine: str, owner: str, *,
     见模块头「owner 撞车的检测」。这里**不抛异常** —— 登记失败不该拖垮启动。
     """
     token = token or _TOKEN
-    key = _claim_key(machine, owner)
+    key = _claim_key(owner)
     try:
         got = await redis.get(key)
         if got is None:
@@ -142,24 +179,28 @@ async def _claim_owner(redis: Any, machine: str, owner: str, *,
 async def register_self() -> bool:
     """登记本实例（幂等）。返回是否登记成功（没 Redis = False）。"""
     if not cluster_enabled():
+        logger.info("instance_register skipped：未配置 Redis（单实例模式）")
         return False
     redis = await get_redis()
     if redis is None:
+        logger.warning("instance_register skipped：Redis 客户端不可用")
         return False
     machine = owner_machine()
     me = owner_id()
-    key = _key(machine)
+    key = _key()
     now = int(time.time() * 1000)
     # 顺序：先认领再登记。认领只是检测，失败也照样登记 ——
     # 两个同 owner 的副本都应该出现在存活集合里，让上层「看起来」是对的，
     # 同时日志里已经有明确告警，运维能看到。
-    await _claim_owner(redis, machine, me)
+    await _claim_owner(redis, me)
     try:
         await redis.zadd(key, {me: now})
         await redis.pexpire(key, _STALE_MS * 2)
+        logger.info("instance_register ok instance=%s machine=%s key=%s",
+                    me, machine, key)
         return True
     except Exception:  # noqa: BLE001
-        logger.warning("登记实例失败", exc_info=True)
+        logger.warning("instance_register failed instance=%s", me, exc_info=True)
         return False
 
 
@@ -170,9 +211,8 @@ async def heartbeat() -> None:
     redis = await get_redis()
     if redis is None:
         return
-    machine = owner_machine()
     me = owner_id()
-    key = _key(machine)
+    key = _key()
     now = int(time.time() * 1000)
     try:
         await redis.zadd(key, {me: now})
@@ -184,7 +224,7 @@ async def heartbeat() -> None:
         return
     # 心跳顺便复核认领：`_claim_owner` 是 NX 的，启动时若因竞态漏判，
     # 或运维事后把两个副本改成同一标识，下一跳就能发现（30s 内）。
-    await _claim_owner(redis, machine, me)
+    await _claim_owner(redis, me)
 
 
 async def unregister_self() -> None:
@@ -194,16 +234,16 @@ async def unregister_self() -> None:
     redis = await get_redis()
     if redis is None:
         return
-    machine = owner_machine()
     me = owner_id()
     try:
-        await redis.zrem(_key(machine), me)
+        await redis.zrem(_key(), me)
+        logger.info("instance_unregister instance=%s", me)
     except Exception:  # noqa: BLE001
-        pass
+        logger.warning("instance_unregister failed instance=%s", me, exc_info=True)
     # 认领键也要放掉：否则同一 pod name 重启后会看到「上个进程的 token」，
     # 误报一次冲突（K8s 里 pod 重建后名字可能复用）。
     try:
-        key = _claim_key(machine, me)
+        key = _claim_key(me)
         got = await redis.get(key)
         if got == _TOKEN:
             await redis.delete(key)
@@ -212,7 +252,12 @@ async def unregister_self() -> None:
 
 
 async def live_owners(machine: Optional[str] = None) -> set[str]:
-    """本机（或指定机器）当前**活着**的 owner 集合。
+    """当前**活着**的 owner 集合。
+
+    - `machine=None`（默认）：**全集群**。判活（`is_generation_dead_elsewhere`）、
+      收敛（`recover_stale_runtime`）需要这个粒度。
+    - 给了 `machine`：只返回该机器的（按 owner 的 `"<machine>:"` 前缀过滤）。
+      容器清扫需要这个粒度 —— 容器只存在于本机 Docker 里。
 
     没配 Redis 返回空集合 —— 调用方据此退化成「按机器名前缀」的宽松模式。
     这正是单实例的正确语义（本机只有自己，所有本机容器都算残留）。
@@ -222,12 +267,19 @@ async def live_owners(machine: Optional[str] = None) -> set[str]:
     redis = await get_redis()
     if redis is None:
         return set()
-    machine = machine or owner_machine()
     now = int(time.time() * 1000)
     try:
-        rows = await redis.zrangebyscore(
-            _key(machine), now - _STALE_MS, "+inf")
-        return set(rows or [])
+        # 全集群一个键；机器维度靠 owner 前缀区分，不再靠 key。
+        rows = await redis.zrangebyscore(_key(), now - _STALE_MS, "+inf")
+        members = set(rows or [])
+        if machine:
+            prefix = f"{machine}:"
+            members = {o for o in members if o.startswith(prefix)}
+        # DEBUG 级别：这个函数被清理逻辑频繁调用，INFO 会刷屏。
+        # 需要时把日志级别调到 DEBUG 就能看到完整的存活集合。
+        logger.debug("live_owners machine=%s n=%d members=%s",
+                     machine or "*", len(members), sorted(members))
+        return members
     except Exception:  # noqa: BLE001
-        logger.warning("读取存活实例失败", exc_info=True)
+        logger.warning("live_owners failed machine=%s", machine, exc_info=True)
         return set()
