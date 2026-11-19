@@ -123,6 +123,35 @@ _BEGIN_LOCKED = re.compile(
 _BEGIN_PLAIN = re.compile(r"^\s*BEGIN(?:\s+DEFERRED)?\s*;?\s*$", re.IGNORECASE)
 
 
+# DDL 串行化用的 advisory lock scope。
+#
+# ## 为什么需要（2026-11-19 真跑 compose --scale app=2 时复现）
+#
+# PG 的 `CREATE TABLE IF NOT EXISTS` 不是原子的：它「先查后建」，两步之间
+# 没有锁。两个实例同时 `init_db()` 时，两边都查到「不存在」，都去建，
+# 一个就会撞在系统表的唯一索引上：
+#
+#   duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+#
+# 然后整个 `executescript` 回滚、lifespan 抛异常、进程退出
+# （`Application startup failed. Exiting.`）。
+#
+# SQLite 不会这样：它的 DDL 拿的是库级写锁，天然串行。所以这纯粹是
+# 「迁到 PG 之后新出现的多实例 bug」。
+#
+# ## 为什么不能只让 leader 建表
+#
+# 建表发生在 lifespan 很早（`db.init_db()`），那时 leader election 可能
+# 还没跑完；而且非 leader 也必须能建表（leader 可能后起）。
+# 所以用一把**只看「谁在建表」的锁**，与 leader 无关。
+DDL_LOCK_SCOPE = "hlz:ddl:init"
+
+# DDL 锁最多等多久。建表脚本是毫秒级的，但冷启动 + 慢盘可能要几秒；
+# 等太久会把启动拖死，等太短会误判失败。30s 足够覆盖最坏情况，
+# 又能在「有个实例卡死在建表」时及时放弃（表通常已经建好了）。
+DDL_LOCK_WAIT_S = 30
+
+
 def lock_key_for(scope: str | None) -> int:
     """把 scope 字符串映射成 `pg_advisory_xact_lock` 的 64 位键。
 
@@ -413,15 +442,41 @@ class PgConnection(Connection):
             _known_schemas.add(schema)
         await raw.execute(f'SET search_path TO "{schema}", public')
 
-    async def _begin(self, *, lock: bool = False, scope: str | None = None) -> None:
+    async def _begin(self, *, lock: bool = False, scope: str | None = None,
+                     wait_s: float | None = None) -> None:
         raw = await self._ensure()
         await raw.execute("BEGIN")
         self._in_tx = True
         if lock:
             # 顶替 SQLite 的库级写锁：整个事务独占写，事务结束自动释放。
             # `scope` 决定锁粒度（None = 全局，与迁移前行为一致）。
-            await raw.execute("SELECT pg_advisory_xact_lock($1)",
-                              lock_key_for(scope))
+            #
+            # `wait_s` 给了就带超时。`pg_advisory_xact_lock` 本身会**无限等**，
+            # 一个卡死的持有者会把所有实例的启动一起拖死 —— 对业务写事务
+            # 这是对的（宁可等也不能丢），但对**启动期 DDL** 必须能放弃：
+            # 超时说明「别人大概已经建好了」，继续跑反而更安全。
+            if wait_s is None:
+                await raw.execute("SELECT pg_advisory_xact_lock($1)",
+                                  lock_key_for(scope))
+            else:
+                # `pg_try_advisory_xact_lock` 不等待；轮询到超时。
+                # 用 `SET LOCAL lock_timeout` 做不到（advisory lock 不受它管）。
+                import asyncio as _aio
+                deadline = _aio.get_running_loop().time() + wait_s
+                key = lock_key_for(scope)
+                while True:
+                    row = await raw.fetchrow(
+                        "SELECT pg_try_advisory_xact_lock($1) AS ok", key)
+                    if row and row["ok"]:
+                        break
+                    if _aio.get_running_loop().time() >= deadline:
+                        # 放弃加锁但仍然继续：DDL 都是 IF NOT EXISTS，
+                        # 重跑一遍是幂等的；卡在等锁上更糟（启动直接挂）。
+                        logger.warning(
+                            "DDL 锁等待超时（%.0fs），继续执行建表（幂等）",
+                            wait_s)
+                        break
+                    await _aio.sleep(0.1)
         await self._savepoint()
 
     async def _savepoint(self) -> None:
@@ -685,7 +740,7 @@ class PgConnection(Connection):
     # ---------------- 扩展 API ----------------
 
     async def executescript(self, sql: str) -> Cursor:
-        """跑一段 DDL 脚本，**自带事务**（与 sqlite3 的 executescript 语义一致）。
+        """跑一段 DDL 脚本，**自带事务 + 跨实例串行化**。
 
         sqlite3 的 `executescript` 会先 COMMIT 掉挂起的事务，再整段执行。
         这里照抄这个语义，有两个实际好处：
@@ -695,6 +750,19 @@ class PgConnection(Connection):
            `_in_tx` 为假，下一条语句会重新 BEGIN + 建 SAVEPOINT，
            失败只回滚到那个新 SAVEPOINT，不会把刚建好的表一起吞掉
            （2026-11-19 实测：不提交时 `relation "t" does not exist`）。
+
+        ## 为什么必须拿 DDL 锁（2026-11-19 加）
+
+        `CREATE TABLE IF NOT EXISTS` 在 PG 上**不是原子的**（先查后建）。
+        多实例同时启动时两个副本会撞在 `pg_type_typname_nsp_index` 上，
+        第二个进程直接 `Application startup failed. Exiting.`。
+        详见 `DDL_LOCK_SCOPE` 的注释。
+
+        锁的粒度是**整个脚本**，不是每条语句：DDL 只在启动跑一次，
+        串行化的代价可忽略，而语句级加锁会让 `try/except` 迁移代码的
+        语义变得依赖顺序。
+
+        SQLite 路径不受影响（它的 DDL 已自带库级写锁，且走的是另一个驱动）。
         """
         from .sqlcompat import split_statements
 
@@ -707,7 +775,9 @@ class PgConnection(Connection):
         if self._in_tx:
             await self._commit_raw()
 
-        await self._begin()
+        # 跨实例串行化：BEGIN 时就把 advisory lock 一起拿上，
+        # 事务提交/回滚时 PG 自动释放（xact 级，不用手动解锁）。
+        await self._begin(lock=True, scope=DDL_LOCK_SCOPE, wait_s=DDL_LOCK_WAIT_S)
         try:
             for stmt in stmts:
                 await self._execute_raw(stmt, ())
