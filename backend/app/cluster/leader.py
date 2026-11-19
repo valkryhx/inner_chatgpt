@@ -82,6 +82,11 @@ class LeaderElector:
         self._fired: set[str] = set()
         self._stopping = False
         self._redis = None
+        # 是否已经 `start()` 过。没有这个标志时，`is_leader` 无法区分
+        # 「单实例真 leader」和「配了 Redis 但选举根本没启动」——
+        # 后者的 `_redis` 也是 None，于是也会返回 True（真跑 compose 时
+        # 两个副本都报 leader=true，就是这么来的）。
+        self._started = False
 
     # ---------------- 回调 ----------------
 
@@ -102,10 +107,29 @@ class LeaderElector:
     # ---------------- 状态 ----------------
 
     @property
+    def is_running(self) -> bool:
+        """选举循环是否已经启动。**不可由 `_redis` 推断** —— 见 `__init__`。"""
+        return self._started
+
+    @property
     def is_leader(self) -> bool:
-        # 没配 Redis = 单实例 = 永远是 leader
-        if self._redis is None:
-            return True
+        """**如实**回答「我是不是 leader」。
+
+        三种情况必须区分开：
+
+        | 情况 | `_started` | `_redis` | 应返回 |
+        | --- | --- | --- | --- |
+        | 真·单实例（没配 Redis） | False | None | `True`（本就是唯一实例） |
+        | 配了 Redis 但选举没启动 | False | None | `False`（不知道，别撒谎） |
+        | 选举在跑 | True | 有 | 循环里维护的 `_is_leader` |
+
+        第二行是 2026-11-19 真跑 compose 时暴露的：两个副本都报
+        `leader: true`，运维会以为高可用正常，实际选举根本没跑。
+        """
+        # 没配 Redis = 单实例 = 永远是 leader（这个语义不能丢）
+        if not self._started:
+            from .config import cluster_enabled
+            return not cluster_enabled()
         return self._is_leader
 
     # ---------------- 生命周期 ----------------
@@ -120,6 +144,8 @@ class LeaderElector:
             return
         self._stopping = False
         self._redis = await get_redis()
+        # 无论走哪条分支都要标记「已启动」：之后 `is_leader` 才敢如实回答。
+        self._started = True
 
         if self._redis is None:
             # 单实例：直接当 leader，回调跑一次

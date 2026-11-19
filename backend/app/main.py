@@ -27,9 +27,16 @@ _LOG_CONFIG = setup_logging()
 async def lifespan(app: FastAPI):
     import logging
 
-    logging.getLogger(__name__).info(
-        "logging ready: level=%s team_log=%s",
-        _LOG_CONFIG["level"], _LOG_CONFIG["team_log"] or "(disabled)")
+    _log = logging.getLogger(__name__)
+    # 启动横幅：多实例下排查的第一性问题就是「这个容器是谁」。
+    # 一条日志同时给出 owner、注入标识、日志文件位置，省掉 exec 进去看环境变量。
+    _identity = _instance_identity()
+    _log.info(
+        "startup instance=%s app_log=%s level=%s team_log=%s",
+        _identity or "(unknown)",
+        _LOG_CONFIG.get("app_log") or "(disabled)",
+        _LOG_CONFIG["level"],
+        _LOG_CONFIG["team_log"] or "(disabled)")
     # PG 后端先预热连接池：冷建连 ~200ms，首个请求不该承担它
     # （记忆预取有 50ms 级的时序要求，见 pgdriver.warm_pool）。
     try:
@@ -98,8 +105,15 @@ async def lifespan(app: FastAPI):
         from .cluster import instances as inst_registry
         await inst_registry.register_self()
         instance_hb = asyncio.create_task(_instance_heartbeat_loop())
+        # 登记完立刻打一条集群快照：多实例排查时「启动这一刻有几个兄弟」
+        # 是最关键的信息（后面谁死了、谁新加了都要跟这一条对比）。
+        _snap = await _cluster_snapshot()
+        _log.info(
+            "cluster enabled=%s live=%d leader=%s instance_id=%s owner=%s",
+            _snap.enabled, _snap.live_instances, _snap.leader,
+            _snap.instance_id or "(none)", _identity or "(unknown)")
     except Exception:
-        logging.getLogger(__name__).warning("实例登记失败（按单实例继续）", exc_info=True)
+        _log.warning("实例登记失败（按单实例继续）", exc_info=True)
     # 沙箱管理器：自检 Docker/镜像 + 清扫上次进程残留容器 + 起 TTL 回收协程。
     # 自检失败**不阻断启动**（auto 模式降级留痕、strict 模式在工具调用点报错），
     # 这与设计文档 §6.5「沙箱故障不能拖垮主服务」一致。
@@ -244,12 +258,18 @@ async def health(request: Request, response: Response):
 
     ## 顺手下发粘性 cookie
 
-    nginx 的 `hash $cookie_hlz_sticky consistent` **只能读** cookie，
-    没法设。所以由应用下发一个稳定的随机值，让同一个浏览器始终落到
-    同一个后端实例（见 deploy/nginx.conf）。
+    nginx 的 `hash $cookie_hlz_sticky`（**不带 consistent**，见 nginx.conf 的说明）
+    **只能读** cookie，没法设。所以由应用下发一个稳定的随机值，让同一个浏览器
+    始终落到同一个后端实例。
 
     为什么放在 health：它是前端启动第一个必然访问的端点，且不需要登录。
     已经带了就不重复下发（避免每次心跳都刷 Set-Cookie）。
+
+    ## 多实例可观测性（2026-11-19 加）
+
+    返回 `instance` 与 `cluster`，让运维**不进容器**就能回答：
+    这次请求落在谁身上、集群里还有谁活着、我是不是 leader。
+    全部可安全公开 —— 不含 Redis URL / DB DSN / 密码。
     """
     _ensure_sticky_cookie(request, response)
     model = ""
@@ -258,7 +278,62 @@ async def health(request: Request, response: Response):
             model = load_llm_settings().model
         except Exception:
             model = ""
-    return HealthOut(ok=True, model=model, mcp_tools=0)
+    return HealthOut(ok=True, model=model, mcp_tools=0,
+                     instance=_instance_identity(),
+                     cluster=await _cluster_snapshot())
+
+
+def _instance_identity() -> str:
+    """本实例 owner（`<hostname>:<标识>`）。取不到返回空串，绝不抛。"""
+    try:
+        from .sandbox.identity import owner_id
+        return owner_id()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def _cluster_snapshot():
+    """集群形态快照。任何失败都降级成「单实例」，不影响 health 可用性。
+
+    **只返回形状**：有没有配 Redis、活着几个实例、我是不是 leader、我的标识。
+    绝不回传连接串。
+    """
+    from .schemas import ClusterHealthOut
+    try:
+        from .cluster import instances as inst
+        from .cluster.config import cluster_enabled, instance_id
+        enabled = cluster_enabled()
+        live = 0
+        if enabled:
+            try:
+                live = len(await inst.live_owners())
+            except Exception:  # noqa: BLE001
+                live = 0
+        is_leader = False
+        election = "off"
+        try:
+            from .cluster import get_elector
+            elector = get_elector()
+            if elector.is_running:
+                is_leader = bool(elector.is_leader)
+                election = "on"
+            elif enabled:
+                # 配了 Redis 但选举循环没跑：`leader` 值不可信。
+                # 如实报 false + 状态，而不是让运维以为高可用正常。
+                is_leader = False
+                election = "starting"
+            else:
+                # 单实例：本来就是唯一实例
+                is_leader = True
+                election = "off"
+        except Exception:  # noqa: BLE001
+            is_leader = not enabled
+            election = "off"
+        return ClusterHealthOut(enabled=enabled, live_instances=live,
+                                leader=is_leader, instance_id=instance_id(),
+                                leader_election=election)
+    except Exception:  # noqa: BLE001
+        return ClusterHealthOut()
 
 
 # 粘性 cookie 名。与 deploy/nginx.conf 的 `hash $cookie_hlz_sticky` 必须一致。

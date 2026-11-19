@@ -15,6 +15,30 @@ uvicorn 只配置它自己的 logger，`app.*` 的日志全部被丢弃。结果
    关闭：`HLZ_TEAM_LOG=0`。
 3. **不引入依赖**：只用标准库 logging + 一个自定义 Formatter。
 4. **可轮转**：按大小轮转，避免长期运行把磁盘写满。
+
+## 多实例：每一行都必须能回答「这是哪个实例」（2026-11-19 加）
+
+真跑 `compose --scale app=3` 时暴露一个致命的可观测性缺陷：
+
+**所有副本共享同一个 `appdata` 卷，写同一个 `app.log`。** 三个实例的日志
+交错在一起，`tail app.log` 根本看不出某一行是谁打的。排查
+「为什么这个请求落到了 B」「B 为什么把 A 的 generation 判死」时无从下手。
+
+三层修法（互相独立，任何一层都能单独定位问题）：
+
+| 层 | 做法 | 回答什么问题 |
+| --- | --- | --- |
+| 控制台 / app.log | 行首恒定 `[<实例标识>]` | 这一行是哪个实例打的 |
+| app.log 文件名 | `app-<实例标识>.log` | 共享卷下也不交错（**关键**） |
+| JSONL | `instance` 字段 | 按实例过滤结构化事件 |
+
+实例标识取 `identity._instance_tag()` 的**尾部**（`hostname:` 之后那段），
+与 `owner_id()` 和 `X-HLZ-Instance` 响应头的尾部**完全一致** —— 这样日志、
+HTTP 响应、Redis 里的 owner 三者能互相印证。
+
+**注入方式很关键**：实例标识加在 **Formatter 层**（以及 record 的 `instance`
+属性），绝不改 `record.msg`。否则任何断言日志内容的代码
+（`caplog`、`assert "xxx" in caplog.text`）都会因前缀而失败。
 """
 from __future__ import annotations
 
@@ -38,10 +62,73 @@ TEAM_LOGGER_NAME = "hlaudz.team"
 # 数字全丢了。而「首帧慢在哪一段」恰恰只能靠这些字段回答。
 PRELUDE_LOGGER_NAME = "hlaudz.prelude"
 
-_DEFAULT_FORMAT = "%(levelname)-7s %(asctime)s %(name)s: %(message)s"
+# 实例标识的前缀格式。放在常量里，测试和文档引用同一个定义。
+INSTANCE_PREFIX_FMT = "[%(instance)s] "
+
+_DEFAULT_FORMAT = (
+    INSTANCE_PREFIX_FMT + "%(levelname)-7s %(asctime)s %(name)s: %(message)s")
 _DATE_FORMAT = "%H:%M:%S"
 
 _configured = False
+
+
+def instance_tag() -> str:
+    """本实例的短标识（owner 的尾部）。
+
+    与 `sandbox.identity.owner_id()`、`X-HLZ-Instance` 响应的尾部一致。
+    取不到时返回 `"-"`，绝不抛异常 —— 日志基础设施不该让服务起不来。
+    """
+    try:
+        from .sandbox.identity import _instance_tag
+        return _instance_tag()
+    except Exception:  # noqa: BLE001
+        return "-"
+
+
+def instance_slug() -> str:
+    """日志文件名用的**唯一**标识：`<机器名>-<标识>`。
+
+    ## 为什么不能只用 tag（2026-11-19 真跑 compose 踩到）
+
+    没注入 `HLZ_INSTANCE_ID` 时 tag 就是 PID。两个容器的 python 进程
+    **可能拿到同一个 PID**（实测都是 7）—— 于是它们算出同一个文件名
+    `app-7.log`，在共享 `appdata` 卷上交错写同一份日志，且无法区分。
+
+    带上机器名（容器 hostname，`--scale` 下天然不同）就唯一了。
+    """
+    try:
+        from .sandbox.identity import _hostname, _instance_tag
+        host, tag = _hostname(), _instance_tag()
+    except Exception:  # noqa: BLE001
+        return "-"
+    slug = f"{host}-{tag}"
+    return "".join(c if (c.isalnum() or c in "-_.") else "-" for c in slug) or "-"
+
+
+class InstanceFilter(logging.Filter):
+    """给每条 record 补一个 `instance` 属性，供 Formatter 渲染。
+
+    ## 为什么用 Filter 而不是在每条 logger 调用里传 extra
+
+    `logger.info(..., extra={"instance": x})` 要求**每一个调用点**都记得传，
+    漏一个就有一行没有归属。Filter 挂在 handler 上是**全局兜底**：
+    任何 logger（含第三方库）走这个 handler 都自动带上。
+
+    ## 为什么写在 record 上而不是改 msg
+
+    改 `record.msg` 会污染 `getMessage()`，让所有 `assert "xxx" in caplog.text`
+    之类的断言失效。这里只加一个额外属性，消息本身一个字不动。
+    """
+
+    def __init__(self, tag: str) -> None:
+        super().__init__()
+        self.tag = tag
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # 已显式传了 instance 的（比如跨实例转发来的事件）就尊重原值
+        if not getattr(record, "instance", ""):
+            record.instance = self.tag
+        return True
 
 
 def _logs_dir() -> Path:
@@ -93,6 +180,7 @@ class JsonLineFormatter(logging.Formatter):
         payload: dict[str, Any] = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(record.created)),
             "level": record.levelname,
+            "instance": getattr(record, "instance", "") or instance_tag(),
             "logger": record.name,
             "event": record.getMessage(),
         }
@@ -124,28 +212,49 @@ def setup_logging() -> dict[str, Any]:
     level = log_level()
     root = logging.getLogger()
     team_path: Path | None = None
+    app_log_path: Path | None = None
+    tag = instance_tag()
     if not _configured:
         root.setLevel(level)
+
+        # 实例标识过滤器：挂在每个 handler 上，保证任何 logger（含第三方库）
+        # 落到这个 handler 的 record 都带 `instance` 属性。
+        inst_filter = InstanceFilter(tag)
 
         # stdout：人读的格式
         console = logging.StreamHandler(sys.stdout)
         console.setFormatter(logging.Formatter(_DEFAULT_FORMAT, datefmt=_DATE_FORMAT))
         console.setLevel(level)
+        console.addFilter(inst_filter)
         root.addHandler(console)
 
         # 可选：应用日志单独落文件（不跟 uvicorn 的 access log 混）
         # 默认开：排查问题时最常见的情况是「事情已经发生了才去看」，
         # 只写到 stdout 的话日志会随终端滚走。
-        app_log = (os.environ.get("HLZ_APP_LOG") or "").strip() or "app.log"
+        #
+        # ## 多实例下必须按实例分文件
+        #
+        # 所有副本共享 `appdata` 卷时 `app.log` 会被三个进程交错写，
+        # 逻辑行互相穿插（尤其多行 traceback），且无法归属。
+        # 加上实例标识后每个实例写自己的文件，`ls logs/` 就能看出跑了几个。
+        # 单实例时默认名保持 `app.log`（不破坏现有习惯与文档）。
+        app_log = (os.environ.get("HLZ_APP_LOG") or "").strip()
+        if not app_log:
+            # 没显式指定时按实例分名：`app-<机器名>-<标识>.log`。
+            # 必须带机器名：无注入时标识就是 PID，两个容器的 PID 可能相同。
+            slug = instance_slug()
+            app_log = f"app-{slug}.log" if slug and slug != "-" else "app.log"
         if _env_flag("HLZ_APP_LOG_ON", default=True) and app_log:
             path = Path(app_log) if os.path.isabs(app_log) else _logs_dir() / app_log
             path.parent.mkdir(parents=True, exist_ok=True)
             file_handler = logging.handlers.RotatingFileHandler(
                 path, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8")
-            file_handler.setFormatter(
-                logging.Formatter("%(asctime)s " + _DEFAULT_FORMAT, datefmt=_DATE_FORMAT))
+            file_handler.setFormatter(logging.Formatter(
+                "%(asctime)s " + _DEFAULT_FORMAT, datefmt=_DATE_FORMAT))
             file_handler.setLevel(level)
+            file_handler.addFilter(inst_filter)
             root.addHandler(file_handler)
+            app_log_path = path
 
         # 团队事件：独立 JSONL，便于 grep。默认开。
         if _env_flag("HLZ_TEAM_LOG", default=True):
@@ -156,6 +265,7 @@ def setup_logging() -> dict[str, Any]:
             team_handler.setFormatter(JsonLineFormatter())
             # 团队日志恒为 INFO：它是可观测性的核心，不该被全局级别压掉
             team_handler.setLevel(logging.INFO)
+            team_handler.addFilter(inst_filter)
             team_logger = logging.getLogger(TEAM_LOGGER_NAME)
             team_logger.addHandler(team_handler)
             team_logger.setLevel(logging.INFO)
@@ -174,6 +284,7 @@ def setup_logging() -> dict[str, Any]:
                 prelude_path, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8")
             prelude_handler.setFormatter(JsonLineFormatter())
             prelude_handler.setLevel(logging.INFO)
+            prelude_handler.addFilter(inst_filter)
             prelude_logger = logging.getLogger(PRELUDE_LOGGER_NAME)
             prelude_logger.addHandler(prelude_handler)
             prelude_logger.setLevel(logging.INFO)
@@ -187,6 +298,8 @@ def setup_logging() -> dict[str, Any]:
 
     return {
         "level": logging.getLevelName(level),
+        "instance": tag,
         "team_log": str(team_path) if team_path else "",
+        "app_log": str(app_log_path) if app_log_path else "",
         "logs_dir": str(_logs_dir()),
     }

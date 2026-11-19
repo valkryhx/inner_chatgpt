@@ -17,23 +17,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app import logging_setup  # noqa: E402
 
 
+from _logging_isolation import isolated_logging  # noqa: E402
+
+
 @pytest.fixture
-def fresh_logging(monkeypatch, tmp_path):
-    """重置全局配置，让每个用例都能重新 setup 到临时目录。"""
-    root = logging.getLogger()
-    saved_handlers = list(root.handlers)
-    saved_level = root.level
-    team_logger = logging.getLogger(logging_setup.TEAM_LOGGER_NAME)
-    saved_team = list(team_logger.handlers)
-    saved_prop = team_logger.propagate
-    logging_setup._configured = False
-    monkeypatch.setattr(logging_setup, "_logs_dir", lambda: tmp_path)
-    yield tmp_path
-    root.handlers[:] = saved_handlers
-    root.setLevel(saved_level)
-    team_logger.handlers[:] = saved_team
-    team_logger.propagate = saved_prop
-    logging_setup._configured = False
+def fresh_logging(isolated_logging):
+    """日志配置隔离（统一实现见 `tests/_logging_isolation.py`）。
+
+    先前手写版本只恢复 root + team，漏了 prelude —— 全量跑时会串。
+    """
+    return isolated_logging
 
 
 def test_app_logger_gets_a_handler(fresh_logging, monkeypatch, capfd):

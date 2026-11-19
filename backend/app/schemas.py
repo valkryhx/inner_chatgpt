@@ -141,10 +141,33 @@ class CompactResult(BaseModel):
     message: str = ""
 
 
+class ClusterHealthOut(BaseModel):
+    """多实例形态快照。**只含形状，不含连接串/密码**。
+
+    为什么放在 health 里：运维排查「为什么粘性没生效」「另一个实例是不是还活着」
+    时，不该需要进容器 exec redis-cli。这些字段全部可安全公开。
+    """
+
+    enabled: bool = False          # 有没有配 Redis（配了才是多实例模式）
+    live_instances: int = 0        # 心跳表里还活着的实例数
+    leader: bool = True            # 本实例是不是 leader
+    instance_id: str = ""          # 本实例的注入标识（K8s pod name 等）
+    # leader 选举的真实状态。`leader=false` 时运维要能一眼看出是
+    # 「我确实不是 leader」还是「选举根本没启动」。
+    #   on       选举在跑（leader 值可信）
+    #   off      没配 Redis（单实例，本来就该是 leader）
+    #   starting 配了 Redis 但选举未启动（leader 值不可信）
+    leader_election: str = "off"
+
+
 class HealthOut(BaseModel):
     ok: bool = True
     model: str = ""
     mcp_tools: int = 0
+    # 多实例可观测性（2026-11-19 加）。都是**新增可选字段**，
+    # 老前端不认也不会坏（Pydantic 只多不少）。
+    instance: str = ""             # 本实例 owner（与 X-HLZ-Instance 头一致）
+    cluster: Optional[ClusterHealthOut] = None
 
 
 # ---------------- 多用户 / 认证 ----------------
