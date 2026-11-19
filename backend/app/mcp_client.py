@@ -8,6 +8,7 @@ fastmcp.Client 直接接入，封装为自研 Tool（不再依赖 langchain）�
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from typing import Any, Optional
@@ -102,6 +103,80 @@ def _format_call_error(exc: Exception, schema: Any) -> str:
             "指定某月请用 metric_series 的 month=YYYY-MM。"
         )
     return f"[工具执行错误] {type(exc).__name__}: {msg}{hint}"
+
+
+# MCP 工具调用的**默认**超时。
+#
+# ## 为什么必须显式给（2026-11-19 多实例事故）
+#
+# SDK 的默认值是「无超时」，两头都是 None：
+#
+#     fastmcp.Client.call_tool(..., timeout: ... | None = None)
+#     mcp.ClientSession.call_tool(..., read_timeout_seconds: ... | None = None)
+#
+# 于是 server 收到请求但不回包时（半死连接 / 中间设备吞包 / 服务端 hang），
+# `await call_tool(...)` 会**永久挂住**，协程永不恢复，`tool_result` 永不发出。
+# 实测现场：两个子代理都发出 `web_search_exa` 的 `tool_start` 后再无下文，
+# 父代理连等 240s + 300s 两次都 timeout，而实例进程健康、`/api/health` 20ms
+# 返回 —— 事件循环没事，是这一个 await 不返回。
+#
+# 同一份代码新建连接只要 0.9s，说明不是网络不通，而是「旧连接卡住 + 没有兜底」。
+# 对照 `runtime.py` 的探活：那里明确 `asyncio.wait_for` 并把超时判为死连接，
+# 说明设计上知道会卡，只是执行路径漏了这层。
+#
+# ## 为什么是 300s
+#
+# 工具调用里最长的是联网搜索/抓取，正常几秒到几十秒。300s 既远大于正常耗时
+# （不误杀慢请求），又远小于 user 能容忍的「永远转圈」。可用环境变量覆盖。
+_DEFAULT_MCP_CALL_TIMEOUT_S = 300.0
+_MCP_CALL_TIMEOUT_ENV = "MCP_CALL_TIMEOUT_S"
+# 兜底下限/上限：0 或负数等于没有超时，必须退回默认。
+_MCP_CALL_TIMEOUT_MIN_S = 1.0
+_MCP_CALL_TIMEOUT_MAX_S = 3600.0
+
+
+def mcp_call_timeout_s() -> float:
+    """单次 MCP 工具调用的超时秒数（`MCP_CALL_TIMEOUT_S` 可覆盖）。
+
+    坏配置（非数字 / 0 / 负数 / 超范围）一律退回默认值：宁可超时保守，
+    也不能因为一个环境变量写错就让工具彻底不可用或变回「无超时」。
+    """
+    import os
+
+    raw = os.environ.get(_MCP_CALL_TIMEOUT_ENV)
+    if raw is None or not str(raw).strip():
+        return _DEFAULT_MCP_CALL_TIMEOUT_S
+    try:
+        v = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return _DEFAULT_MCP_CALL_TIMEOUT_S
+    if v < _MCP_CALL_TIMEOUT_MIN_S or v > _MCP_CALL_TIMEOUT_MAX_S:
+        return _DEFAULT_MCP_CALL_TIMEOUT_S
+    return v
+
+
+class _McpCallTimeout(Exception):
+    """单次 MCP 工具调用超时（内部信号，不外泄给模型）。
+
+    单独一个类型而不是直接往上抛 `asyncio.TimeoutError`：因为外层还有一层
+    `except Exception` 会把它归到「业务错误」，那会把「server 无响应」
+    误报成「参数不对」，误导模型改参数重试。
+    """
+
+    def __init__(self, seconds: float) -> None:
+        super().__init__(f"mcp call timeout after {seconds}s")
+        self.seconds = seconds
+
+
+def _timeout_error_text(server: str, tool: str, seconds: float) -> str:
+    """超时变成可读的 tool observation，让模型能继续而不是整轮挂死。"""
+    where = f"（server={server}）" if server else ""
+    return (
+        f"[工具执行错误] MCP 工具 {tool} 调用超时{where}："
+        f"超过 {seconds:.0f}s 没有返回。"
+        "已放弃本次调用。该 server 可能已无响应，"
+        "可以稍后重试，或换用其他数据源继续。"
+    )
 
 
 def _apply_mcp_budget(user_id: str, server: str, tool_name: str, text: str) -> str:
@@ -367,13 +442,31 @@ class MCPToolset:
         toolset = self
 
         async def _invoke(payload: dict) -> str:
-            """调用一次；会话失效时自动重连并重试一次。"""
+            """调用一次；会话失效时自动重连并重试一次。
+
+            ## 两处调用都必须包超时
+
+            `_call_guarded` 是唯一的出口 —— 原来这里是两条**裸** `await
+            client.call_tool(...)`，而 SDK 默认 `timeout=None`（无限等）。
+            server 半死时整轮生成会永久挂住（2026-11-19 事故，见模块顶部常量的说明）。
+            """
+            async def _call_guarded(target_client: Any) -> str:
+                """带超时地调一次；超时转成可读错误而不是往上抛。"""
+                seconds = mcp_call_timeout_s()
+                try:
+                    result = await asyncio.wait_for(
+                        target_client.call_tool(name, payload), timeout=seconds)
+                except (asyncio.TimeoutError, TimeoutError):
+                    raise _McpCallTimeout(seconds) from None
+                return _result_to_text(result)
+
             client = toolset._client
             if client is None:
                 return f"[工具执行错误] MCP server {toolset._server_name or ''} 当前没有活动连接"
             try:
-                result = await client.call_tool(name, payload)
-                return _result_to_text(result)
+                return await _call_guarded(client)
+            except _McpCallTimeout as exc:
+                return _timeout_error_text(toolset._server_name, name, exc.seconds)
             except Exception as exc:  # noqa: BLE001
                 if not _looks_session_dead(exc):
                     return _format_call_error(exc, schema)
@@ -386,8 +479,9 @@ class MCPToolset:
                         f"该 server 当前不可用：{toolset._error or '重连失败'}"
                     )
                 try:
-                    result = await toolset._client.call_tool(name, payload)
-                    return _result_to_text(result)
+                    return await _call_guarded(toolset._client)
+                except _McpCallTimeout as exc2:
+                    return _timeout_error_text(toolset._server_name, name, exc2.seconds)
                 except Exception as exc2:  # noqa: BLE001
                     return _format_call_error(exc2, schema)
 
