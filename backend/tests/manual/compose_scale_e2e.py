@@ -121,16 +121,20 @@ def main() -> int:
 
     # ---------------- 5. Redis 登记 ----------------
     print("\n=== 5. Redis 心跳登记 ===")
-    keys = [k for k in redis("keys", "hlz:instances:*").splitlines() if k and ":claim:" not in k]
-    print(f"     心跳表 key: {keys}")
-    total = 0
-    members: list[str] = []
-    for k in keys:
-        ms = [m for m in redis("zrange", k, "0", "-1").splitlines() if m]
-        members.extend(ms)
-        total += len(ms)
+    #
+    # ⚠️ 2026-11-19 修：原来查 `hlz:instances:*` 并对多个 key 求和，
+    # 那是「按机器分键」的旧实现。后来改成**全局单 key** `hlz:instances`
+    # （见 cluster/instances.py，多机部署必须共享一张表才看得到彼此），
+    # 但脚本没跟着改 —— 于是 `keys hlz:instances:*` 只匹配到 `:claim:` 那些
+    # 派生 key（被下面的过滤排掉），结果恒为空。
+    #
+    # 这不是代码 bug，是脚本漂移。教训：断言「Redis 里有什么」要和
+    # `_key()` 的实现对齐，别凭记忆写 pattern。
+    key = "hlz:instances"
+    members = [m for m in redis("zrange", key, "0", "-1").splitlines() if m]
+    print(f"     心跳表 key: {key}")
     print(f"     成员: {members}")
-    check("3 个副本都登记了", total == 3, f"{total} 个成员")
+    check("3 个副本都登记了", len(members) == 3, f"{len(members)} 个成员")
     check("登记成员 = 访问到的实例集合",
           set(members) == owners, f"登记={sorted(set(members))} 访问={sorted(owners)}")
 
