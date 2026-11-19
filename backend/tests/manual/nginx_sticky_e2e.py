@@ -127,6 +127,12 @@ http {{
     scgi_temp_path /tmp/st;
 
     upstream hlz {{
+        # ⚠️ 这里用**两个不同端口**的 server，和 `--scale` 的场景不同。
+        # 2026-11-19 实测：`server app:8000` 由 docker DNS 解析成 3 个 A 记录时，
+        # `hash ... consistent` 会退化成严格轮询（ketama 环按 server **名字**
+        # 建点，三个同名 peer 在环上重合）。本脚本用不同端口，环上名字不同，
+        # 所以 `consistent` 能正常工作 —— **这正说明本脚本抓不到那个 bug**。
+        # 那个 bug 由 `tests/manual/compose_scale_e2e.py` 覆盖（真 compose --scale）。
         hash $cookie_hlz_sticky consistent;
         server host.docker.internal:{APP_A};
         server host.docker.internal:{APP_B};
