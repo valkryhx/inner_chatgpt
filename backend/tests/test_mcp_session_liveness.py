@@ -225,13 +225,28 @@ def test_refresh_keeps_runtime_when_connection_is_alive(monkeypatch):
 
 
 def test_refresh_still_skips_while_generation_active(monkeypatch):
+    """有生成在跑时**不重建**（不打断），但要如实报告连接状态。
+
+    ⚠️ 2026-11-19 行为变更（事故 §6.3）：原来这条断言 `out[0]["ok"] is True`，
+    即「即使连接已死，有生成在跑时也报已连接」。
+
+    那正是事故里最恶劣的一点：用户发现卡住，打开设置页想确认 MCP 是否断了，
+    设置页调的正是这个函数 —— 返回缓存的假「已连接」，用户完全无法自救。
+    而卡住的那一轮「恰好就是有生成在跑」⇒ 该分支永远命中 ⇒ 永远不会重建。
+
+    现在：**探测照做**（只读、不占配额、不关任何东西），只是**重建推迟**。
+    所以这里改成断言「不 close」（真正的安全属性）+「如实报断开」。
+    完整用例见 tests/test_mcp_pending_rebuild.py。
+    """
     dead = FakeToolset([FakeChild(DeadClient(RuntimeError("Session terminated")),
                                   [FakeTool("ping")])])
     hub, fake, key = _hub(dead)
     monkeypatch.setattr(rt, "has_active_generation_for_user", lambda uid: True)
     out = run(hub.refresh_mcp_status(_UID, "m1"))
-    assert fake.closed is False         # 有轮次在跑，绝不动
-    assert out[0]["ok"] is True
+    assert fake.closed is False         # 有轮次在跑，绝不动 toolset
+    # 但状态必须如实：连接确实死了，不能报「已连接」
+    assert out[0]["ok"] is False, "有生成在跑也不能隐瞒已断开的连接"
+    assert key in hub._pending_rebuild, "必须记下待重建，等这一轮结束后执行"
 
 
 def _async(value):

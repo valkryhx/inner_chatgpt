@@ -35,6 +35,17 @@ class RuntimeHub:
         self._subagent_hosts: dict[tuple[str, str, str, str], "object"] = {}
         # runtime 建立时间（monotonic），用于 MCP 状态的软 TTL 刷新。
         self._built_at: dict[tuple[str, str], float] = {}
+        # 待重建标记：key = (user_id, model_key)。
+        #
+        # 场景：`refresh_mcp_status` 探测到连接已死，但此刻**有生成在跑**，
+        # 不能立刻 `close()`（那会打断正在用的 toolset / LLM client）。
+        # 于是把 key 记在这里，等下一次「没有活跃生成」时由 `get_user_runtime` 消费。
+        #
+        # 为什么必须有这个集合（2026-11-19 事故 §6.3）：
+        # 原来那个分支直接 `return`，连探测都不做，于是「卡住的那一轮恰好就是
+        # 有生成在跑」⇒ 永远走不到重建，形成死角。有了待重建标记，
+        # 「不打断」和「最终会重建」才不矛盾。
+        self._pending_rebuild: set[tuple[str, str]] = set()
         # 本代 ACP manager：key = (user_id, session_id, generation_id)
         # 与 subagent hosts 同构，用户 id 参与键，/stop 不能作用于别人的会话。
         self._acp_managers: dict[tuple[str, str, str], "object"] = {}
@@ -124,6 +135,13 @@ class RuntimeHub:
     async def get_user_runtime(self, user_id: str, model_id: str = "") -> UserRuntime:
         """Get/build runtime for (user, session-selected model)."""
         key = (user_id, model_id or "")
+        # 消费「待重建」标记：上一次 refresh 探测到连接已死、但当时有生成在跑
+        # 所以没敢重建（见 _pending_rebuild 的说明）。现在如果已经没有活跃生成，
+        # 就把旧的换掉；否则继续不动（绝不打断正在跑的那一轮）。
+        if key in self._pending_rebuild and not has_active_generation_for_user(user_id):
+            self._pending_rebuild.discard(key)
+            logger.info("消费待重建标记，重建 runtime user=%s model=%s", user_id, model_id)
+            await self.invalidate(user_id)
         cur = self._runtimes.get(key)
         if cur is not None:
             return cur
@@ -198,8 +216,29 @@ class RuntimeHub:
             built = self._built_at.get(key, 0.0)
             if time.monotonic() - built < _MCP_STATUS_TTL_S:
                 return getattr(ur.toolset, "manifest", []) or []
+
+        # ---- 有生成在跑：探测可以，重建不行 ----
+        #
+        # 原来这里直接 `return 缓存状态`，连探测都不做。后果是
+        # **用户打开设置页看到的永远是假的「已连接」**，而卡住的那一轮
+        # 恰恰就是「有生成在跑」⇒ 永远不重建，用户无法自救、也无法诊断
+        # （2026-11-19 事故 §6.3）。
+        #
+        # 探测是只读的（`_toolset_is_live` 只调一个无副作用的探针工具，
+        # 不走 MCP 配额，不 close 任何东西），所以完全可以做。
+        # 真正的风险只有「重建」，那就把重建推迟。
         if has_active_generation_for_user(user_id):
-            return getattr(ur.toolset, "manifest", []) or []
+            live = await _toolset_is_live(getattr(ur, "toolset", None))
+            if live:
+                # 连接活着：续期，省掉每次进设置页都探一遍
+                self._built_at[key] = time.monotonic()
+                return getattr(ur.toolset, "manifest", []) or []
+            # 连接已死：不重建（会打断），但如实报告 + 记下待重建
+            self._pending_rebuild.add(key)
+            return _mark_dead(
+                getattr(ur.toolset, "manifest", None) or [],
+                "连接已无响应（探测超时或会话已断开）；已安排在对话结束后自动重连",
+            )
 
         # 1) 先看缓存连接是否还活着（真实往返，比 list_tools 更严格）
         live = await _toolset_is_live(getattr(ur, "toolset", None))
@@ -225,6 +264,9 @@ class RuntimeHub:
             if key[0] == user_id:
                 ur = self._runtimes.pop(key, None)
                 self._built_at.pop(key, None)
+                # 标记跟着 runtime 一起清：重建完就不需要它了，
+                # 留着会让下一次 get_user_runtime 白白再 invalidate 一次。
+                self._pending_rebuild.discard(key)
                 if ur is not None:
                     await ur.close()
 
@@ -266,6 +308,7 @@ class RuntimeHub:
         for key in keys:
             ur = self._runtimes.pop(key, None)
             self._built_at.pop(key, None)
+            self._pending_rebuild.discard(key)
             if ur is not None:
                 dropped += 1
                 try:
@@ -362,6 +405,30 @@ def _same_manifest(a: list[dict], b: list[dict]) -> bool:
             for i in items
         )
     return norm(a) == norm(b)
+
+
+def _mark_dead(manifest: list[dict], reason: str) -> list[dict]:
+    """把 manifest 里的连接如实标成「已断开」，供设置页显示。
+
+    只在「探测到死连接但因活跃生成不能立刻重建」时用。
+    不这么做的后果（2026-11-19 事故）：用户打开设置页看到缓存的假「已连接」，
+    完全无法判断卡在哪 —— 唯一的诊断入口给出错误信息。
+
+    不修改传入对象（manifest 可能被别处共享），返回新列表。
+    """
+    out = []
+    for item in manifest:
+        row = dict(item)
+        # 已经标记为失败的行不要覆盖它的具体原因（那信息更有用）
+        if row.get("ok"):
+            row["ok"] = False
+            row["tool_count"] = 0
+            row["error"] = reason
+        out.append(row)
+    if not out:
+        # 缓存里一条都没有时，也要能表达「连接有问题」而不是空列表
+        out = [{"name": "", "ok": False, "tool_count": 0, "error": reason, "tools": []}]
+    return out
 
 
 # 会话活性探测的超时。MCP server 卡死时不能把状态查询也拖住。
