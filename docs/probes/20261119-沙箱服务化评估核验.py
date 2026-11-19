@@ -137,6 +137,74 @@ def main() -> int:
 
     print()
     print("=" * 70)
+    print("五、§7 运行时选型章节")
+    print("=" * 70)
+
+    for sec in ("## 7. 运行时选型", "### 7.4", "### 7.5", "### 7.6"):
+        check(f"§7 章节存在：{sec}", sec in doc)
+
+    # §7 必须**显式**标注自己是实测。
+    #
+    # 不能只靠上面那条「文档区分了实测与推断」——那条是全文级判定，
+    # 别处有「实测」二字就绿。实测发现：把 §7 的实测标注删掉，全文级
+    # 断言仍然绿（假绿）。所以 §7 要单独钉死。
+    check("§7 显式标注自己是实测",
+          "第 7 章（运行时选型）**是实测**" in doc)
+    # §7 也必须显式交代它没覆盖什么（防「实测」被读成「生产已验证」）
+    check("§7 显式标注未被生产验证",
+          "所有验证都在「容器内跑 bwrap」" in doc)
+
+    # 五个坑必须都在（漏一个就说明实测结论没落实）
+    for pit in ("`--ro-bind / /` 会把 app 的 `.env`",
+                "会让 `/etc` 变可写",
+                "--clearenv",
+                "假降权",
+                "只管单进程"):
+        check(f"坑已记录：{pit}", pit in doc)
+
+    # 探针脚本必须存在且真的包含对应断言
+    probe = REPO / "docs" / "probes" / "20261119-bwrap可行性实测.sh"
+    check("bwrap 探针脚本存在", probe.exists(), str(probe))
+    if probe.exists():
+        src = probe.read_text(encoding="utf-8", errors="replace")
+        # 用 `ok <编号> ` 带尾随空格匹配，避免 "ok 10b" 命中 "ok 10b-REMOVED"
+        # 这类子串陷阱（反向确认第二组抓出来的）
+        for n in ("ok 10b ", "ok 12 ", "ok 14 ", "ok 22 ", "ok 21 "):
+            check(f"探针含断言 {n.strip()}", n in src)
+        # 关键：断言必须只看退出码，不能比对 mount 的输出文本
+        #
+        # ⚠️ 两个坑都在这里踩过：
+        #  1. must_not 的语义是「条件成立 = 通过」，所以要传 `not in`。
+        #     写反了是**静默**的：「坏写法存在」会被当成通过。
+        #  2. 不能直接对全文做纯文本匹配 —— 探针的**注释**里就合法地
+        #     写着这个坏写法（记录踩过的坑），纯文本匹配会把注释算进去，
+        #     于是对照用例永远红。必须先剥掉注释行再查代码。
+        #     （AGENTS.md §8.5「静态守卫的正确写法」同一类问题）
+        code_only = "\n".join(
+            ln for ln in src.splitlines()
+            if not ln.lstrip().startswith("#"))
+        must_not("探针不再用『输出文本比对』判 mount 是否被拒",
+                 "echo denied" not in code_only)
+        check("探针用退出码判 mount / chroot",
+              "mount rc=" in src or 'echo $?' in src)
+
+    # 探针不能把**探针脚本目录**放到 Git Bash 的 /tmp：
+    # Docker Desktop 解析不了这个 POSIX 路径，会把脚本挂成一个空目录 ——
+    # 探针一行不跑却输出格式正确的空表（本项目实际踩过这个假信号）。
+    #
+    # ⚠️ 只禁「用 mktemp 当 -v 挂载源」这一种用法，不是禁 mktemp 本身。
+    # `docker build <ctx>` 用 mktemp 是可以的（实测通过）——build context 由
+    # docker CLI 自己读，不走 daemon 的路径解析。断言写宽了会误伤。
+    if probe.exists():
+        src2 = probe.read_text(encoding="utf-8", errors="replace")
+        mount_from_probe_dir = re.findall(r'-v\s+"\$PROBE/', src2)
+        must_not("探针不用 $PROBE 作 -v 挂载源（须用 Windows 路径）",
+                 not mount_from_probe_dir,
+                 f"发现 {len(mount_from_probe_dir)} 处")
+        check("探针把挂载路径转成 Windows 形式", "cygpath -w" in src2)
+
+    print()
+    print("=" * 70)
     if FAILS:
         print(f"结果：{len(FAILS)} 项失败")
         for f in FAILS:

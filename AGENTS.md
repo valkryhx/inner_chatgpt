@@ -336,6 +336,11 @@
 | `docs/20261106-任意格式文件下载实施记录.md` | **任意格式文件下载（最新，已实施）**：`workspace-file/-files/-zip` 三端点、FileChip/WorkspacePanel/步骤下载、Office 依赖、154 项单测 + 16 项真实 E2E 证据 |
 | `docs/20261106-任意格式文件下载设计方案.md` | **任意格式文件下载设计**：workspace 通用下载端点、目录列表与打包、Markdown/工具步骤/文件面板三入口、安全边界与 P1–P5 实施测试计划 |
 | `docs/20261106-Codex修复须知-Web自测Bug.md` | 自测 Bug 的修复建议单（含优先级、建议改法、验收与回归清单） |
+| `docs/20261120-Python日志静默丢失排查经验.md` | **日志「静默丢失」排查**：`logging.getLogger("x.y")` 的 INFO 默认消失（root level=WARNING 且无 handler），`--log-level info/debug` 都救不了；配包根 logger + `if root.handlers` 幂等 + level 可配；含 4 步排查清单。核验 `docs/probes/20261120-日志经验核验.py` + 反向确认 |
+| `docs/20261119-沙箱服务化方案-bwrap版.md` | **沙箱服务化方案（bwrap 运行时）**：为什么选 bwrap 不挂 docker.sock；纯净 fork 池（8.8ms，比每次新进程快 7 倍且不泄漏）；`HLZ_SANDBOX_MODE`/`BACKEND`/`OVERFLOW`/`MAX_SLOTS` 四个开关的取值与组合矩阵；MinIO 判据（单机用共享卷，跨机器才需要）；`Executor` 接口让 gVisor 可替换 |
+| `docs/20261119-沙箱服务化实施进度.md` | **沙箱服务化实施记录**：阶段 1–3 已完成（84 单测 + 20 项端到端），每阶段的目标/产出/任务/验收/不做什么，以及实施中踩到的 4 个真问题；**文末「2026-11-19 补完」**记录预热复用接通（522ms→7–15ms）及修复中抓出的 3 个缺陷（`get_executor()` 每次新实例 / destroy 留孤儿 bwrap / `reap_idle()` 没人调） |
+| `docs/20261119-沙箱镜像测试target.md` | **沙箱镜像的 test target**：为什么生产镜像不带 pytest 导致 8 条 `requires_bwrap` 测试在任何环境都不执行；`base`/`test`/`production` 三 stage 与「production 必须最后」的原因（`docker build` 默认构建最后一个 stage）；构建/运行命令（必须 `--user 1000:1000`，否则 `RLIMIT_NPROC` 静默失效、隔离结论是假的）；两个真问题（bwrap 内层进程变孤儿 / `ps` 的 args 列截断导致测试假红） |
+| `docs/20261119-workspace单根收敛.md` | **workspace 单根收敛**：双根（`SANDBOX_WORKSPACES_DIR` + 白名单）整块删除——它是 Docker 方案的遗留（容器要挂专属目录），bwrap 的 `--bind` 不需要；且**已在生产造成错位**（实测 app 与 sandbox 容器对同一用户算出 `workspaces/` vs `sandbox/`，成因是 compose 两侧 `${VAR-}` 默认值写法不同）。收敛后不变量：**一个用户一个根，沙箱开关只决定走不走沙箱、不决定文件放哪**；含删除清单、测试处置、反向确认 3/3 |
 
 ### 0.3 目录约定（写文件前先确认放在哪个目录）
 
