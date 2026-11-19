@@ -1331,6 +1331,20 @@ textarea, input { caret-color: var(--clay); }
   border: none; border-radius: 8px; background: transparent; color: var(--ink);
   font-size: 14px; text-align: left; cursor: pointer; width: 100%;
 }
+/* 图标槽位：固定宽度 + 居中，让所有菜单项的文字从同一个 x 开始。
+ *
+ * 为什么必须有它（用户报告的「文字和图标没对齐成一条竖线」）：
+ * 这些图标是**字形**不是图标字体，字面宽度各不相同 ——
+ *   ＋ (全角 U+FF0B) 比 ⌕ (U+2315) 宽，‹› 还是两个字符。
+ * `flex + gap` 只保证「前一个盒子边缘」等距，盒子宽度不同，文字起点就参差。
+ *
+ * `flex: none` 防止被 flex 压缩（窄侧边栏时会缩，宽度就又不固定了）。
+ * `letter-spacing: 0` 单独为 ‹› 准备：正文若有字距，两个字符的图标会偏。 */
+.side-nav-item .nav-ico {
+  width: 16px; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  letter-spacing: 0; font-size: 14px; line-height: 1;
+}
 .side-nav-item:hover:not(:disabled) { background: var(--surface-2); }
 .side-nav-item:disabled { opacity: .5; cursor: default; }
 .side-nav-item .kbd { margin-left: auto; font-size: 11px; color: var(--muted); }

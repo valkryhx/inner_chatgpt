@@ -147,22 +147,22 @@ export default function Sidebar({
 
       <nav className="side-nav">
         <button className="side-nav-item" onClick={onCreate}>
-          <span aria-hidden="true">＋</span> 新建 <span className="kbd">Ctrl Shift O</span>
+          <span className="nav-ico" aria-hidden="true">＋</span> 新建 <span className="kbd">Ctrl Shift O</span>
         </button>
         <button className="side-nav-item" onClick={onOpenSearch}>
-          <span aria-hidden="true">⌕</span> 搜索 <span className="kbd">Ctrl Shift K</span>
+          <span className="nav-ico" aria-hidden="true">⌕</span> 搜索 <span className="kbd">Ctrl Shift K</span>
         </button>
         <button className="side-nav-item" disabled title="项目（未实现）">
-          <span aria-hidden="true">▤</span> 项目
+          <span className="nav-ico" aria-hidden="true">▤</span> 项目
         </button>
         <button className="side-nav-item" disabled title="Artifacts（未实现）">
-          <span aria-hidden="true">◫</span> Artifacts
+          <span className="nav-ico" aria-hidden="true">◫</span> Artifacts
         </button>
         <button className="side-nav-item" disabled title="Code（未实现）">
-          <span aria-hidden="true">‹›</span> Code <span className="tag">未开通</span>
+          <span className="nav-ico" aria-hidden="true">‹›</span> Code <span className="tag">未开通</span>
         </button>
         <button className="side-nav-item" onClick={onOpenSettings}>
-          <span aria-hidden="true">⚙</span> 自定义
+          <span className="nav-ico" aria-hidden="true">⚙</span> 自定义
         </button>
       </nav>
 
