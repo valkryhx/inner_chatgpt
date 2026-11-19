@@ -68,10 +68,28 @@ services:
       HLZ_DB_URL: postgresql://hlz:${POSTGRES_PASSWORD}@postgres:5432/hlaudz
       HLZ_REDIS_URL: redis://redis:6379/0
       HLZ_REDIS_PREFIX: hlz
-      # 实例标识：容器部署时必须注入，用于心跳登记与容器 owner 标签。
-      # compose 的 --scale 下每个副本的 hostname 不同，可以自动区分；
-      # K8s 里应该用 pod name。
-      HLZ_INSTANCE_ID: ${HOSTNAME:-unknown}
+      # 实例标识：**必须是每个副本各自唯一的值**，否则 owner 会撞。
+      #
+      # ⚠️ 不要写 `${HOSTNAME:-unknown}` —— compose 的 `${...}` 是从
+      # **宿主 shell** 插值的，所有副本拿到同一个值，等于「保证撞车」。
+      #
+      # compose 的 `--scale` 下副本的 hostname 天然不同（容器 ID 前缀），
+      # 所以不注入时 `hostname:pid` 也能区分。但容器里 PID 恒为 1，
+      # 一旦编排器让所有副本 hostname 相同（hostNetwork / StatefulSet 未设
+      # hostname / 某些 PaaS），所有副本的 owner 就都是 `web-0:1`。
+      # 撞车的表现**不是启动失败，而是随机数据分叉**（跨实例判活失效）。
+      #
+      # 所以推荐显式注入一个稳定且唯一的标识：
+      #   docker compose ... up -d        # 单副本/本地
+      #   HLZ_INSTANCE_ID 留空即可（回退到 hostname:pid）
+      #
+      # K8s 里用 pod name（本就唯一）：
+      #   env:
+      #     - name: HLZ_INSTANCE_ID
+      #       valueFrom: {fieldRef: {fieldPath: metadata.name}}
+      #
+      # 真撞了会被 `cluster.instances._claim_owner` 检测到并打 WARNING。
+      HLZ_INSTANCE_ID: ${HLZ_INSTANCE_ID:-}
       # 沙箱：容器里跑容器需要挂 docker socket，风险很大。
       # 多实例部署建议先关闭沙箱（工具退回进程内执行），或每个实例
       # 独占一台机器后再打开。

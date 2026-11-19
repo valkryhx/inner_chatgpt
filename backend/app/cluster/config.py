@@ -24,12 +24,18 @@ def cluster_enabled() -> bool:
 
 
 def instance_id() -> str:
-    """本实例的唯一标识。容器化部署时应由环境变量注入（如 K8s pod name）。"""
-    raw = (os.environ.get("HLZ_INSTANCE_ID") or "").strip()
-    if raw:
-        return raw
-    from ..sandbox.identity import owner_id
-    return owner_id()
+    """本实例的唯一标识（owner 的尾部，**不含机器名前缀**）。
+
+    有 `HLZ_INSTANCE_ID` 时是它（净化后的）；没有时退化成本进程 PID。
+
+    ⚠️ 2026-11-19 之前这个函数是**死代码** —— 全仓没人调用，
+    所以 `HLZ_INSTANCE_ID` 从未生效过。现在真正的消费点是
+    `sandbox.identity.owner_id()`（它直接读环境变量，不在启动期缓存，
+    这样测试改环境变量立即生效）。这个函数保留下来是给**需要显示/上报**
+    实例标识的地方用（日志、`/api/health` 扩展），值必须与 owner 的尾部一致。
+    """
+    from ..sandbox.identity import _instance_tag
+    return _instance_tag()
 
 
 def is_leader() -> bool:
