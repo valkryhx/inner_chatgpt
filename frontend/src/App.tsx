@@ -14,6 +14,8 @@ import SettingsModal from './components/SettingsModal'
 import { mergeStart, mergeStatus } from './subagentView'
 import { isWrongInstanceError, planResumeRetry } from './resumeRetry'
 import { doneStatus } from './doneStatus'
+import { shouldApplyTeamSnapshot } from './teamSnapshotGuard'
+import { mergeTeamEvent } from './teamMerge'
 import TeamPanel from './components/TeamPanel'
 import WorkspacePanel from './components/WorkspacePanel'
 
@@ -61,65 +63,6 @@ function appendReasoningBlock(blocks: any[], chunk: string): any[] {
   return [...blocks, { type: 'reasoning', text: chunk }]
 }
 
-
-function mergeTeamEvent(prev: TeamSnapshot | null, event: TeamEvent): TeamSnapshot | null {
-  // Team creation can fail (quota/DB) while the ordinary turn still runs.  Keep
-  // the event even when no team snapshot exists, so the panel and the notice
-  // bar can explain why no task board appeared.
-  if (event.type === 'team_unavailable') {
-    const base = prev || { team: null, tasks: [], events: [], messages: [] }
-    const events = [...base.events.filter((e) => e.event_seq !== event.event_seq), event]
-      .sort((a, b) => a.event_seq - b.event_seq)
-    return { team: base.team, tasks: base.tasks, events, messages: base.messages }
-  }
-  // 新 Team 的 team_start 必须能替换旧代快照，否则同一会话下一轮生成期间
-  // 会一直显示上一轮的旧任务板（generation/team id 都不同）。
-  if (event.type === 'team_start' && (!prev?.team || prev.team.team_id !== event.team_id)) {
-    const now = Date.now()
-    return {
-      team: {
-        team_id: event.team_id, user_id: '', session_id: event.session_id || '',
-        generation_id: event.generation_id || '', lead_agent_id: event.agent_id || 'root',
-        name: typeof event.payload.name === 'string' ? event.payload.name : 'Agent Team',
-        status: 'active', created_at: now, updated_at: now, closed_at: 0,
-      },
-      tasks: [], events: [event], messages: [],
-    }
-  }
-  if (!prev || !prev.team) return prev
-  if (event.team_id && prev.team.team_id !== event.team_id) return prev
-  const events = prev.events.some((e) => e.event_seq === event.event_seq)
-    ? prev.events
-    : [...prev.events, event].sort((a, b) => a.event_seq - b.event_seq)
-  let tasks = prev.tasks
-  let messages = prev.messages
-  let team = prev.team
-  if (event.type === 'team_resumed') {
-    // The backend snapshots the previous generation's open board.  Keep the
-    // restored rows in the same snapshot so the panel updates on first paint.
-    const restoredTasks = event.payload.tasks
-    const restoredMessages = event.payload.messages
-    if (Array.isArray(restoredTasks)) tasks = restoredTasks as TeamSnapshot['tasks']
-    if (Array.isArray(restoredMessages)) messages = restoredMessages as TeamSnapshot['messages']
-  } else if (event.type === 'task_created' || event.type === 'task_updated') {
-    const task = event.payload.task as TeamSnapshot['tasks'][number] | undefined
-    if (task?.task_id) {
-      const exists = tasks.some((t) => t.task_id === task.task_id)
-      tasks = exists ? tasks.map((t) => t.task_id === task.task_id ? task : t) : [...tasks, task]
-    }
-  } else if (event.type === 'team_message') {
-    const message = event.payload.message as TeamSnapshot['messages'][number] | undefined
-    if (message?.message_id && !messages.some((m) => m.message_id === message.message_id)) {
-      messages = [...messages, message]
-    }
-  } else if (event.type === 'team_end') {
-    const nextStatus = typeof event.payload.status === 'string'
-      ? event.payload.status as typeof team.status
-      : team.status
-    team = { ...team, status: nextStatus }
-  }
-  return { team, tasks, events, messages }
-}
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null)
@@ -177,6 +120,16 @@ export default function App() {
   // 让回调拿到最新消息列表（effect 的闭包会捕获旧值）。
   const messagesRef = useRef<Message[]>([])
   useEffect(() => { messagesRef.current = messages }, [messages])
+  // 让 loadTeam 的迟到响应能判断「此刻面板上还有什么」。
+  //
+  // 为什么用 ref 而不是把这两个值塞进 useCallback 依赖：`loadTeam` 在
+  // `useEffect([user, activeId, loadTeam])` 里，依赖一变就重新拉一次。
+  // 把 teamSnapshot / streaming 加进依赖会让每次事件更新都触发一次
+  // GET /api/team —— 既浪费，也会不断和流式事件抢着写 snapshot。
+  const teamSnapshotRef = useRef<TeamSnapshot | null>(null)
+  useEffect(() => { teamSnapshotRef.current = teamSnapshot }, [teamSnapshot])
+  const streamingRef = useRef(false)
+  useEffect(() => { streamingRef.current = streaming }, [streaming])
 
   // Restore the panel preference once the account is known, then persist it.
   // One effect keeps the restore from being overwritten by a premature write.
@@ -366,14 +319,39 @@ export default function App() {
     })
   }, [user, loadSessions, refreshHealth, loadModels])
 
+  // 历史快照可能**迟到**，而它带着的可能是「后端还没建 team」时的空结果。
+  //
+  // 现场（2026-11-19）：新会话 `send()` 里 `setActiveId(sid)` 会立刻触发一次
+  // loadTeam，此时 `prepare_turn_team` 还没跑，接口返回 `{team: null}`。
+  // 等它回来时 `team_start`（后端 0.11s 就发了）已经把 snapshot 填好，
+  // 这个 null 又把它盖回去，侧栏于是永远卡在「正在启动...」直到本轮结束。
+  //
+  // 守卫只在「流式中 + 空 team + 当前已有 team」时拦下，其余照常应用，
+  // 所以刷新恢复、切会话、任务更新都不受影响。判据见 teamSnapshotGuard.ts。
   const loadTeam = useCallback(async (id: string) => {
+    let snapshot: TeamSnapshot | null = null
+    let failed = false
     try {
-      const snapshot = await api.getTeam(id)
-      if (activeId === id || !activeId) setTeamSnapshot(snapshot)
+      snapshot = await api.getTeam(id)
     } catch {
-      if (activeId === id || !activeId) setTeamSnapshot(null)
+      failed = true
     }
-  }, [activeId])
+    const current = teamSnapshotRef.current
+    const currentSession = activeIdRef.current
+    if (!shouldApplyTeamSnapshot({
+      incoming: snapshot,
+      current,
+      incomingSession: id,
+      currentSession,
+      streaming: streamingRef.current,
+    })) {
+      return
+    }
+    // 失败的请求只有在「确实切走了会话」时才值得清空面板；
+    // 其余情况保留现有内容，不要让一次网络抖动把任务板擦掉。
+    if (failed && (!currentSession || currentSession === id)) return
+    setTeamSnapshot(failed ? null : snapshot)
+  }, [])
 
   useEffect(() => {
     if (!user || !activeId) {
