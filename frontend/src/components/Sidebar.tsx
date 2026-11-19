@@ -164,6 +164,13 @@ export default function Sidebar({
         <button className="side-nav-item" onClick={onOpenSettings}>
           <span className="nav-ico" aria-hidden="true">⚙</span> 自定义
         </button>
+        {/* 「查看全部会话」是**可点击的动作**，与上面的新建/搜索/自定义同类，
+            所以放在导航区里、用同款 nav-ico 槽位与文字色。
+            之前的做法是挂在会话列表末尾并做成异形按钮 —— 那是在治症状：
+            真正的区分手段是分组，它在导航区就不会和会话条目混在一起。 */}
+        <button className="side-nav-item" onClick={onOpenAllSessions}>
+          <span className="nav-ico" aria-hidden="true">⌗</span> 查看全部会话
+        </button>
       </nav>
 
       {pinned.length > 0 && (
@@ -183,13 +190,6 @@ export default function Sidebar({
         )}
         {rest.map(row)}
       </div>
-      {/* 独立样式类 all-sessions：不能只靠「比会话条目更灰」区分，
-          那会让它混在列表里被忽略。见 .all-sessions 的 CSS 注释。 */}
-      <button className="all-sessions" onClick={onOpenAllSessions}>
-        <span className="all-ico" aria-hidden="true">⌗</span>
-        <span className="all-text">查看全部会话</span>
-        <span className="all-arrow" aria-hidden="true">›</span>
-      </button>
 
       <button
         type="button"

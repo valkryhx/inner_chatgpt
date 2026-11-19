@@ -1494,45 +1494,19 @@ textarea, input { caret-color: var(--clay); }
 .mm-default { margin-left: auto; font-size: 11px; color: var(--clay); flex: 0 0 auto; }
 .mm-check { color: var(--ok); font-size: 12px; flex: 0 0 auto; }
 
-/* ---------- 侧栏「查看全部会话」：必须与会话条目明显不同 ----------
+/* ---------- 侧栏「查看全部会话」 ----------
  *
- * 原来是 `side-nav-item all-sessions`，即复用了导航行的盒子：同样 32px 高、
- * 同样 8px 内边距、同样 8px 圆角、muted 灰。夹在一列同样高的会话条目下面，
- * 视觉上就是"又一条会话"，用户根本注意不到它是个入口。
+ * 它现在就是 `.side-nav-item`，和新建 / 搜索 / 自定义完全一致 —— 因为它
+ * 确实是同一类东西：**可点击的动作**。
  *
- * 现在改成**带边框的按钮**：细描边 + 独立底色 + 强调色文字 + 右侧箭头。
- * 形状一变，它就不再属于"列表行"这个视觉族，而是明确的动作入口。
- * 高度 34px（比会话条目 32px 高 2px）也是刻意的：连高度都不该一样。
+ * 演进记录（避免后来人再走回头路）：
+ *   1. 最初它挂在会话列表末尾、用 `side-nav-item all-sessions` 复用导航盒子，
+ *      结果夹在一列同高的会话条目里像"又一条会话"，被用户忽略。
+ *   2. 一度改成带边框的异形按钮（34px + 描边 + clay 图标 + 箭头）来强行区分
+ *      —— 那是在治症状：真正让它脱离会话列表的手段是**分组**，不是改形状。
+ *   3. 现在回到导航区、与其它导航项同款（含同色图标），由位置本身完成区分。
+ *      图标必须继承导航项文字色（--ink），不要单独上 clay 强调色。
  */
-.all-sessions {
-  flex: 0 0 auto;
-  display: flex; align-items: center; gap: 8px;
-  height: 34px; padding: 0 10px; margin: 6px 0 2px;
-  border: 1px solid var(--line-strong); border-radius: 8px;
-  background: var(--surface); color: var(--ink-2);
-  font-size: 13px; font-weight: 500; text-align: left; cursor: pointer;
-  transition: background-color 120ms var(--ease), border-color 120ms var(--ease),
-              color 120ms var(--ease);
-}
-.all-sessions:hover {
-  background: var(--surface-2); border-color: var(--clay); color: var(--ink);
-}
-.all-sessions:focus-visible {
-  outline: none; border-color: var(--clay);
-  box-shadow: 0 0 0 3px var(--clay-soft);
-}
-/* 图标槽位与导航列同宽（16px），让两处的图标竖线一致 */
-.all-ico {
-  width: 16px; flex: none;
-  display: inline-flex; align-items: center; justify-content: center;
-  letter-spacing: 0; font-size: 13px; color: var(--clay);
-}
-.all-text { flex: 1; min-width: 0; }
-.all-arrow {
-  flex: none; color: var(--muted); font-size: 15px; line-height: 1;
-  transition: transform 120ms var(--ease), color 120ms var(--ease);
-}
-.all-sessions:hover .all-arrow { color: var(--clay); transform: translateX(2px); }
 
 /* ---------- 全部会话弹窗 ---------- */
 .session-browser { width: min(720px, 92vw); max-height: 72vh; display: flex; flex-direction: column; }
@@ -1555,8 +1529,7 @@ textarea, input { caret-color: var(--clay); }
 .sb-row .icon-btn { color: var(--muted); }
 .sb-more { align-self: center; margin: 8px auto 0; display: block; }
 
-/* 「查看全部会话」固定在会话滚动区下方，始终可见。
- * 具体视觉见上方 .all-sessions（带边框的按钮，刻意不同于会话条目）。 */
+/* 「查看全部会话」已在导航区（见上方说明），这里无需额外样式。 */
 
 /* =====================================================================
    登录 / 注册：与登录后同一套暖纸卡面，主色用 Claude 橙（#d97757）
