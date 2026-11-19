@@ -80,7 +80,23 @@ services:
       HLZ_PG_SCHEMA_PER_PATH: "0"
     volumes:
       - appdata:/app/backend/data
-    # 不写 ports：多副本时固定端口会冲突。对外走 LB。
+    # 不写 ports：多副本时固定端口会冲突。对外走下面的 nginx。
+
+  # ---- 入口：粘性负载均衡 ----
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "${HLZ_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
 volumes:
   pgdata:
