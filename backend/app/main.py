@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -179,6 +179,41 @@ async def _instance_heartbeat_loop() -> None:
 
 app = FastAPI(title="Hlaudz (self-built agent kernel)", version="0.3.0", lifespan=lifespan)
 
+
+@app.middleware("http")
+async def _instance_header(request: Request, call_next):
+    """给每个响应打上 `X-HLZ-Instance`，标明是哪个实例处理的。
+
+    ## 为什么需要
+
+    多实例部署下，「这个请求落到哪个实例」是排查的第一性问题：
+
+    - 验证 nginx 粘性是否真的生效（同一 cookie 是否总命中同一实例）
+    - 用户报「改了配置没生效」时，先看两次请求是不是落到了不同实例
+      （runtime / MCP 连接缓存是进程内的，不共享）
+    - 定位「为什么这个实例的容器特别多」
+
+    没有这个头，只能去翻各实例的日志，且要按时间戳人工对齐。
+
+    ## 为什么用 header 而不是日志
+
+    日志需要登录服务器；header 前端 / curl / 浏览器 DevTools 直接能看到。
+
+    ## 安全
+
+    只暴露 `<host>:<pid>`，不含任何用户信息或路径。
+    生产环境如果不想暴露，用 `HLZ_INSTANCE_HEADER=0` 关掉。
+    """
+    import os
+    response = await call_next(request)
+    if (os.environ.get("HLZ_INSTANCE_HEADER", "1") or "1").strip() not in ("0", "false", "False"):
+        try:
+            from .sandbox.identity import owner_id
+            response.headers["X-HLZ-Instance"] = owner_id()
+        except Exception:  # noqa: BLE001 - 拿不到就不打，不该影响响应
+            pass
+    return response
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -201,12 +236,22 @@ app.include_router(a2a_router.api_router)
 
 
 @app.get("/api/health", response_model=HealthOut)
-async def health():
+async def health(request: Request, response: Response):
     """健康检查：不依赖 llm.yaml（模型由每个用户自己配置）。
 
     llm.yaml 仅为本机可选兜底；缺失时返回 model="" 而不是 500，
     前端会显示当前会话/用户自己配置的模型名。
+
+    ## 顺手下发粘性 cookie
+
+    nginx 的 `hash $cookie_hlz_sticky consistent` **只能读** cookie，
+    没法设。所以由应用下发一个稳定的随机值，让同一个浏览器始终落到
+    同一个后端实例（见 deploy/nginx.conf）。
+
+    为什么放在 health：它是前端启动第一个必然访问的端点，且不需要登录。
+    已经带了就不重复下发（避免每次心跳都刷 Set-Cookie）。
     """
+    _ensure_sticky_cookie(request, response)
     model = ""
     if llm_yaml_available():
         try:
@@ -214,6 +259,31 @@ async def health():
         except Exception:
             model = ""
     return HealthOut(ok=True, model=model, mcp_tools=0)
+
+
+# 粘性 cookie 名。与 deploy/nginx.conf 的 `hash $cookie_hlz_sticky` 必须一致。
+STICKY_COOKIE = "hlz_sticky"
+
+
+def _ensure_sticky_cookie(request, response) -> None:
+    """没有粘性 cookie 就发一个（随机值，不是用户标识）。"""
+    try:
+        if request.cookies.get(STICKY_COOKIE):
+            return
+        import secrets
+        value = secrets.token_hex(16)
+        response.set_cookie(
+            STICKY_COOKIE, value,
+            max_age=30 * 24 * 3600,      # 30 天
+            path="/",
+            httponly=True,               # 前端不需要读它
+            samesite="lax",
+            # secure：只在 HTTPS 下开。HTTP 部署时设 True 会让浏览器
+            # 直接丢弃这个 cookie，粘性静默失效 —— 比没有更糟。
+            secure=False,
+        )
+    except Exception:  # noqa: BLE001 - 下发失败不该让健康检查失败
+        pass
 
 
 # ---- 前端静态托管 ----
