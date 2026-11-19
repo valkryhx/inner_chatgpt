@@ -201,19 +201,42 @@ add("§4 对照：generation_owner.is_generation_dead_elsewhere 存在",
     "async def is_generation_dead_elsewhere" in go)
 
 
-# ============================================================ 前端 done 映射
+# ── 前端 done 映射 ────────────────────────────────────────────────
+#
+# 历史上这里断言「映射只有三态」——因为 `'streaming'` 会落到 else 变成 `'complete'`，
+# 那一轮中断了却显示「已完成」。2026-11-19 多实例真机验证时确认这个缺陷真实存在
+# （续看对「消息 streaming 但无 active generation」的会话会发
+# `done status=streaming`），于是把映射抽成 doneStatus() 并改成只认终态。
+# 断言随之翻转：现在断言「该兜底真的存在」。
 
+DONE_STATUS_TS = HLAUDZ / "frontend/src/doneStatus.ts"
 APP_TSX = (HLAUDZ / "frontend/src/App.tsx").read_text(encoding="utf-8")
 
-# 'streaming' 落到 else -> 'complete' —— 这是「谎报」在前端的放大点。
-# 这条**仍然成立**且必须保留：它是后端返回值与前端映射共同作用的结果，
-# 后端修好（不再在别人跑着时发 done）之后，这个映射本身仍是正确的
-# （那时 status 真的只有三种）。保留它作为「前端不会把 streaming 当完成」的
-# 保险：如果哪天有人去掉后端的 wrong_instance 分支，这里会提醒映射会放大问题。
-add("§4 前端 status 映射只有三态（放大点的来源）",
-    re.search(r"ev\.status === 'stopped' \? 'stopped' : ev\.status === 'error' \? 'error' : 'complete'",
-              APP_TSX) is not None,
-    fail_hint="映射改了 —— 如果改成能识别 streaming，§4 的放大效应就消失了，请更新文档")
+add("§4 有 doneStatus 纯函数（已修）",
+    DONE_STATUS_TS.exists(),
+    fail_hint="doneStatus.ts 没了 —— streaming 又会经三元表达式的 else 变成 complete")
+
+if DONE_STATUS_TS.exists():
+    ds = DONE_STATUS_TS.read_text(encoding="utf-8")
+    fn_start = ds.find("export function doneStatus")
+    fn_body = ds[fn_start:] if fn_start >= 0 else ""
+    # 断言①：兜底放在**最后**且返回 stopped。
+    # 不能只查「文件里有 return 'stopped'」——`if (raw === 'stopped') return 'stopped'`
+    # 也算，于是把兜底改回 complete 时断言仍然通过（反向确认抓出来的）。
+    returns = re.findall(r"return '(\w+)'", fn_body.split("}")[0] if fn_body else "")
+    add("§4 非终态兜底成 stopped 而不是 complete（已修）",
+        bool(returns) and returns[-1] == "stopped",
+        fail_hint=f"最后一个 return 是 {returns[-1] if returns else '无'} —— 兜底该是 stopped",
+        info=f"return 序列 {returns}")
+    add("§4 App.tsx 用 doneStatus 映射（两处）",
+        APP_TSX.count("doneStatus(") >= 2,
+        fail_hint=f"App.tsx 只用了 {APP_TSX.count('doneStatus(')} 处 —— 续看和主流程都要")
+
+# 旧的三元表达式不能再回来（它把 streaming 映射成 complete）
+_LEGACY_TRI = ("ev.status === 'stopped' ? 'stopped' : ev.status === 'error' ? 'error' : 'complete'")
+add("§4 旧的三态三元表达式已移除（已修）",
+    _LEGACY_TRI not in APP_TSX,
+    fail_hint="旧三元表达式回来了 —— 它会把 streaming 映射成 complete")
 
 # 断言（已修）：前端必须真的处理 wrong_instance，且要「先换 cookie 再重试」
 add("§4 前端处理 wrong_instance（已修）",

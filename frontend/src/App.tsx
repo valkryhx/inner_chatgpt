@@ -13,6 +13,7 @@ import LoginPage from './components/LoginPage'
 import SettingsModal from './components/SettingsModal'
 import { mergeStart, mergeStatus } from './subagentView'
 import { isWrongInstanceError, planResumeRetry } from './resumeRetry'
+import { doneStatus } from './doneStatus'
 import TeamPanel from './components/TeamPanel'
 import WorkspacePanel from './components/WorkspacePanel'
 
@@ -453,7 +454,7 @@ export default function App() {
         patch({ ...current, blocks: [...blocks] })
       } else if (ev.type === 'done') {
         const finishedAt = Date.now()
-        const status = ev.status === 'stopped' ? 'stopped' : ev.status === 'error' ? 'error' : 'complete'
+        const status = doneStatus(ev.status)
         patch({ ...current, status, run_finished_at: finishedAt })
         setStreaming(false)
         setActiveStreamMsgId(null)
@@ -861,7 +862,7 @@ export default function App() {
       } else if (ev.type === 'compaction') {
         setAutoCompacted((n) => n + 1)
       } else if (ev.type === 'done') {
-        const status = ev.status === 'stopped' ? 'stopped' : ev.status === 'error' ? 'error' : 'complete'
+        const status = doneStatus(ev.status)
         const finishedAt = Date.now()
         runTimesRef.current.set(assistantMsg.id, { started: runStartedAt, finished: finishedAt })
         patch(withSummaries({ ...assistantMsg, status, run_finished_at: finishedAt }))

@@ -75,6 +75,12 @@ def fresh_copy():
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copy(REAL / "backend/deploy/nginx.conf", be / "deploy/nginx.conf")
     shutil.copy(REAL / "frontend/src/App.tsx", tmp / "frontend/src/App.tsx")
+    # 新增的前端模块也要复制进来，否则对应断言的 check 会因「文件不存在」恒 False，
+    # 于是「正向对照」那条会假红（而不是因为真的有问题）。
+    for extra in ("doneStatus.ts", "resumeRetry.ts"):
+        p = REAL / "frontend/src" / extra
+        if p.exists():
+            shutil.copy(p, tmp / "frontend/src" / extra)
     for p in (REAL / "backend/tests/manual").iterdir():
         if p.is_file():
             shutil.copy(p, be / "tests/manual" / p.name)
@@ -140,11 +146,28 @@ def _s4_frontend_retry(m) -> bool:
     return "wrong_instance" in app or "isWrongInstanceError" in app
 
 
+def _s4_done_status_fallback(m) -> bool:
+    """§4 前端：非终态 status 必须兜底成 stopped，且 App 真的用了它。"""
+    import re as _re
+    p = m.HLAUDZ / "frontend/src/doneStatus.ts"
+    if not p.exists():
+        return False
+    ds = p.read_text(encoding="utf-8")
+    app = (m.HLAUDZ / "frontend/src/App.tsx").read_text(encoding="utf-8")
+    start = ds.find("export function doneStatus")
+    if start < 0:
+        return False
+    body = ds[start:].split("}")[0]
+    returns = _re.findall(r"return '(\w+)'", body)
+    return bool(returns) and returns[-1] == "stopped" and app.count("doneStatus(") >= 2
+
+
 CHECKS = {
     "§1 判据按 owner 与存活集合过滤": _s1_owner_filtered,
     "§2 中间件里下发粘性 cookie": _s2_in_middleware,
     "§4 _resume_decision 存在": _s4_decision_exists,
     "§4 前端处理 wrong_instance": _s4_frontend_retry,
+    "§4 非终态兜底成 stopped": _s4_done_status_fallback,
     "§5 有一键入口脚本": _s5_runner_exists,
 }
 
@@ -257,6 +280,36 @@ run_case("回退 §5（删掉一键脚本）-> 「一键入口」该变红",
 
 run_case("回退前端（去掉 wrong_instance）-> 该变红",
          revert_frontend_retry, ["§4 前端处理 wrong_instance"])
+
+
+def revert_done_status_fallback(root: Path):
+    """回退 §4 兜底：把整个函数体换成「非终态 -> complete」（原来的 bug）。
+
+    ⚠️ 前两版 mutation 都没生效，反向确认没变红才发现：
+
+    | 版本 | 改了什么 | 为什么没变红 |
+    | --- | --- | --- |
+    | v1 | 只在开头加 `return 'complete'` | 尾部原有的 `return 'stopped'` 还在，成了最后一个 return |
+    | v2 | 同上，只是位置不同 | 同 v1 —— 断言看的是**最后一个** return |
+
+    所以必须把函数体**整个替换**，不能只改前半段。
+    """
+    p = root / "frontend/src/doneStatus.ts"
+    t = p.read_text(encoding="utf-8")
+    start = t.find("export function doneStatus")
+    assert start > 0, "mutation 前提不成立"
+    end = t.find("\n}", start)
+    assert end > start
+    replacement = """export function doneStatus(raw: string | null | undefined): MessageStatus {
+  if (raw === 'error') return 'error'
+  if (raw === 'stopped') return 'stopped'
+  return 'complete'
+"""
+    p.write_text(t[:start] + replacement + t[end:], encoding="utf-8")
+
+
+run_case("回退 doneStatus 兜底（非终态 -> complete）-> 该变红",
+         revert_done_status_fallback, ["§4 非终态兜底成 stopped"])
 
 
 # ---------------------------------------------------------------- 汇总
