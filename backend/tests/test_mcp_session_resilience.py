@@ -105,6 +105,69 @@ def test_business_errors_are_not_treated_as_dead_session(msg):
     assert _looks_session_dead(ValueError(msg)) is False
 
 
+# ---------------- 1b. 「从没连上」也要能自愈（2026-11-19 真机复现） ----------------
+#
+# 现场：exa MCP 的 3 个工具全部报
+#   RuntimeError: Client is not connected. Use the 'async with client:' ...
+# 而且重试 3 次都一样 —— 因为这条错误不在 `_SESSION_DEAD_MARKERS` 里，
+# `_looks_session_dead` 返回 False，**重连根本没被触发**。
+#
+# 这不是网络错误，是 fastmcp 的本地会话状态错误：Client 对象从没成功
+# `__aenter__` 过（连接在启动时失败 / 被 invalidate 关掉后重建又失败）。
+# 后果比「会话断了」更严重 —— 它不会随时间自愈，整个进程生命周期内
+# 这个 server 都不可用，且日志里没有任何重连尝试。
+
+@pytest.mark.parametrize("msg", [
+    "Client is not connected. Use the 'async with client:' context manager first.",
+    "RuntimeError: Client is not connected",
+    "not connected",                       # 大小写/前缀不同的变体
+    "MCP server not connected yet",
+])
+def test_not_connected_is_detected_as_dead_session(msg):
+    """**核心**：「从没连上」必须和「会话断了」一样触发重连。
+
+    两者的恢复手段完全相同（重建 client），所以判定必须都返回 True。
+    """
+    assert _looks_session_dead(RuntimeError(msg)) is True, (
+        f"{msg!r} 没被判定为可重连 —— 该 server 会永久不可用")
+
+
+def test_tool_call_reconnects_when_never_connected(monkeypatch):
+    """**核心回归**：首次调用报 `Client is not connected`，必须重连并成功。
+
+    复现 hx 用户的 exa：三个工具全部失败，重试也没用。
+    """
+    ts = _toolset("exa", ["web_search_exa"], script=[
+        RuntimeError("Client is not connected. Use the 'async with client:' "
+                     "context manager first.")])
+    fresh = ScriptedClient([_raw("web_search_exa")])
+
+    monkeypatch.setattr(mcp_client, "Client", lambda target: fresh)
+
+    out = run(ts.tools[0].call({"query": "x"}))
+    assert "工具执行错误" not in out, f"没有自愈：{out}"
+    assert fresh.calls == [("web_search_exa", {"query": "x"})]
+
+
+def test_never_connected_is_not_a_business_error(monkeypatch):
+    """`Client is not connected` 绝不能走「参数校验失败」那条分支。
+
+    那条分支会给模型一个误导提示（「请严格按工具参数定义调用」），
+    让模型反复改参数而永远调不通。
+    """
+    called = {"n": 0}
+
+    def fake_client(target):
+        called["n"] += 1
+        return ScriptedClient([_raw("ping")])
+
+    ts = _toolset("exa", ["ping"], script=[RuntimeError("Client is not connected")])
+    monkeypatch.setattr(mcp_client, "Client", fake_client)
+    out = run(ts.tools[0].call({}))
+    assert "参数校验失败" not in out, f"被当成参数错了：{out}"
+    assert called["n"] == 1, "没有尝试重连"
+
+
 # ---------------- 2. 自动重连重试 ----------------
 def test_tool_call_reconnects_once_when_session_dies(monkeypatch):
     """核心回归：第一次调用抛 Session terminated，应重连并重试成功。"""

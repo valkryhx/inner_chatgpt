@@ -60,6 +60,22 @@ _SESSION_DEAD_MARKERS = (
     "transport closed",
     "stream closed",
     "no active session",
+    # ---- 「从没连上」也算（2026-11-19 加）----
+    #
+    # fastmcp 的 `Client.__aenter__` 失败后，client 对象留在「未连接」状态，
+    # 之后每次 `call_tool` 都抛 `Client is not connected. Use the 'async with
+    # client:' context manager first.`
+    #
+    # 这条**以前不在白名单里**，于是 `_looks_session_dead` 返回 False ->
+    # 不重连 -> 走 `_format_call_error`（还对模型说「请严格按工具参数定义调用」，
+    # 完全误导）。结果是这个 server 在整个进程生命周期内**永久不可用**，
+    # 用户看到的就是「重试也一样失败、非偶发」。
+    #
+    # 实测现场（hx 用户的 exa）：3 个工具全部同样的错，重试 3 次全失败。
+    #
+    # 为什么归到「可重连」：恢复手段与「会话断了」完全相同 —— 重建 client。
+    "client is not connected",
+    "not connected",
 )
 
 
@@ -106,10 +122,94 @@ def _apply_mcp_budget(user_id: str, server: str, tool_name: str, text: str) -> s
     return apply_budget(f"mcp:{server}:{tool_name}", text, persist_dir=where)
 
 
+def _is_local_url(url: str) -> bool:
+    """URL 是否指向本机（loopback）。
+
+    ## 为什么必须单独判定（2026-11-19 真机复现）
+
+    本机 Windows 开着系统代理（`ProxyEnable=1`, `ProxyServer=127.0.0.1:7897`），
+    而 httpx 默认 `trust_env=True` —— 它会把 **127.0.0.1 的请求也送进代理**。
+    代理连不上那个本地端口，就返回 `502 Bad Gateway`。
+
+    于是「MCP 服务没起」被伪装成「MCP 服务返回 502」，把排查引向错误方向
+    （去查服务日志，而服务根本没在跑）。实测对照：
+
+    | 配置 | 连不存在的本地端口 |
+    | --- | --- |
+    | 走代理（默认） | `502 Bad Gateway` ← 假象 |
+    | 直连 | `ConnectError: WinError 10061 目标计算机积极拒绝` ← 真相 |
+
+    只判 loopback（不看私有网段）：`192.168.x` / `10.x` 可能是局域网里
+    真正需要经代理访问的服务，误判会让它们断掉。
+    """
+    if not url:
+        return False
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return False
+    if not host:
+        return False
+    # 整个 127.0.0.0/8 都是 loopback；`localhost` 与 `::1` 同理。
+    if host in ("localhost", "::1"):
+        return True
+    if host.startswith("127."):
+        # 必须是纯 IPv4：`127.0.0.1.nip.io` 这类域名前缀不算
+        parts = host.split(".")
+        return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+    return False
+
+
+# 本地地址绕过代理时使用的 httpx 参数。常量导出供测试断言。
+_LOCAL_PROXY_BYPASS = {"trust_env": False}
+
+
+def _http_client_kwargs(url: str) -> dict:
+    """给某个 URL 决定 httpx 参数。
+
+    本地地址关 `trust_env`（不读系统代理）；外网保持默认（需要代理的环境仍能走）。
+    """
+    return dict(_LOCAL_PROXY_BYPASS) if _is_local_url(url) else {}
+
+
+def _httpx_factory_for(url: str):
+    """造一个 `httpx_client_factory`，让 fastmcp 用指定的 httpx 参数。
+
+    fastmcp 的 transport 只接受 `httpx_client_factory` 来定制底层 httpx，
+    没有直接暴露 `trust_env`。返回 `None` 表示用 fastmcp 的默认行为。
+
+    ## 为什么不用 `create_mcp_http_client`
+
+    它只接受 `headers / timeout / auth`，**不接受 `trust_env`**
+    （实测 `TypeError: create_mcp_http_client() got an unexpected keyword
+    argument 'trust_env'`）。所以这里自己造 `AsyncClient`，并把 MCP 协议
+    依赖的两个默认值照抄过来：
+
+    - `follow_redirects=True` —— MCP 的服务端可能 30x 到真实端点
+    - 默认超时 30s —— 不设的话 httpx 默认 5s，长 tool call 会被掐
+    """
+    if not _is_local_url(url):
+        return None
+
+    import httpx
+
+    def _factory(*args, **kwargs) -> "httpx.AsyncClient":
+        # 合并：调用方（fastmcp）传的优先，我们只补 trust_env。
+        merged = {**kwargs, **dict(_LOCAL_PROXY_BYPASS)}
+        merged.setdefault("follow_redirects", True)
+        merged.setdefault("timeout", httpx.Timeout(30.0))
+        return httpx.AsyncClient(*args, **merged)
+
+    return _factory
+
+
 def _build_target(target: Any) -> Any:
     """把高层描述转成 fastmcp.Client 接受的 transport。
 
     兼容标准 mcp.json 的字段：stdio 用 command/args/env；http/sse 用 url/headers。
+
+    **本地地址会绕过系统代理** —— 见 `_is_local_url` 的说明。
     """
     if not isinstance(target, dict):
         return target  # FastMCP 实例或 URL 字符串
@@ -129,12 +229,16 @@ def _build_target(target: Any) -> Any:
         if not parts:
             raise ValueError("stdio mcp requires command")
         return StdioTransport(command=parts[0], args=parts[1:], env=target.get("env") or None)
+    url = target.get("url", "") or ""
+    factory = _httpx_factory_for(url)
     if transport == "sse":
         from fastmcp.client.transports import SSETransport
-        return SSETransport(url=target.get("url", ""), headers=target.get("headers") or None)
+        return SSETransport(url=url, headers=target.get("headers") or None,
+                            httpx_client_factory=factory)
     # 默认 http（streamable-http）
     from fastmcp.client.transports import StreamableHttpTransport
-    return StreamableHttpTransport(url=target.get("url", ""), headers=target.get("headers") or None)
+    return StreamableHttpTransport(url=url, headers=target.get("headers") or None,
+                                   httpx_client_factory=factory)
 
 
 class MCPToolset:
