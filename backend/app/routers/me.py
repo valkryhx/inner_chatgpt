@@ -233,10 +233,21 @@ async def export_mcp_json(user: dict = Depends(get_current_user)):
 
 @router.get("/mcp-effective")
 async def mcp_effective(user: dict = Depends(get_current_user)):
+    """返回**模型实际拥有的完整工具面**（内置 + MCP）。
+
+    ## 「可用工具」的唯一定义
+
+    用户问「有几个工具可用」时，意思是「模型能调用几个」，
+    那必然是内置 + MCP 的并集。所以本端点与 `mcp_probe` 必须口径一致。
+
+    2026-11-20 实测事故：本端点返回 46（11 内置 + 35 MCP），
+    而 `mcp_probe` 返回 35（只有 MCP），设置页同一个标签在两处
+    显示两个数字，用户以为连接在抖。
+    """
     from ..runtime import get_hub
     hub = get_hub()
     if not hub:
-        return {"tools": []}
+        return {"tools": [], "builtin_count": 0, "mcp_count": 0}
     # 工具与模型无关，但 runtime 构建会顺带解析模型；模型不可用时不应让本接口 500。
     # 必须用与会话轮次相同的 model_id 取 runtime，否则这里是另一个缓存实例：
     # 它会独立再连一遍 MCP，状态和用户实际聊天时看到的可能不一致
@@ -256,11 +267,16 @@ async def mcp_effective(user: dict = Depends(get_current_user)):
         refreshed = await hub.refresh_mcp_status(user["id"], model_id)
         if refreshed:
             ur = await hub.get_user_runtime(user["id"], model_id)
+        tools = ur.registry.tools
+        manifest = getattr(ur.toolset, "manifest", []) or []
         return {
-            "tools": [t.name for t in ur.registry.tools],
+            "tools": [t.name for t in tools],
+            # 拆分计数：用户据此判断「总数变了是 MCP 掉了还是内置变了」。
+            "builtin_count": sum(1 for t in tools if not getattr(t, "source", "")),
+            "mcp_count": sum(1 for t in tools if getattr(t, "source", "")),
             # 每个 MCP server 的连接结果：设置页据此显示「已连接 / 失败原因」。
             # 只给工具名的话，用户无法区分「没配」和「配了但连不上」。
-            "servers": getattr(ur.toolset, "manifest", []) or [],
+            "servers": manifest,
         }
     except Exception as e:  # noqa: BLE001
         from ..builtin_tools import build_builtin_tools
@@ -268,26 +284,47 @@ async def mcp_effective(user: dict = Depends(get_current_user)):
             names = [t.name for t in build_builtin_tools(user["id"])]
         except Exception:
             names = []
-        return {"tools": names, "servers": [], "error": f"{type(e).__name__}: {e}"}
+        return {"tools": names, "builtin_count": len(names), "mcp_count": 0,
+                "servers": [], "error": f"{type(e).__name__}: {e}"}
 
 
 @router.post("/mcp-servers/probe")
 async def mcp_probe(user: dict = Depends(get_current_user)):
-    """强制重连所有已启用的 MCP server，返回实时状态。
+    """强制重连所有已启用的 MCP server，返回**与 `mcp-effective` 同口径**的完整工具面。
 
     runtime 按 (user, model) 缓存，MCP 断开后缓存里的「已连接」不会自己变。
     用户点「重新检测」时需要真实探测结果，所以这里绕开任何缓存。
+
+    ## ⚠️ 必须并入内置工具（2026-11-20 修复）
+
+    原来只返回 `ts.tools`（纯 MCP，35 个），而 `mcp-effective` 返回
+    registry（内置 + MCP，46 个）。前端两处都渲染 `effective.length`，
+    于是「打开设置页 46 → 点重新检测 35」，11 个工具的差值就是内置工具。
     """
     from ..agent import build_user_toolset
+    from ..builtin_tools import build_builtin_tools
+
+    def _builtin_names() -> list[str]:
+        try:
+            return [t.name for t in build_builtin_tools(user["id"])]
+        except Exception:  # noqa: BLE001 - 内置工具装配失败不该让探测整个失败
+            return []
 
     try:
         ts = await build_user_toolset(user["id"])
         servers = getattr(ts, "manifest", []) or []
-        tools = [t.name for t in ts.tools]
+        mcp_names = [t.name for t in ts.tools]
         await ts.__aexit__(None, None, None)
-        return {"ok": True, "servers": servers, "tools": tools}
+        builtin = _builtin_names()
+        return {"ok": True, "servers": servers,
+                # 与 mcp-effective 同口径：内置 + MCP
+                "tools": builtin + mcp_names,
+                "builtin_count": len(builtin),
+                "mcp_count": len(mcp_names)}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "servers": [], "tools": [],
+        builtin = _builtin_names()
+        return {"ok": False, "servers": [], "tools": builtin,
+                "builtin_count": len(builtin), "mcp_count": 0,
                 "error": f"{type(e).__name__}: {e}"}
 
 

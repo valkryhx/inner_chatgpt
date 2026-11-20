@@ -622,6 +622,16 @@ function McpSection() {
   const [list, setList] = useState<MCPServer[]>([])
   const [error, setError] = useState<string | null>(null)
   const [effective, setEffective] = useState<string[]>([])
+  // 内置 / MCP 的工具数分开保存。
+  //
+  // ## 为什么不能只用一个总数（2026-11-20 真机报告）
+  //
+  // 用户看到「共 46 个可用工具」，点「重新检测」变成 35，以为连接在抖。
+  // 实际 46 = 11 内置 + 35 MCP，而 probe 当时只返回 MCP 的 35 —— 两个端点
+  // 口径不同。后端已统一，但**前端仍要把两个数字分开显示**：
+  // 只给总数时，数字一变用户无法判断是「MCP 掉了一个」还是「内置变了」。
+  const [builtinCount, setBuiltinCount] = useState<number | null>(null)
+  const [mcpCount, setMcpCount] = useState<number | null>(null)
   const [servers, setServers] = useState<McpServerStatus[]>([])
   // MCP 状态是异步查的，首次要连全部 server（实测冷启动 30+ 秒）。
   // 「还在查」和「查失败」必须与「真的没配」分开，否则那 30 秒里
@@ -642,6 +652,8 @@ function McpSection() {
       .mcpEffective()
       .then((r) => {
         setEffective(r.tools)
+        setBuiltinCount(typeof r.builtin_count === 'number' ? r.builtin_count : null)
+        setMcpCount(typeof r.mcp_count === 'number' ? r.mcp_count : null)
         setServers(r.servers || [])
         setMcpState('ready')
         setMcpError('')
@@ -711,6 +723,8 @@ function McpSection() {
       const r = await api.mcpProbe()
       setServers(r.servers || [])
       setEffective(r.tools || [])
+      setBuiltinCount(typeof r.builtin_count === 'number' ? r.builtin_count : null)
+      setMcpCount(typeof r.mcp_count === 'number' ? r.mcp_count : null)
       setMcpState(r.ok ? 'ready' : 'error')
       setMcpError(r.ok ? '' : (r.error || '未知原因'))
       if (!r.ok && r.error) setError('检测失败：' + r.error)
@@ -765,7 +779,11 @@ function McpSection() {
               : `${servers.filter((s) => s.ok).length}/${servers.length} 个 server 已连接`}
           </b>
           <span className="mcp-summary-tools">
-            {mcpState === 'ready' ? `共 ${effective.length} 个可用工具` : '工具数待检测'}
+            {mcpState !== 'ready'
+              ? '工具数待检测'
+              : builtinCount !== null && mcpCount !== null
+              ? `MCP ${mcpCount} 个 · 内置 ${builtinCount} 个（合计 ${effective.length}）`
+              : `共 ${effective.length} 个可用工具`}
           </span>
           <button className="ghost-btn small" onClick={probe} disabled={probing || mcpState === 'loading'}>
             {probing || mcpState === 'loading' ? '检测中…' : '重新检测连接'}

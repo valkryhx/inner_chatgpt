@@ -264,7 +264,15 @@ export const api = {
     }),
   deleteMcpServer: (id: string) => request<{ ok: boolean }>(`/me/mcp-servers/${id}`, { method: 'DELETE' }),
   mcpEffective: () =>
-    request<{ tools: string[]; servers?: McpServerStatus[]; error?: string }>('/me/mcp-effective'),
+    request<{
+      tools: string[]
+      /** 内置工具数。与 mcp_count 分开报，前端才能显示「内置 11 + MCP 35」。 */
+      builtin_count?: number
+      /** MCP 工具数（各 server 的 tool_count 之和）。 */
+      mcp_count?: number
+      servers?: McpServerStatus[]
+      error?: string
+    }>('/me/mcp-effective'),
   mcpImport: (raw: string) =>
     request<{
       ok: boolean
@@ -281,7 +289,14 @@ export const api = {
     }),
   mcpExport: () => request<{ json: string }>('/me/mcp-servers/export'),
   mcpProbe: () =>
-    request<{ ok: boolean; servers: McpServerStatus[]; tools: string[]; error?: string }>(
+    request<{
+      ok: boolean
+      servers: McpServerStatus[]
+      tools: string[]
+      builtin_count?: number
+      mcp_count?: number
+      error?: string
+    }>(
       '/me/mcp-servers/probe',
       { method: 'POST' },
     ),
