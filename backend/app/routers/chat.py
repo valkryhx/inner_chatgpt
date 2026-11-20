@@ -703,7 +703,14 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                 # ★ 子代理内部动作也要进时间轴 —— agent team 的耗时
                 # 绝大部分发生在子代理里，不记的话主时间轴只剩派单/收单两点，
                 # 中间十几分钟是空白。
-                trace.record(f"sub.{it}", name=str(inner.get("name") or aid),
+                #
+                # `agent=aid` 必须**独立**传，不能靠 `name` 兜底：
+                # 工具事件里 name 是工具名（code_run / file_write），
+                # 早期写 `name=str(inner.get("name") or aid)` 让 agent id
+                # 只能在没有工具名时出现 —— 4 个子代理并行时无法回答
+                # 「这个工具调用是谁发的」（2026-11-20 实测缺口）。
+                trace.record(f"sub.{it}", name=str(inner.get("name") or ""),
+                             agent=aid,
                              detail=inner.get("input") or inner.get("text"))
                 if it in ("text_delta", "thinking_delta"):
                     b["events"].append({"kind": "text" if it == "text_delta" else "reasoning",

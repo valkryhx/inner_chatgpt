@@ -163,17 +163,71 @@ run2 验证生效，且能算出每个子代理的产出：
 
 全部做过「移除实现后测试重新变红」的反向确认。
 
-## 6. 一个未修的观测限制（诚实标注）
+## 6. ✅ 已修：`sub.tool_start` 的 agent 归属（2026-11-20 当轮补完）
 
-`sub.tool_start` / `sub.tool_result` 事件**不带 agent 归属**：
+### 6.1 原来的缺陷
+
+接入侧写的是：
+
+```python
+trace.record(f"sub.{it}", name=str(inner.get("name") or aid), ...)
+```
+
+`name` 位被**工具名**占了（`code_run` / `file_read`），agent id 只能 `or` 兜底 ——
+有工具名时就永久丢失。日志变成：
 
 ```
-action=sub.tool_start brief=code_run code=rm -f out/zz_probe_code.txt ...
+action=sub.tool_start brief=code_run code=...
 ```
 
-这是因为接入侧传的是 `name=str(inner.get("name") or aid)` —— 工具名占了
-`name` 位，agent id 没地方放。导致「某个工具调用是哪个子代理发的」仍然看不出。
+多代理并行时无法回答「这个工具调用是谁发的」，也就无法把工具耗时归到
+各 agent 头上、无法定位「哪个 agent 卡在工具里」。
 
-**影响**：多代理并行时，无法把工具耗时精确算到各 agent 头上。
-**未修原因**：需要改 `record()` 的签名（加独立 `agent` 参数）并同步接入侧，
-属于下一轮的清理项，本轮不扩大改动面。
+### 6.2 修法：`agent` 独立参数 + 拼进 `who=`
+
+`record()` 加 `agent` 参数，与 `name`（工具名）解耦。渲染时拼进 `who=`：
+
+```
+修复前： who=root t=155020ms action=sub.tool_start brief=code_run ...
+修复后： who=root/sub:worker_c t=155020ms action=sub.tool_start brief=task_get ...
+```
+
+**为什么拼进 `who=` 而不是新增 `agent=` 字段**：新增字段会插在 `who=` 与 `t=`
+之间，而现有分析脚本用 `who=(\S+) t=` 紧邻匹配 —— 中间多一个字段会让那些
+正则**静默失配**（不报错，只是匹配不到任何行，看起来像「那轮没有日志」）。
+拼进 who 则 `\S+` 自然吞掉 `root/worker_ratio`，旧脚本照常工作。
+
+**为什么 `brief` 首 token 必须仍是工具名**：现有脚本用 `brief.split()[0]`
+取工具名做 start/result 配对。agent 放进 brief 开头会让所有这类脚本失效。
+所以 agent 只走 `who=`，`brief` 结构不动。
+
+### 6.3 修复带来的新能力：按 agent 归集工具耗时
+
+run3（`co_78daf507d365`，4 个子代理，288.7s，0 段 >30s 静默）：
+
+| agent | 工具调用 | 耗时 | top 工具 |
+| --- | --- | --- | --- |
+| `root` | 36 次 | 175.6s | `metric_search`×5, `task_create`×4, `spawn_teammate`×4 |
+| **`root/sub:worker_b`** | **26 次** | **7.0s** | **`run_readonly_sql`×10**, `code_run`×7 |
+| `root/sub:worker_a` | 14 次 | 0.6s | `code_run`×8 |
+| `root/sub:worker_c` | 11 次 | 0.3s | `code_run`×7 |
+| `root/sub:worker_d` | 7 次 | 0.2s | `code_run`×3 |
+
+**这张表在修复前做不出来。** 它直接回答了「哪个子代理在工具上花时间」：
+`worker_b` 用了 10 次 `run_readonly_sql`，耗时 7 秒，是其他三个子代理的十倍以上。
+若某个 agent 卡在工具里，现在一眼能看出来。
+
+### 6.4 测试与守卫
+
+| 测试 | 锁住什么 |
+| --- | --- |
+| `test_sub_tool_start_carries_agent` | 工具行能看出 agent（断言**渲染后的日志行**） |
+| `test_tool_name_still_first_token_of_brief` | brief 首 token 仍是工具名（旧脚本兼容） |
+| `test_agent_rendered_under_who_not_new_field` | 拼进 who=，不新增字段（旧正则兼容） |
+| `test_chat_py_passes_agent_explicitly` | **静态守卫**：接入侧不能退回旧写法 |
+
+静态守卫用 AST 按调用点检查，不用纯文本匹配 —— 注释里会合法提到旧写法，
+纯文本会让守卫假红。反向确认验证过：把接入侧改回 `name=... or aid`，守卫立刻变红。
+
+> 为什么这个缺陷必须靠静态守卫：它**不报错、不影响功能**，
+> 只表现为日志少一块。真机多代理 + 确有工具调用时才暴露，单测很难锁住。

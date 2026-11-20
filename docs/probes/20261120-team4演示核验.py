@@ -208,12 +208,20 @@ def main() -> int:
     else:
         problems.append(f"存在 >60s 静默：run1={max(gaps1):.1f} run2={max(gaps2):.1f}")
 
-    # ★ must_not：文档不得声称 sub.tool_start 带 agent 归属（那是未修的）
-    if "不带 agent 归属" in doc:
-        print("[✓] 文档如实标注了 sub.tool_* 缺 agent 归属")
+    # ★ §6：agent 归属缺口**已修**（2026-11-20 当轮补完）。
+    #   原断言是「文档应标注这个缺口未修」，修好后它必须反过来 ——
+    #   否则一篇已经修好的文档会被判成不合格。
+    if "已修：`sub.tool_start` 的 agent 归属" in doc:
+        print("[✓] §6 记录了 agent 归属已修")
         ok += 1
     else:
-        problems.append("文档没标注 sub.tool_* 的归属缺口（§6 应存在）")
+        problems.append("§6 没记录 agent 归属修复（应写「已修」）")
+    # 且不能再有「未修」的措辞残留
+    if "未修的观测限制" in doc:
+        problems.append("文档仍称该限制「未修」，与实际不符")
+    else:
+        print("[✓ must_not] 文档不再声称该限制未修")
+        ok += 1
 
     print()
     if problems:

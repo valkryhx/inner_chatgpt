@@ -216,10 +216,9 @@ def test_aggregated_text_keeps_agent_attribution():
     for _ in range(3):
         tr.record("sub.text_delta", name="query_penetration", detail="xyz")
     tr.flush()
-    rows = at.drain_for_test()
-    joined = " ".join(r["brief"] for r in rows)
-    assert "query_scale" in joined, f"聚合行丢了 query_scale 归属：{rows}"
-    assert "query_penetration" in joined, f"聚合行丢了 query_penetration 归属：{rows}"
+    lines = " ".join(_rendered())
+    assert "query_scale" in lines, f"聚合行丢了 query_scale 归属：{lines}"
+    assert "query_penetration" in lines, f"聚合行丢了 query_penetration 归属：{lines}"
 
 
 def test_aggregated_buckets_are_per_agent_not_merged():
@@ -245,7 +244,11 @@ def test_root_agent_text_still_has_label():
     tr.flush()
     rows = at.drain_for_test()
     assert rows
-    assert "root" in rows[0]["brief"], f"根代理的字数行没有标识：{rows[0]}"
+    # 根代理的归属由 `who=root`（turn_label）表达，不在 brief 里也不设 agent。
+    # 断言渲染结果：那才是真正落盘的一行。
+    line = _rendered()[0]
+    assert "who=root " in line, f"根代理的字数行 who 不对：{line}"
+    assert rows[0]["agent"] == "", f"根代理不该设 agent 字段：{rows[0]}"
 
 
 def test_sub_tool_events_keep_agent_name():
@@ -279,3 +282,155 @@ def test_thinking_action_name_is_stable():
     assert "thinking" in actions, f"思考流的 action 名不是 thinking：{actions}"
     assert "reasoning" not in actions, (
         f"出现了 reasoning —— 日志契约被破坏，跨轮对比会失效：{actions}")
+
+
+# --------------------------------------------------------------------------
+# ★ 工具调用的 agent 归属（2026-11-20 遗留项修复）
+# --------------------------------------------------------------------------
+
+def _rendered(gen: str = "g_x", label: str = "root") -> list[str]:
+    """把 drain 到的行按真实日志格式渲染出来。
+
+    断言渲染结果而不是 row 字典，是因为**落盘的那一行才是产品**：
+    row 里字段齐全但渲染时漏掉，日志里照样看不出归属。
+    """
+    return [at.render_line_for_test(r, gen, label) for r in at.drain_for_test()]
+
+
+def test_sub_tool_start_carries_agent():
+    """★ 子代理的工具调用必须能看出是哪个 agent 发的。
+
+    ## 这是上一轮遗留的缺口
+
+    `routers/chat.py` 原来写的是：
+
+        trace.record(f"sub.{it}", name=str(inner.get("name") or aid), ...)
+
+    `name` 位置被**工具名**占了（`code_run` / `web_search_exa`），
+    agent id 只能 `or` 兜底 —— 有工具名时就永久丢失。于是 4 个子代理并行时：
+
+        action=sub.tool_start brief=code_run code=...
+
+    无法回答「这个工具调用是谁发的」。多代理场景下这是硬伤：
+    工具耗时无法归到各 agent 头上，也就无法定位「哪个 agent 卡在工具里」。
+
+    修法：`record()` 增加独立的 `agent` 参数，与 `name`（工具名）解耦。
+    """
+    tr = at.ActivityTrace(generation_id="g_tool")
+    tr.record("sub.tool_start", name="code_run", agent="worker_ratio",
+              detail={"code": "pwd"})
+    lines = _rendered()
+    assert len(lines) == 1
+    assert "worker_ratio" in lines[0], f"工具调用行看不出 agent：{lines[0]}" 
+    assert "code_run" in lines[0], f"工具名丢了：{lines[0]}"
+
+
+def test_sub_tool_result_carries_agent():
+    """tool_result 同样要有归属（否则配对不上是谁的工具返回了）。"""
+    tr = at.ActivityTrace(generation_id="g_tr")
+    tr.record("sub.tool_result", name="file_write", agent="writer_doc")
+    lines = _rendered()
+    assert "writer_doc" in lines[0], f"{lines[0]}"
+    assert "file_write" in lines[0], f"{lines[0]}"
+
+
+def test_tool_name_still_first_token_of_brief():
+    """brief 的第一个 token 必须仍是工具名。
+
+    ## 为什么这条不能破
+
+    现有分析脚本（`docs/probes/20261120-时间轴分析.py` 等）用
+    `brief.split()[0]` 取工具名做配对。把 agent 塞到 brief 开头会让
+    所有这类脚本静默失效 —— 所以 agent 走**独立字段**，不动 brief。
+    """
+    tr = at.ActivityTrace(generation_id="g_ord")
+    tr.record("sub.tool_start", name="code_run", agent="worker_scale",
+              detail={"code": "ls"})
+    brief = at.drain_for_test()[0]["brief"]
+    assert brief.split()[0] == "code_run", (
+        f"brief 首 token 不是工具名，现有分析脚本会失效：{brief!r}")
+
+
+def test_root_events_keep_simple_who():
+    """根代理自己的动作，`who=` 里不该出现 `/agent` 后缀。"""
+    tr = at.ActivityTrace(generation_id="g_root", turn_label="root")
+    tr.record("tool_start", name="list_files", detail={"path": "."})
+    line = _rendered()[0]
+    assert "who=root " in line, f"根代理的 who 被污染了：{line}"
+    assert "/" not in line.split("who=")[1].split()[0], f"{line}"
+
+
+def test_agent_rendered_under_who_not_new_field():
+    """agent 拼进 `who=<turn>/<agent>`，不新增字段。
+
+    ## 为什么这样设计
+
+    新增 `agent=` 字段会插在 `who=` 与 `t=` 之间，而现有脚本用
+    `who=(\\S+) t=` 紧邻匹配 —— 中间多一个字段会让那些正则**静默失配**
+    （不是报错，是匹配不到任何行，看起来像"那轮没有日志"）。
+    拼进 who 则 `\\S+` 自然吞掉 `root/worker_ratio`，所有旧脚本照常工作。
+    """
+    tr = at.ActivityTrace(generation_id="g_who", turn_label="root")
+    tr.record("sub.tool_start", name="code_run", agent="a1", detail={"code": "x"})
+    line = _rendered()[0]
+    assert "who=root/a1" in line, f"格式不符：{line}"
+    assert "agent=" not in line, f"不该新增 agent= 字段（会破坏旧正则）：{line}"
+
+
+def test_aggregated_text_uses_agent_field_not_brief_prefix():
+    """流式聚合行的 agent 也走 who=，brief 只剩 `+N 字`。
+
+    与工具行保持一致：agent 只有一处来源，避免「有的在 brief、有的在 who」
+    这种双轨制（那样 grep 要写两种模式）。
+    """
+    tr = at.ActivityTrace(generation_id="g_txt", turn_label="root")
+    tr.record("sub.text_delta", name="worker_ratio", detail="abcdef")
+    tr.flush()
+    line = _rendered()[0]
+    assert "who=root/worker_ratio" in line, f"{line}"
+    assert "字" in line and "abcdef" not in line
+
+
+# --------------------------------------------------------------------------
+# 静态守卫：接入侧不能再退回「用 name 兜底传 agent」的写法
+# --------------------------------------------------------------------------
+
+def test_chat_py_passes_agent_explicitly():
+    """`routers/chat.py` 的子代理埋点必须显式传 `agent=`。
+
+    ## 为什么要静态守卫
+
+    这个缺陷是**静默**的：`name=str(inner.get("name") or aid)` 语法合法、
+    测试也过（测试自己构造 inner 时通常不带 name）。只有真机跑多代理、
+    且确实有工具调用时，日志里才会暴露出「看不出是哪个 agent」。
+
+    所以单测锁不住，必须直接检查调用点。用 AST 按函数作用域定位，
+    不用纯文本匹配（注释里会合法提到旧写法，纯文本会让守卫假红）。
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path("backend/app/routers/chat.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if not (isinstance(fn, ast.Attribute) and fn.attr == "record"):
+            continue
+        kwargs = {k.arg for k in node.keywords if k.arg}
+        # 只看子代理前缀那条（action 是 f-string "sub.{it}"）
+        first = node.args[0] if node.args else None
+        is_sub = (isinstance(first, ast.JoinedStr) and
+                  any(isinstance(v, ast.Constant) and str(v.value).startswith("sub.")
+                      for v in first.values))
+        if not is_sub:
+            continue
+        hits.append(kwargs)
+
+    assert hits, "找不到子代理的 trace.record 调用点（守卫失效，检查选择器）"
+    for kw in hits:
+        assert "agent" in kw, (
+            f"子代理埋点没有显式传 agent=（当前关键字：{sorted(kw)}）。"
+            "靠 name 兜底会让工具事件丢失 agent 归属。")

@@ -76,7 +76,26 @@ def render_line_for_test(row: dict[str, Any], gen: str, label: str) -> str:
 
 
 def _render(row: dict[str, Any], gen: str, label: str) -> str:
-    return (f"agent-activity gen={gen} who={label} t={int(row['t'])}ms "
+    """渲染一行日志。
+
+    ## `who=` 的两种形态
+
+    - 根代理自己的动作：`who=root`
+    - 子代理的动作：`who=root/<agent>`（如 `who=root/worker_ratio`）
+
+    ## 为什么把 agent 拼进 `who=` 而不是新增 `agent=` 字段
+
+    新增字段会插在 `who=` 与 `t=` 之间，而现有分析脚本用
+    `who=(\\S+) t=` 紧邻匹配 —— 中间多一个字段会让那些正则**静默失配**
+    （不报错，只是匹配不到任何行，看起来像「那轮没有日志」）。
+
+    拼进 who 则 `\\S+` 自然吞掉 `root/worker_ratio`，旧脚本照常工作。
+    """
+    who = label or "-"
+    agent = row.get("agent") or ""
+    if agent and agent != who:
+        who = f"{who}/{agent}"
+    return (f"agent-activity gen={gen} who={who} t={int(row['t'])}ms "
             f"action={row['action']} brief={row['brief']}")
 
 
@@ -133,23 +152,39 @@ class ActivityTrace:
     def offset_ms(self) -> float:
         return (time.monotonic() - self._t0) * 1000.0
 
-    def record(self, action: str, *, name: str = "", detail: Any = None) -> None:
+    def record(self, action: str, *, name: str = "", agent: str = "",
+               detail: Any = None) -> None:
         """记一个动作。
 
-        流式增量（`text_delta` / `thinking_delta`，含子代理前缀形式
-        `sub.text_delta` / `sub.thinking_delta`）在这里被**自动路由**到聚合路径。
+        ## 参数职责（三者不能混用）
 
-        为什么不要求调用方改用 `record_text`：那样的话
-        `record("text_delta")` 会静默变成「每帧一条」，一次长回复写出几十万行，
-        而调用方看不出自己用错了 API。宁可让这个类自己识别。
+        | 参数 | 放什么 | 例 |
+        | --- | --- | --- |
+        | `action` | 事件类型 | `tool_start` / `sub.text_delta` |
+        | `name` | **工具名** | `code_run` / `file_patch` |
+        | `agent` | **哪个子代理** | `worker_ratio` |
 
-        为什么必须包含 `sub.` 前缀：首版只认裸名字，结果子代理的
-        `sub.thinking_delta` 每帧一条 —— 一次实测里 60 秒内写了几百行，
-        全部是 "I have enough from" 这种半句。聚合在这里必须覆盖全部流式形式。
+        ### 为什么 `agent` 必须独立于 `name`
+
+        早期实现只有 `name`，接入侧写成
+        `name=str(inner.get("name") or aid)` —— agent id 只能在没有工具名时
+        兜底出现。有工具名时归属**永久丢失**，日志变成：
+
+            action=sub.tool_start brief=code_run code=...
+
+        4 个子代理并行时无法回答「这个工具调用是谁发的」，
+        也就无法定位「哪个 agent 卡在工具里」（2026-11-20 实测缺口）。
+
+        ### 流式增量自动路由
+
+        `text_delta` / `thinking_delta`（含 `sub.` 前缀）在这里被路由到聚合路径。
+        不要求调用方改用 `record_text`：否则 `record("text_delta")` 会静默变成
+        「每帧一条」，一次长回复写出几十万行，而调用方看不出自己用错了 API。
         """
         if not enabled():
             return
         base = action[4:] if action.startswith("sub.") else action
+        is_sub = action.startswith("sub.")
         if base in ("text_delta", "thinking_delta"):
             # ★ detail 可能是 dict（`{"text": ...}`）也可能是**裸字符串**
             #   （接入侧传 `ev.get("text")`）。首版只处理 dict，
@@ -159,15 +194,17 @@ class ActivityTrace:
                 text = detail.get("text", "")
             else:
                 text = detail if isinstance(detail, str) else ""
-            # 子代理事件用 name 当 agent 归属；根代理固定 "root"。
-            agent = name or ("root" if not action.startswith("sub.") else "sub")
+            # 流式事件没有工具名，历史接入侧把 agent id 放在 `name` 里
+            # （`name=str(inner.get("name") or aid)`）。所以这里回退到 name，
+            # 兼容旧调用；新代码应显式传 `agent=`。
+            who = agent or name or ("" if not is_sub else "sub")
             # ⚠️ kind 必须是 "thinking"，不能写成 "reasoning" ——
             # `_flush_locked` 拿 kind 当 action 名落盘，改名会让跨轮日志
             # 无法对比（2026-11-20 实测踩过：run1 是 thinking、run2 变成
             # reasoning，核验脚本对同一份文档算出两个数）。
             self.record_text(
                 "thinking" if base == "thinking_delta" else "text",
-                str(text), agent)
+                str(text), who)
             return
         # 容器事件本身没有语义（它的内容由内部的 sub.* 事件表达），
         # 记一条空的只是噪音 —— 实测一次运行里 1/3 的行是这种空 brief。
@@ -176,9 +213,11 @@ class ActivityTrace:
         now = time.monotonic()
         brief = _summarize(detail)
         if name:
+            # ⚠️ 工具名必须留在 brief 的**第一个 token**：现有分析脚本
+            # 用 `brief.split()[0]` 取工具名做 start/result 配对。
             brief = f"{name} {brief}".strip()
         row = {"t": (now - self._t0) * 1000.0, "action": action,
-               "brief": brief[: _BRIEF_MAX * 2]}
+               "brief": brief[: _BRIEF_MAX * 2], "agent": agent or ""}
         with self._lock:
             self._flush_locked(now, force=True)
             self._buf.append(row)
@@ -221,7 +260,10 @@ class ActivityTrace:
         for (kind, agent), n in pending.items():
             if not n:
                 continue
-            row = {"t": off, "action": kind, "brief": f"{agent} +{n} 字"}
+            # agent 走 row["agent"] 而不是 brief 前缀，与工具行保持单一来源。
+            # 双轨制（有的在 brief、有的在 who）会让 grep 要写两种模式。
+            row = {"t": off, "action": kind, "brief": f"+{n} 字",
+                   "agent": "" if agent == "root" else agent}
             self._buf.append(row)
             self._emit(row)
         self._last_flush = now
