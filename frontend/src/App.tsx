@@ -88,7 +88,12 @@ export default function App() {
   const [autoCompacted, setAutoCompacted] = useState<number>(0)
   const [health, setHealth] = useState<
     {
-      model: string; mcp_tools: number; servers: McpServerStatus[]
+      model: string
+      /** MCP 工具数（只 MCP，不含内置）。左下角「MCP 正常 · N 工具」用它。 */
+      mcp_tools: number
+      /** 内置工具数。与 mcp_tools 分开存，界面才能显示「MCP 35 / 内置 11」。 */
+      builtin_tools: number
+      servers: McpServerStatus[]
       // MCP 状态是异步拿的，而且首次要连全部 server（实测冷启动 30+ 秒）。
       // 必须把「还在查」和「查失败」与「真的没配」区分开，否则用户在这 30 秒里
       // 看到的是「未检测 · 0 个工具」，与「一个 MCP 都没配」长得一模一样。
@@ -285,6 +290,7 @@ export default function App() {
     setHealth((prev) => ({
       model: prev?.model || '',
       mcp_tools: prev?.mcp_tools ?? 0,
+      builtin_tools: prev?.builtin_tools ?? 0,
       servers: prev?.servers || [],
       mcp_state: 'loading',
       mcp_error: '',
@@ -301,9 +307,21 @@ export default function App() {
       mcpState = 'error'
       mcpError = e instanceof Error ? e.message : String(e)
     }
+    // ★ `mcp_tools` 必须是**只含 MCP** 的数。
+    //
+    // 原来写 `eff.tools.length` —— 那是「内置 + MCP」合并后的总数（如 46），
+    // 而左下角文案是「MCP 正常 · N 工具」，读起来像「有 46 个 MCP 工具」。
+    // 设置页那边已经拆成「MCP 35 · 内置 11」，这里必须与之一致。
+    const mcpCount = typeof eff?.mcp_count === 'number'
+      ? eff.mcp_count
+      : (eff?.servers || []).reduce((n, s) => n + (s.tool_count || 0), 0)
+    const builtinCount = typeof eff?.builtin_count === 'number'
+      ? eff.builtin_count
+      : Math.max(0, (eff?.tools.length || 0) - mcpCount)
     setHealth({
       model: h?.model || '',
-      mcp_tools: eff ? eff.tools.length : 0,
+      mcp_tools: mcpCount,
+      builtin_tools: builtinCount,
       servers: eff?.servers || [],
       mcp_state: mcpState,
       mcp_error: mcpError,

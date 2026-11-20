@@ -190,3 +190,67 @@ def test_probe_failure_still_reports_builtin(monkeypatch):
     assert res["builtin_count"] == 1, f"失败路径丢了内置工具数：{res}"
     assert res["mcp_count"] == 0
     assert "mcp down" in res["error"]
+
+
+# --------------------------------------------------------------------------
+# ★ 左下角状态条：同样必须区分 MCP 与内置
+# --------------------------------------------------------------------------
+
+def test_sidebar_shows_mcp_count_not_total():
+    """侧边栏「MCP 正常 · N 工具」里的 N 必须是**MCP** 工具数。
+
+    ## 这是设置页修完之后漏掉的第二处
+
+    设置页改成「MCP 35 个 · 内置 11 个」之后，左下角仍显示
+    「MCP 正常 · 46 工具」——同一个界面自相矛盾：46 是总数，
+    但文案前缀写的是「MCP」，读起来像「有 46 个 MCP 工具」。
+
+    `App.tsx` 里 `mcp_tools: eff.tools.length` 取的是合并后的总数，
+    与 `mcp-effective` 返回的 `mcp_count` 是两回事。
+    """
+    side = pathlib.Path("frontend/src/components/Sidebar.tsx").read_text(encoding="utf-8")
+    app = pathlib.Path("frontend/src/App.tsx").read_text(encoding="utf-8")
+
+    assert "mcp_tools" in side, "侧边栏不再用 mcp_tools 字段（结构变了？）"
+    # ★ 判据：文案必须**同时**出现 MCP 数与内置数。
+    #
+    # 只检查某个字段名存在是不够的（`mcp_tools` 一直存在，值才是错的）。
+    # 这里要求渲染表达式里出现 `MCP ${...mcp_tools}` 与 `内置 ${...builtin_tools}`
+    # 两个插值 —— 那正是「拆开显示」的实现形态。
+    assert "mcp_tools" in side and "builtin_tools" in side, (
+        "侧边栏没有同时使用 mcp_tools 与 builtin_tools")
+    # ★ 判据必须**只针对正文那一条**，不能全局搜。
+    #
+    # 两轮反向确认都假绿的教训：
+    #   第一版 `MCP \$\{[^}]*mcp_tools[^}]*\}` 在退化写法
+    #   （两者相加）上也成立，因为那一行里确实有 mcp_tools。
+    #   收紧成「独立插值」后**仍然**全绿 —— 因为 Sidebar 的 tooltip
+    #   （`title={...MCP ${mcp_tools}...内置 ${builtin_tools}...}`）里
+    #   本来就有一对独立插值，全局正则匹配到的是它。
+    #
+    # 所以：先按结构切出正文标签 `mcp-health-text` 的那一段，只在里面断言。
+    m_body = re.search(
+        r'className="mcp-health-text"[^>]*>(.*?)</span>',
+        side, re.S)
+    assert m_body, "找不到正文 <span className=\"mcp-health-text\">，结构变了？"
+    body = m_body.group(1)
+
+    m_mcp = re.search(r"MCP \$\{([^}]*)\}", body)
+    assert m_mcp, f"正文没有「MCP ${{...}}」渲染：{body!r}"
+    assert "builtin_tools" not in m_mcp.group(1), (
+        "正文「MCP ${...}」里混进了 builtin_tools —— 显示的仍是两者之和，"
+        f"实际：MCP ${{{m_mcp.group(1)}}}")
+    m_bi = re.search(r"内置 \$\{([^}]*)\}", body)
+    assert m_bi, f"正文没有「内置 ${{...}}」渲染：{body!r}"
+    assert "mcp_tools" not in m_bi.group(1), (
+        f"正文「内置 ${{{m_bi.group(1)}}}」里混进了 mcp_tools")
+
+    # App.tsx 不能再用 tools.length 当 mcp_tools
+    assert "mcp_tools: eff ? eff.tools.length : 0" not in app, (
+        "App.tsx 仍把「内置+MCP 总数」赋给 mcp_tools —— 这就是 46 的来源")
+
+
+def test_sidebar_tooltip_explains_split():
+    """悬停提示也应说明拆分，否则用户点开前仍不知道 46 的构成。"""
+    side = pathlib.Path("frontend/src/components/Sidebar.tsx").read_text(encoding="utf-8")
+    assert "内置" in side, "侧边栏的 tooltip 没提内置工具数"

@@ -13,7 +13,10 @@ interface Props {
    */
   health: {
     model: string
+    /** MCP 工具数（不含内置）。 */
     mcp_tools: number
+    /** 内置工具数。与 mcp_tools 分开显示，避免「MCP 46 工具」的误读。 */
+    builtin_tools: number
     servers: McpServerStatus[]
     mcp_state?: 'idle' | 'loading' | 'ready' | 'error'
     mcp_error?: string
@@ -200,7 +203,7 @@ export default function Sidebar({
             ? `MCP 检测失败：${health?.mcp_error || '未知原因'}（点击查看详情）`
             : badServers.length
             ? `连接失败：${badServers.map((s) => s.name).join('、')}（点击查看详情）`
-            : 'MCP 与工具状态（点击打开设置）'
+            : `MCP ${health?.mcp_tools ?? 0} 个工具 · 内置 ${health?.builtin_tools ?? 0} 个（点击打开设置）`
         }
       >
         <span className={`mcp-dot ${mcpLoading ? 'idle' : mcpFailed || badServers.length ? 'warn' : 'ok'}`} />
@@ -213,6 +216,8 @@ export default function Sidebar({
             ? '未配置 MCP'
             : badServers.length
             ? `${badServers.length} 个 MCP 断开`
+            : health?.builtin_tools
+            ? `MCP ${health?.mcp_tools ?? 0} · 内置 ${health.builtin_tools}`
             : `MCP 正常 · ${health?.mcp_tools ?? 0} 工具`}
         </span>
       </button>
