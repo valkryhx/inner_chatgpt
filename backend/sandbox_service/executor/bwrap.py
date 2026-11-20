@@ -98,6 +98,31 @@ def _child_run(req, wfd):
         code = req.get("code") or ""
         code_type = req.get("code_type") or "python"
 
+        # umask 002：让这个子进程建的目录/文件**组可写**。
+        #
+        # ## 为什么必须在这里设
+        #
+        # 默认 022 下 `mkdir` 给 0755、`open()` 给 0644 —— **组不可写**。
+        # 而 workspace 是 app（root）与沙箱服务（uid 1000）共享写的
+        # （共享组 hlz，见 deploy/docker-compose.yml）。
+        # 实测（2026-11-20）：code_run 里 `mkdir` 得到 `0o2755`、
+        # `write_text` 得到 `0o100644`，两者组都不可写。
+        #
+        # 后果是一条只在特定序列里出现的坑：
+        #
+        #     code_run 写文件       → 成功（uid 1000 自己是属主，有 w）
+        #     app 侧的 file_patch 改它 → 依赖目录/文件对组可写才能落下 tmp 文件
+        #
+        # ## 为什么是 002 而不是 022
+        #
+        # 002 = 「other 不可写、**组可写**」。与 `ensure_dir_shared` 的
+        # `| 0o020` 是同一条不变量：workspace 里的一切都必须对共享组可写。
+        # 只 reduce 组位、不动 other —— 不扩大对外暴露面。
+        try:
+            os.umask(0o002)
+        except Exception:
+            pass
+
         # 第一级超时：让 Python 层面的死循环/阻塞能被中断
         try:
             signal.signal(signal.SIGALRM, _alarm_handler)
@@ -296,10 +321,18 @@ class BwrapExecutor:
             f"--cpu={self._cpu}",
             f"--fsize={self._fsize}",
         ]
+        # umask 002 必须显式设：默认 022 下 mkdir 给 0755、open 给 0644，
+        # 组不可写 ⇒ 之后 app 侧（不同 uid）动这些文件就失败。
+        # 与 daemon 模式的 `_child_run` 里那条是同一条不变量，
+        # **两条执行路径必须一致**（否则「有时能改有时不能」极难排查）。
+        #
+        # 用 `sh -c 'umask 002; exec ...'` 而不是另写脚本文件：
+        # 不改镜像、不引入新的挂载点，而且 `exec` 保证不留 sh 父进程
+        # （signal / exit code 语义与直接跑一致）。
         if code_type == "sh":
-            argv += ["sh", "-c", code]
+            argv += ["sh", "-c", f"umask 002; {code}"]
         else:
-            argv += ["python3", "-c", code]
+            argv += ["sh", "-c", "umask 002; exec python3 -c \"$0\"", code]
         return argv
 
     def _build_daemon_argv(self, workspace: Path, *, cwd: str = "") -> list[str]:
