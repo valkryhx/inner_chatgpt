@@ -32,7 +32,16 @@ from .workspace import (
     write_root_for,
 )
 
-DEFAULT_READ_LINES = 200
+# 单次 file_read 默认读多少行。**对齐 CC 的 2000**（319 `m0274:604` `$tn = 2000`，
+# 提示词 `claude-code-fable-5.2.md:2331` "Reads up to 2000 lines by default"）。
+#
+# 从 200 提到 2000（2026-11-20）的理由是**轮次成本**，不是"抄得像"：
+# 一个 40 KB 的 markdown 报告约 1000-1500 行，旧默认下模型要翻 5-8 次才能读完，
+# 每次都是一轮 LLM 调用。实测 Agent Team 的子代理把大量轮次花在翻页上。
+#
+# 上限 2000 仍然夹住（见 `_read_impl` 里的 `min(..., 2000)`）：一次读太多会挤爆
+# 上下文预算，而预算被挤爆的代价（压缩、丢中间内容）远大于多翻一页。
+DEFAULT_READ_LINES = 2000
 MAX_OUTPUT_CHARS = 20000
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 600
@@ -183,8 +192,62 @@ def _read_impl(user_id: str, path: str, start: int = 1, count: int = DEFAULT_REA
     if show_linenos:
         body = "\n".join(f"{start + i}|{line}" for i, line in enumerate(chunk))
         header = f"[FILE] {display_path(user_id, target)} | 共 {total} 行，显示 {start}-{end}\n"
-        return header + body
-    return "\n".join(chunk)
+        return header + body + _truncation_banner(
+            user_id, target, start=start, end=end, total=total)
+    tail = "\n".join(chunk)
+    # show_linenos=False 时仍要提示截断 —— 否则模型以为自己拿到了全文。
+    # 这是「不显示行号」和「不告知未读完」两件事，不能混。
+    return tail + _truncation_banner(
+        user_id, target, start=start, end=end, total=total)
+
+
+def _truncation_banner(user_id: str, target, *, start: int, end: int,
+                       total: int) -> str:
+    r"""截断时追加的横幅：**明确告诉模型下一步怎么读**。
+
+    ## 对齐 CC（319 `m0591:148116`）
+
+    CC 的原文模板（按能否按行分页分两档）：
+
+        [Truncated: PARTIAL view — <file>: showing lines 1-N of M total
+        (T tokens, cap G). Call <Read> with offset=N+1 limit=N for the next page,
+        or <Grep> to find a specific section. Do NOT answer from this page alone
+        if the answer may be further in the file.]
+
+    三件事一起做：① 声明这是**部分视图**；② 给出**可直接照抄的参数**
+    （`offset=N+1 limit=N`）；③ 警告别只看这一页就下结论。
+
+    ## 为什么必须写出具体参数
+
+    只写「显示 1-200，共 2500 行」，模型得自己推「下一步 start=201」。
+    实测（Agent Team 子代理）它会重读同一段、或者干脆放弃阅读直接瞎写。
+    CC 把下一步写死，模型不需要推理就能继续 —— 这是**消除一类失败模式**，
+    不是提供便利。
+
+    ## 为什么必须有第 ③ 条
+
+    没有它时，模型容易把「我看到的这部分」当成「全部」，据此下结论。
+    CC 用 `Do NOT answer from this page alone` 明说。这里保留等效的中文表述。
+
+    Args:
+        start/end: 本次实际返回的 1-based 行区间（闭区间）。
+        total: 文件总行数。
+
+    Returns:
+        空串（没截断）或 `\n\n` 开头的横幅。
+    """
+    if end >= total:
+        return ""
+    nxt = end + 1
+    shown = display_path(user_id, target)
+    remain = total - end
+    return (
+        f"\n\n[Truncated: 部分视图 — {shown}: 显示 {start}-{end}，共 {total} 行，"
+        f"还有 {remain} 行未显示。\n"
+        f"下一页：file_read path={shown!r} start={nxt} count={end - start + 1}\n"
+        f"找特定内容：file_read path={shown!r} keyword=<关键字>\n"
+        f"不要在只看这一页的情况下下结论 —— 答案可能在未显示的部分。]"
+    )
 
 
 # ---------------- file_write ----------------
