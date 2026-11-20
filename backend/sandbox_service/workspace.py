@@ -92,6 +92,50 @@ def user_workspace(user_id: str, *, create: bool = False) -> Path:
     return root
 
 
+def resolve_in_workspace(user_id: str, rel_path: str) -> Path:
+    """把相对路径解析到该用户 workspace 内，越界抛 `PathSecurityError`。
+
+    ## 服务侧必须自己校验，不能只信 app
+
+    app 侧已经用 `safe_workspace_path()` 校验过一次，然后把相对路径发过来。
+    但**服务侧不能因此跳过校验**：一旦 app 被攻破（或有别的调用方直连，
+    或将来加了别的入口），只信调用方就等于把「任意位置写文件」开放出去。
+
+    这跟 `reject_unsafe_segment` 在两边各有一份是同一个道理 ——
+    校验的长度是重复的，但它防的是「一边被绕过」。
+
+    ## 规则
+
+    - 只接受**相对路径**（绝对路径直接拒：app 的契约就是发相对的，
+      接受绝对的等于给了一个绕过 workspace 的入口）
+    - 解析后必须仍在该用户 workspace 内（挡 `..` 与符号链接）
+
+    Args:
+        user_id: 已认证的用户（来自 header，不是请求体）。
+        rel_path: 相对 workspace 根的路径，如 `notes/a.md`。
+
+    Raises:
+        PathSecurityError: 绝对路径 / 空路径 / 解析后越界。
+    """
+    raw = (rel_path or "").strip()
+    if not raw:
+        raise PathSecurityError("path 不能为空")
+
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        raise PathSecurityError(f"只接受相对路径（收到 {raw!r}）")
+
+    root = workspaces_root(user_id).resolve()
+    try:
+        target = (root / candidate).resolve()
+    except OSError as exc:
+        raise PathSecurityError(f"无法解析路径: {raw}") from exc
+
+    if target != root and root not in target.parents:
+        raise PathSecurityError(f"路径越界（必须位于 {root} 内）: {raw}")
+    return target
+
+
 def make_resolver():
     """给 `Executor` 用的 resolver：`user_id -> Path`。"""
 

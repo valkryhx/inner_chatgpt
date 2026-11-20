@@ -75,18 +75,34 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
     LANG=C.UTF-8
 
-# ---- 非 root 用户 ----------------------------------------------------------
+# ---- 非 root 用户 + 共享组 --------------------------------------------------
 # ★ 关键：bwrap 的 --uid 是「假降权」（userns 内映射，内核视角仍是 0），
 #   所以 RLIMIT_NPROC 在 bwrap 里设了也没用。必须让**容器本身**非 root。
 #   实测：uid 1000 下 nproc=20 拦在第 18 个；root 下起满 60 个。
-RUN useradd --create-home --uid 1000 sandbox \
+#
+# ## 为什么要建 hlz 组（gid 1000）
+#
+# app 容器以 root 运行、本服务以 uid 1000 运行，两者共享同一个 appdata 卷。
+# app 创建的 `workspaces/<uid>/` 属主是 root、属组是 root → 本服务写不进去：
+#
+#     PermissionError: [Errno 13] Permission denied:
+#       '.../workspaces/u_write_probe/xxx.txt.hlz-tmp'
+#
+# 解法是共享组 + setgid 目录（见 deploy/docker-compose.yml 的 sandbox-perms）：
+# 目录属组设为 hlz(1000) 且带 setgid，app 之后新建的子目录/文件自动继承该组，
+# 本服务（组主）就有写权限。
+#
+# ⚠️ gid 必须固定 1000：app 侧 `group_add: [1000]` 是按**数字**加的
+#    （容器之间不共享 /etc/group）。两边数字不一致等于没加。
+RUN groupadd --gid 1000 hlz \
+    && useradd --create-home --uid 1000 --gid 1000 sandbox \
     && mkdir -p /app /workspaces \
-    && chown -R sandbox:sandbox /app /workspaces
+    && chown -R sandbox:hlz /app /workspaces
 
 WORKDIR /app
 
 # 只拷服务代码，不拷整个 backend（app 的业务代码不该进这个镜像）
-COPY --chown=sandbox:sandbox backend/sandbox_service/ /app/sandbox_service/
+COPY --chown=sandbox:hlz backend/sandbox_service/ /app/sandbox_service/
 
 USER sandbox
 

@@ -27,6 +27,10 @@ _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:/")
 _FILE_URI_RE = re.compile(r"^file:", re.IGNORECASE)
 
+# 用户 workspace 目录的权限：setgid + 属组可写。
+# 见 `user_workspace` 的 docstring（沙箱服务以组 hlz 的身份写入）。
+_WORKSPACE_DIR_MODE = 0o2775
+
 
 class PathSecurityError(ValueError):
     """Raised when a requested path escapes its allowed root."""
@@ -122,10 +126,30 @@ def display_path(user_id: str, target: Path) -> str:
 
 
 def user_workspace(user_id: str, *, create: bool = True) -> Path:
-    """Return (and optionally create) the user's workspace root."""
+    """该用户的 workspace 根（可选创建）。
+
+    ## 建目录时必须显式 `0o2775`，不能靠 umask
+
+    这个目录由 app（root）创建，但**写入它的还有沙箱服务**（uid 1000 = hlz 组）。
+    umask 给的是 `0o755`：
+
+        drwxr-sr-x 2 root hlz     ← 组有 r-x 但**没有 w**
+
+    沙箱服务是组 `hlz` 的成员却写不进去，实测：
+
+        touch: cannot touch '.../u_perm_check/test.tmp': Permission denied
+
+    `0o2775` = setgid + 属主 rwx + **属组 rwx** + 其他 r-x：
+
+    - 属组 rwx  → 沙箱服务（组 hlz）能写
+    - setgid   → 之后新建的子目录自动继承组 `hlz`（否则又退回 root 组）
+
+    必须显式给：umask 在不同部署/CI 里可能不同，靠它等于靠运气。
+    （`sandbox-perms` 只能给顶层目录设一次，追不上 app 之后新建的用户目录。）
+    """
     root = workspaces_root(user_id)
     if create:
-        root.mkdir(parents=True, exist_ok=True)
+        ensure_dir_shared(root)
     return root
 
 
@@ -146,18 +170,52 @@ def shared_skills_root() -> Path:
     return SHARED_SKILLS_DIR
 
 
+def ensure_dir_shared(path: Path) -> None:
+    """创建目录（含父级），并确保它 `g+w` + 对**目录**设 setgid。
+
+    ## 为什么所有建目录的地方都要用它
+
+    workspace 目录由 app（root）创建、但还要被沙箱服务（uid 1000 = hlz 组）
+    写入。普通 `mkdir` 在 umask 0755 下得到：
+
+        drwxr-sr-x  root hlz     ← 组有 r-x，**没有 w**
+
+    实测（2026-11-20）：顶层 `workspaces/` 靠 `sandbox-perms` 设了 2775
+    所以能写；但 `.subagents/<s>/<a>` 这类**子目录**是运行时新建的，
+    `sandbox-perms` 追不上，于是子代理的 file_write 报 507 / PermissionError。
+
+    ## 为什么只给目录设 setgid，不给文件
+
+    文件上的 setgid 位在某些系统上会改变执行语义（对目录才是「继承组」）。
+    文件靠**父目录的 setgid** 自动继承组，不需要自己带。
+    """
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        current = path.stat().st_mode & 0o7777
+        want = current | 0o2000 | 0o020      # setgid + g+w（保留原有其它位）
+        if current != want:
+            path.chmod(want)
+    except OSError:
+        # chmod 失败不该让建目录整个失败（只读挂载 / 非 POSIX 文件系统）
+        pass
+
+
 def write_root_for(user_id: str, root: str = "") -> Path:
     """Resolve (and create) the effective WRITE root inside a user's workspace.
 
     ``root`` 为空 -> 用户 workspace 根；否则是该根下的一个相对子目录
     （如 ``.subagents/<session>/<agent>``），用于把子代理产物隔离。
     任何越界都会抛 PathSecurityError。
+
+    ⚠️ 用 `ensure_dir_shared` 而不是裸 `mkdir`：子代理目录是运行时新建的，
+    `sandbox-perms` 的启动期 chmod 追不上它们（见 ensure_dir_shared 的注释）。
     """
     base = user_workspace(user_id)
     if not (root or "").strip():
         return base
     target = _resolve_under(base, base / root.strip())
-    target.mkdir(parents=True, exist_ok=True)
+    ensure_dir_shared(target)
     return target
 
 

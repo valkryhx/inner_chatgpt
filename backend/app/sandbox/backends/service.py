@@ -203,10 +203,106 @@ class ServiceBackend:
         logger.warning("沙箱服务不可用，降级（mode=auto）：%s", reason)
         return False, DEGRADED_PREFIX.format(reason=reason), ""
 
-    async def write_file(self, *a, **kw) -> tuple[bool, str]:
-        # 文件工具仍在进程内跑（方案 §4.2 的「该留在 app 的」），
-        # 走服务是阶段 3 之后的事。现在明确交回调用方，不假装处理。
-        return False, ""
+    async def write_file(
+        self,
+        user_id: str,
+        path: str,
+        content: str,
+        *,
+        mode: str = "overwrite",
+        root: str = "",
+    ) -> tuple[bool, str]:
+        """把内容写到沙箱侧的 workspace。
 
-    async def patch_file(self, *a, **kw) -> tuple[bool, str]:
-        return False, ""
+        ## 为什么走服务而不是留在进程内
+
+        早期版本这里 `return False, ""`，注释说「文件工具仍在进程内跑
+        （方案 §4.2 的该留在 app 的）」。那个出处是错的：方案的 §3.3
+        「该留在 app 的」列的是 policy / 工具 schema / 预算 / 降级决策 /
+        总开关，**没有文件工具**。
+
+        走服务的收益是防御纵深：写操作也在沙箱的 mount namespace 里，
+        万一路径校验有漏洞还有容器兜底。
+
+        ## `root` 怎么处理
+
+        app 侧的 `root` 是「workspace 内的子根」（子代理隔离用，
+        如 `.subagents/<session>/<agent>`）。服务侧的契约是**相对
+        workspace 根**的路径，所以这里把 root 与 path 拼起来发过去，
+        由服务侧统一做越界校验。
+        """
+        rel = _join_root(root, path)
+        payload = {"path": rel, "content": content, "mode": mode}
+        return await self._post_file("/v1/write", user_id, payload)
+
+    async def patch_file(
+        self,
+        user_id: str,
+        path: str,
+        old: str,
+        new: str,
+        *,
+        root: str = "",
+    ) -> tuple[bool, str]:
+        """替换文件里的第一处 `old`。"""
+        rel = _join_root(root, path)
+        payload = {"path": rel, "old": old, "new": new}
+        return await self._post_file("/v1/patch", user_id, payload)
+
+    async def _post_file(
+        self, endpoint: str, user_id: str, payload: dict
+    ) -> tuple[bool, str]:
+        """`/v1/write` 与 `/v1/patch` 共用：发请求 + 映射错误。
+
+        错误映射与 `exec_code` 一致：
+        - 4xx：调用方的错，直接报出来（**不降级**——参数错不该靠重试解决）
+        - 5xx / 连不上：服务不可用，按 mode 决定降级还是抛错
+        """
+        from ..config import get_config
+
+        cfg = get_config()
+        try:
+            self._require_config()
+            timeout_cfg = httpx.Timeout(DEFAULT_SERVICE_TIMEOUT_S, connect=CONNECT_TIMEOUT_S)
+            async with httpx.AsyncClient(timeout=timeout_cfg) as client:
+                resp = await client.post(
+                    f"{self._url}{endpoint}",
+                    json=payload,
+                    headers=self._headers(user_id),
+                )
+        except Exception as exc:  # noqa: BLE001
+            handled, note, _ = self._handle_unavailable(cfg.mode, exc)
+            return handled, note
+
+        if 400 <= resp.status_code < 500:
+            detail = self._extract_detail(resp)
+            msg = detail.get("message") or detail.get("raw") or str(detail)
+            return True, f"[sandbox] 请求被拒绝（HTTP {resp.status_code}）：{msg}"
+
+        if resp.status_code >= 500:
+            handled, note, _ = self._handle_unavailable(
+                cfg.mode, SandboxUnavailable(f"沙箱服务返回 {resp.status_code}")
+            )
+            return handled, note
+
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001
+            return True, "[sandbox] 沙箱服务返回的不是 JSON"
+
+        rel = data.get("path") or payload.get("path") or ""
+        chars = data.get("chars", 0)
+        if endpoint == "/v1/patch":
+            return True, f"已修改 {rel}（{chars} 字符）"
+        return True, f"已写入 {rel}（{chars} 字符，mode={payload.get('mode')}）"
+
+
+def _join_root(root: str, path: str) -> str:
+    """把 app 侧的 `root`（workspace 内子根）与 `path` 拼成相对路径。
+
+    ⚠️ 拼接后仍由**服务侧**做越界校验，这里不做安全判断 ——
+    两处都判不等于安全翻倍，但一处被判就够。
+    """
+    r = (root or "").strip().strip("/")
+    p = (path or "").strip().lstrip("/")
+    return f"{r}/{p}" if r else p

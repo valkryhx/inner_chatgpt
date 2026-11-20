@@ -144,6 +144,19 @@ services:
       HLZ_PG_SCHEMA_PER_PATH: "0"
     volumes:
       - appdata:/app/backend/data
+    # ---- 共享组 1000（= 沙箱服务的 hlz 组）----
+    #
+    # 本服务跑 root，root 自己能写任何文件 —— 但**新建的文件**属主是 root、
+    # 属组是 root。沙箱服务跑 uid 1000，写不进去：
+    #
+    #     PermissionError: [Errno 13] Permission denied: '.../xxx.txt.hlz-tmp'
+    #
+    # 加了这个组之后，新建文件的属组变成 hlz(1000)，沙箱服务（组主）就能写。
+    # 配合 `sandbox-perms` 给 workspaces/ 设的 setgid 位，子目录也自动继承。
+    #
+    # ⚠️ 用数字 1000：容器之间不共享 /etc/group，按组名 `hlz` 加会失败。
+    group_add:
+      - "1000"
     # 不写 ports：多副本时固定端口会冲突。对外走下面的 nginx。
 
   # ---- 一次性权限初始化：把沙箱需要写的两个子树交给 uid 1000 ----
@@ -164,16 +177,34 @@ services:
   sandbox-perms:
     image: alpine:latest
     restart: "no"
+    # 以 root 跑：只有 root 能 chown/chgrp 别的 uid 拥有的目录
+    user: "0:0"
     command:
       - sh
       - -c
       - |
         set -e
-        mkdir -p /data/workspaces /data/sandbox /data/sandbox-archives
-        chown -R 1000:1000 /data/workspaces /data/sandbox /data/sandbox-archives
-        chmod 750 /data/workspaces /data/sandbox /data/sandbox-archives
+        mkdir -p /data/workspaces /data/sandbox-archives
+
+        # 共享组 1000（= 沙箱服务的 hlz 组）。app 与沙箱服务靠它共享写权限。
+        #
+        # ⚠️ 用**数字** 1000 而不是组名：alpine 容器里没有 hlz 这个名字，
+        #    只有 gid 是跨容器一致的事实。
+        chgrp -R 1000 /data/workspaces /data/sandbox-archives
+
+        # setgid 位（2 开头）是这套方案的关键：
+        #   目录带 setgid ⇒ 之后在它下面**新建的子目录和文件自动继承该组**。
+        #   否则 app（root）之后建的用户目录组还是 root，沙箱服务又写不进去 ——
+        #   而 sandbox-perms 只在启动时跑一次，追不上新目录。
+        #   实测：缺 setgid 时 u_write_probe 目录属组 root，写文件报
+        #   PermissionError: [Errno 13]。
+        #
+        # 2775 = setgid + rwxrwxr-x
+        #   属主(root) rwx / 属组(hlz) rwx / 其他 r-x
+        chmod 2775 /data/workspaces /data/sandbox-archives
+
         echo "perms ok:"
-        ls -ld /data/workspaces /data/sandbox /data/sandbox-archives
+        ls -ld /data/workspaces /data/sandbox-archives
     volumes:
       - appdata:/data
 

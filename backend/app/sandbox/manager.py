@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 
 from .config import SandboxConfig, get_config
 from .errors import SandboxError, SandboxExecError, SandboxTimeout, SandboxUnavailable
@@ -35,6 +36,36 @@ DEGRADED_PREFIX = "[sandbox] 本次未隔离：{reason}（当前模式 auto）"
 # 容器内 shell 支持的类型（设计文档 §10.1）
 _PY_TYPES = {"python", "py"}
 _SH_TYPES = {"bash", "sh", "shell"}
+
+
+def _workspace_rel(user_id: str, target: Path, root: str = "") -> str:
+    """把绝对路径换算成**相对该用户 workspace 根**的路径。
+
+    ## 为什么不能用 `target.relative_to(mount)`
+
+    `mount` 是容器挂载根（永远是该用户的 workspace 根）。而 `target`
+    可能带 `write_root`（子代理的 `.subagents/<s>/<a>`）。两者相减就得到
+    相对根的路径，正是服务侧契约要的形态。
+
+    ## 为什么必须 `as_posix()`
+
+    服务侧在 Linux 上，Windows 风格的反斜杠路径字符串在那边会成为文件名的
+    一部分（历史事故：拼出了带反斜杠的畸形目录名）。
+
+    Raises:
+        ValueError: target 不在该用户 workspace 内（理论上前面已校验过，
+            这里是最后一道防线 —— 宁可报错也不能发出越界路径）。
+    """
+    from ..workspace import user_workspace
+
+    base = Path(user_workspace(user_id, create=False)).resolve()
+    t = Path(target).resolve()
+    try:
+        return t.relative_to(base).as_posix()
+    except ValueError:
+        raise ValueError(
+            f"路径越界：{t} 不在 {base} 内（不应发生，前面应已校验）"
+        ) from None
 
 
 def _selected_backend():
@@ -434,6 +465,34 @@ class SandboxManager:
             if not ok:
                 return True, f"错误：{why}"
 
+        # ★ backend 分发（方案 B）：service 后端把写操作交给沙箱服务。
+        #
+        # 这段原本**缺失**，于是 service 部署下 write_file 直接走下面的
+        # Docker 路径 → app 容器里没装 docker SDK → SandboxUnavailable。
+        # strict 模式不回落 ⇒ 子代理的每次文件写入都失败，反复重试耗尽轮次。
+        # 真机症状：agent team 的子代理状态是 stopped、任务一直 pending。
+        #
+        # 校验仍然在**这里**做完（safe_workspace_path / 门禁 / mode），
+        # 服务侧会再校验一次（纵深，不是替代）。
+        backend = _selected_backend()
+        if backend is not None and backend.name != "inproc":
+            rel = _workspace_rel(user_id, target, root)
+            try:
+                handled, note = await backend.write_file(
+                    user_id, rel, content, mode=mode, root="",
+                )
+                if handled:
+                    return True, note
+                # 降级（auto）或 off：返回 False 让调用方走进程内
+                return False, note
+            except SandboxUnavailable as exc:
+                return False, self._handle_unavailable(exc.reason)
+            except SandboxError as exc:
+                return True, f"[sandbox] {exc}"
+            finally:
+                self._log_routed("file_write", user_id,
+                                 f"backend {backend.name}", f"{rel}, mode={mode}")
+
         target.parent.mkdir(parents=True, exist_ok=True)
         text = content if isinstance(content, str) else str(content)
         existing = ""
@@ -526,6 +585,28 @@ class SandboxManager:
                           "请提供更长、更具体的上下文。")
 
         updated = full.replace(old_content, new_content, 1)
+
+        # ★ backend 分发（与 write_file 同一处缺口，见那边的注释）。
+        #
+        # 唯一性判定已经在上面做完（occurrences 检查），所以这里发过去的
+        # `old` 一定唯一 —— 服务侧的 replace(…, 1) 与这里语义一致。
+        backend = _selected_backend()
+        if backend is not None and backend.name != "inproc":
+            rel = _workspace_rel(user_id, target, root)
+            try:
+                handled, note = await backend.patch_file(
+                    user_id, rel, old_content, new_content, root="",
+                )
+                if handled:
+                    return True, note
+                return False, note
+            except SandboxUnavailable as exc:
+                return False, self._handle_unavailable(exc.reason)
+            except SandboxError as exc:
+                return True, f"[sandbox] {exc}"
+            finally:
+                self._log_routed("file_patch", user_id,
+                                 f"backend {backend.name}", rel)
 
         import pathlib
         host_ws = _host_workspace(user_id, root)      # 含 write_root

@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 from .archive import VolBackend, pack_dir, unpack_dir
 from .executor import ExecResult, get_executor
 from .pool import SlotBusy, SlotPool
-from .workspace import PathSecurityError, make_resolver
+from .workspace import PathSecurityError, make_resolver, resolve_in_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,7 @@ _configure_logging()
 # ---- 常量（照 Aivory 的护栏做法，见方案 §3.0）----
 
 MAX_CODE_BYTES = 1024 * 1024          # 1 MiB
+MAX_CONTENT_BYTES = 4 * 1024 * 1024   # 4 MiB（写文件；比 code 宽，正文可能较大）
 MAX_TIMEOUT_S = 600.0                 # 10 分钟上限
 DEFAULT_TIMEOUT_S = 120.0
 MIN_TIMEOUT_S = 1.0
@@ -367,6 +368,33 @@ class ExecResponse(BaseModel):
     truncated: bool
 
 
+class WriteBody(BaseModel):
+    """写文件请求。
+
+    ⚠️ `path` 是**相对 workspace 根**的路径，不是容器内的 `/ws/...`，
+    也不是宿主绝对路径。理由见 `workspace.resolve_in_workspace`。
+    """
+
+    path: str
+    content: str
+    mode: str = "overwrite"      # overwrite | append | prepend
+    # 同 ExecBody：只用于检测冲突，绝不作为身份来源
+    user_id: str | None = None
+
+
+class WriteResponse(BaseModel):
+    path: str
+    chars: int
+    mode: str
+
+
+class PatchBody(BaseModel):
+    path: str
+    old: str
+    new: str
+    user_id: str | None = None
+
+
 # ---------------------------------------------------------------- 路由
 
 
@@ -470,3 +498,137 @@ async def exec_code(
         duration_ms=result.duration_ms,
         truncated=result.truncated,
     )
+
+# ---------------------------------------------------------------- 文件写
+
+
+def _conflict_guard(body_user_id: str | None, user_id: str) -> None:
+    """请求体里的 user_id 与认证身份冲突 → 403。
+
+    与 `exec_code` 同一条规则：身份只能来自认证，请求体里带的只用来
+    **检测冲突**（静默忽略会让人以为身份被接受了，排查时找不到线索）。
+    """
+    if body_user_id is not None and body_user_id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"请求体 user_id={body_user_id!r} 与认证身份不符。"
+                "用户身份只能由 app 服务端通过 X-HLZ-User 声明。"
+            ),
+        )
+
+
+@app.post("/v1/write", response_model=WriteResponse)
+async def write_file(
+    body: WriteBody,
+    user_id: Annotated[str, Depends(authenticate)],
+) -> WriteResponse:
+    """把内容写进该用户 workspace（服务侧）。
+
+    ## 为什么服务侧要自己做路径校验
+
+    app 已经校验过一次（`safe_workspace_path`），但这里**仍要校验**：
+    调用方可能被攻破，也可能有别的入口直连。只信调用方等于开放任意写。
+    见 `workspace.resolve_in_workspace` 的 docstring。
+
+    ## 错误映射
+
+    - 400 路径越界 / 非法参数
+    - 401 认证失败
+    - 403 身份冲突
+    - 413 内容过大
+    """
+    _conflict_guard(body.user_id, user_id)
+
+    mode = (body.mode or "overwrite").strip().lower()
+    if mode not in ("overwrite", "append", "prepend"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"不支持的 mode: {mode!r}（overwrite/append/prepend）",
+        )
+
+    content = body.content if isinstance(body.content, str) else str(body.content)
+    if len(content.encode("utf-8")) > MAX_CONTENT_BYTES:
+        raise HTTPException(
+            status_code=413, detail=f"content 超过 {MAX_CONTENT_BYTES} 字节"
+        )
+
+    try:
+        target = resolve_in_workspace(user_id, body.path)
+    except PathSecurityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        existing = ""
+        if mode != "overwrite" and target.exists():
+            existing = target.read_text(encoding="utf-8", errors="replace")
+        if mode == "append":
+            new_text = existing + content
+        elif mode == "prepend":
+            new_text = content + existing
+        else:
+            new_text = content
+
+        # 先写临时文件再 rename：避免部分写入被当成完整文件
+        tmp = target.with_name(target.name + ".hlz-tmp")
+        tmp.write_text(new_text, encoding="utf-8")
+        tmp.replace(target)
+    except OSError as exc:
+        # 磁盘满 / 权限 / 路径被占：是服务端问题，不是参数问题
+        logger.warning("写入失败 user=%s path=%s", user_id, body.path, exc_info=True)
+        raise HTTPException(
+            status_code=507, detail=f"写入失败：{exc.__class__.__name__}: {exc}"
+        ) from exc
+
+    rel = body.path.strip().lstrip("/")
+    logger.info("文件写入 user=%s path=%s chars=%d mode=%s",
+                user_id, rel, len(new_text), mode)
+    return WriteResponse(path=rel, chars=len(new_text), mode=mode)
+
+
+@app.post("/v1/patch", response_model=WriteResponse)
+async def patch_file(
+    body: PatchBody,
+    user_id: Annotated[str, Depends(authenticate)],
+) -> WriteResponse:
+    """把文件里的第一处 `old` 替换成 `new`。
+
+    语义与 app 侧的 `file_patch` 一致：**只替换第一处**，找不到就 409
+    （不是静默成功 —— 那会让模型以为改好了）。
+    """
+    _conflict_guard(body.user_id, user_id)
+
+    if not body.old:
+        raise HTTPException(status_code=422, detail="old 不能为空")
+
+    try:
+        target = resolve_in_workspace(user_id, body.path)
+    except PathSecurityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {body.path}")
+
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=507, detail=f"读取失败：{exc}") from exc
+
+    if body.old not in text:
+        raise HTTPException(
+            status_code=409,
+            detail="要替换的内容不存在（file_patch 只替换第一处，找不到即失败）",
+        )
+
+    updated = text.replace(body.old, body.new, 1)
+    try:
+        tmp = target.with_name(target.name + ".hlz-tmp")
+        tmp.write_text(updated, encoding="utf-8")
+        tmp.replace(target)
+    except OSError as exc:
+        raise HTTPException(status_code=507, detail=f"写入失败：{exc}") from exc
+
+    rel = body.path.strip().lstrip("/")
+    logger.info("文件修改 user=%s path=%s chars=%d", user_id, rel, len(updated))
+    return WriteResponse(path=rel, chars=len(updated), mode="patch")
