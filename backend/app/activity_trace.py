@@ -114,7 +114,7 @@ class ActivityTrace:
     """
 
     __slots__ = ("generation_id", "turn_label", "_t0", "_buf", "_lock",
-                 "_pending_text", "_pending_reason", "_last_flush")
+                 "_pending", "_last_flush")
 
     def __init__(self, generation_id: str = "", turn_label: str = "") -> None:
         self.generation_id = generation_id
@@ -122,8 +122,12 @@ class ActivityTrace:
         self._t0 = time.monotonic()
         self._buf: list[dict[str, Any]] = []
         self._lock = threading.Lock()
-        self._pending_text = 0
-        self._pending_reason = 0
+        # 聚合缓冲按 (kind, agent) 分桶。
+        # 为什么必须带 agent：4 个子代理并行时，若只按 kind 分桶，日志里全是
+        # `action=thinking brief=+450 字`，看不出是哪个 agent 写的 ——
+        # 而「谁在干活 / 谁卡住」正是多代理场景最需要的信息
+        # （2026-11-20 真机 4 子代理演示抓出来的缺口）。
+        self._pending: dict[tuple[str, str], int] = {}
         self._last_flush = self._t0
 
     def offset_ms(self) -> float:
@@ -155,8 +159,15 @@ class ActivityTrace:
                 text = detail.get("text", "")
             else:
                 text = detail if isinstance(detail, str) else ""
+            # 子代理事件用 name 当 agent 归属；根代理固定 "root"。
+            agent = name or ("root" if not action.startswith("sub.") else "sub")
+            # ⚠️ kind 必须是 "thinking"，不能写成 "reasoning" ——
+            # `_flush_locked` 拿 kind 当 action 名落盘，改名会让跨轮日志
+            # 无法对比（2026-11-20 实测踩过：run1 是 thinking、run2 变成
+            # reasoning，核验脚本对同一份文档算出两个数）。
             self.record_text(
-                "reasoning" if base == "thinking_delta" else "text", str(text))
+                "thinking" if base == "thinking_delta" else "text",
+                str(text), agent)
             return
         # 容器事件本身没有语义（它的内容由内部的 sub.* 事件表达），
         # 记一条空的只是噪音 —— 实测一次运行里 1/3 的行是这种空 brief。
@@ -173,17 +184,15 @@ class ActivityTrace:
             self._buf.append(row)
         self._emit(row)
 
-    def record_text(self, kind: str, text: str) -> None:
-        """记一段正文/思考增量。只累加字数，到窗口才落一行。"""
+    def record_text(self, kind: str, text: str, agent: str = "root") -> None:
+        """记一段正文/思考增量。按 (kind, agent) 累加，到窗口才落一行。"""
         if not enabled() or not text:
             return
         n = len(text)
         now = time.monotonic()
+        key = (kind, agent or "root")
         with self._lock:
-            if kind == "reasoning":
-                self._pending_reason += n
-            else:
-                self._pending_text += n
+            self._pending[key] = self._pending.get(key, 0) + n
             if (now - self._last_flush) * 1000.0 >= _FLUSH_MS:
                 self._flush_locked(now)
 
@@ -207,13 +216,12 @@ class ActivityTrace:
         if not force and (now - self._last_flush) * 1000.0 < _FLUSH_MS:
             return
         off = (now - self._t0) * 1000.0
-        for kind, attr in (("text", "_pending_text"),
-                           ("thinking", "_pending_reason")):
-            n = getattr(self, attr)
+        pending = dict(self._pending)
+        self._pending.clear()
+        for (kind, agent), n in pending.items():
             if not n:
                 continue
-            setattr(self, attr, 0)
-            row = {"t": off, "action": kind, "brief": f"+{n} 字"}
+            row = {"t": off, "action": kind, "brief": f"{agent} +{n} 字"}
             self._buf.append(row)
             self._emit(row)
         self._last_flush = now

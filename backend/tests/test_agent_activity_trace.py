@@ -193,3 +193,89 @@ def test_sub_prefixed_streaming_detail_as_string():
     total = sum(int(re.search(r"\+(\d+)", r["brief"]).group(1))
                 for r in rows if re.search(r"\+(\d+)", r["brief"]))
     assert total == 30, f"子代理裸字符串字数算错：{total}"
+
+
+def test_aggregated_text_keeps_agent_attribution():
+    """★ 聚合后的字数行必须带**哪个子代理**在写。
+
+    ## 这是真机 4 子代理演示抓出来的缺口
+
+    聚合按「类型」分桶（_pending_text / _pending_reason），但没有按 agent 分桶。
+    于是 4 个子代理并行时，日志里全是：
+
+        action=thinking brief=+450 字
+
+    无法回答「这 450 字是 query_scale 还是 query_penetration 写的」——
+    而那正是多代理场景下最需要的信息（谁在干活、谁卡住）。
+
+    修法：聚合缓冲按 (kind, agent) 分桶，落盘时带上 agent。
+    """
+    tr = at.ActivityTrace(generation_id="g_attr")
+    for _ in range(5):
+        tr.record("sub.text_delta", name="query_scale", detail="abcdef")
+    for _ in range(3):
+        tr.record("sub.text_delta", name="query_penetration", detail="xyz")
+    tr.flush()
+    rows = at.drain_for_test()
+    joined = " ".join(r["brief"] for r in rows)
+    assert "query_scale" in joined, f"聚合行丢了 query_scale 归属：{rows}"
+    assert "query_penetration" in joined, f"聚合行丢了 query_penetration 归属：{rows}"
+
+
+def test_aggregated_buckets_are_per_agent_not_merged():
+    """两个 agent 的字数不能合并成一条（否则看不出各自产出）。"""
+    tr = at.ActivityTrace(generation_id="g_bucket")
+    tr.record("sub.text_delta", name="a1", detail="x" * 100)
+    tr.record("sub.text_delta", name="a2", detail="y" * 50)
+    tr.flush()
+    rows = at.drain_for_test()
+    sizes = []
+    for r in rows:
+        m = re.search(r"\+(\d+)", r["brief"])
+        if m:
+            sizes.append(int(m.group(1)))
+    assert sorted(sizes) == [50, 100], (
+        f"两个 agent 的字数被合并成 {sizes}，应分别为 50 与 100")
+
+
+def test_root_agent_text_still_has_label():
+    """根代理自己的字数行也要能识别（不能与子代理混在一起）。"""
+    tr = at.ActivityTrace(generation_id="g_rootfb")
+    tr.record("text_delta", detail="z" * 30)
+    tr.flush()
+    rows = at.drain_for_test()
+    assert rows
+    assert "root" in rows[0]["brief"], f"根代理的字数行没有标识：{rows[0]}"
+
+
+def test_sub_tool_events_keep_agent_name():
+    """子代理的工具调用行必须能看出是哪个 agent 调的工具。"""
+    tr = at.ActivityTrace(generation_id="g_toolattr")
+    tr.record("sub.tool_start", name="query_scale",
+              detail={"query": "metric_search"})
+    rows = at.drain_for_test()
+    assert rows
+    assert "query_scale" in rows[0]["brief"], (
+        f"工具调用行看不出是哪个 agent：{rows[0]}")
+
+
+def test_thinking_action_name_is_stable():
+    """★ 思考流的 action 名必须是 `thinking`，不能变成 `reasoning`。
+
+    ## 这是真机跨轮对比暴露的日志契约破坏
+
+    run1 的时间轴是 `action=thinking`，改了一版聚合后 run2 变成
+    `action=reasoning`。后果：同一份核验脚本对同一篇文档算出两个数
+    （思考字数 72,470 vs 0），看起来像文档写错了，实际是日志改名。
+
+    日志是**跨轮对比**的依据，action 名必须稳定。
+    """
+    tr = at.ActivityTrace(generation_id="g_kind")
+    tr.record("thinking_delta", detail="x" * 10)
+    tr.record("sub.thinking_delta", name="a1", detail="y" * 10)
+    tr.flush()
+    rows = at.drain_for_test()
+    actions = {r["action"] for r in rows}
+    assert "thinking" in actions, f"思考流的 action 名不是 thinking：{actions}"
+    assert "reasoning" not in actions, (
+        f"出现了 reasoning —— 日志契约被破坏，跨轮对比会失效：{actions}")
