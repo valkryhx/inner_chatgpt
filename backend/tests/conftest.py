@@ -212,7 +212,50 @@ def _reset_app_sandbox_singletons():
         yield
         return
 
-    def _clear():
+    def _clear(*, destroy: bool = True):
+        """重置单例。**teardown 时必须先销毁池里的容器**。
+
+        ## 为什么不能只 `_manager = None`（2026-11-20 实测事故）
+
+        `ContainerPool` 是**模块级单例**（`pool._pool`），它比 `_manager`
+        活得久。只把 `_manager` 置 None，池里 `_entries` 登记的容器 ID
+        就再没人能拿到 —— 而 `pool.shutdown()` 是唯一会 destroy 它们的地方。
+        于是每跑一轮走 Docker 路径的测试，Docker 里就多一个
+        `sleep infinity` 容器。
+
+        真机后果：本机积了 **59 个 `hlz_sbx_*`**（57 running），
+        其中 58 个挂载的是 `pytest-of-.../pytest-NNNN/` 临时目录 ——
+        每轮 pytest 一个。因为每容器真实写入只有 4.1kB，内存上看不出来，
+        一直泄漏到 1711 轮才发现。
+
+        ## 为什么 `setup` 也 destroy
+
+        setup 时池里若还有容器，说明上一轮没清干净（比如上一个用例抛了
+        SystemExit）。销毁它们比留着安全 —— 这些容器是测试专用的，
+        宿主 workspace 指向 tmp_path，本来就不该活过一轮。
+
+        ## 为什么经由 `leak_guard` 而不是直接 `asyncio.run(pool.shutdown())`
+
+        **裸 shutdown 会挂死。** `shutdown()` 里是 `async with self._lock`；
+        若锁在上一个事件循环里被某个中途退出的协程持有（`acquire()` 后
+        没 `release`），新循环的 `acquire()` 会**永久等待**。实测
+        （`work/_probe_lock4.py`）：`locked=True` 时 `wait_for(3s)` 直接
+        TIMEOUT —— 裸 await 就是整个 pytest 会话卡死，比泄漏容器严重得多。
+
+        `leak_guard.release_pool_sync` 带超时，拿不到锁就放弃销毁并打
+        WARNING，保证 teardown 一定往下走。
+
+        另外：跨事件循环本身是安全的 —— `asyncio.Lock` 在有竞争时才会
+        绑定 loop，而即便绑定了旧 loop，新循环里 acquire 仍然能成功
+        （实测 `work/_probe_lock2.py`）。真正的风险只有「锁已被持有」。
+        """
+        if destroy:
+            try:
+                from app.sandbox import leak_guard
+                leak_guard.release_pool_sync(
+                    sbx_manager.get_pool(), timeout_s=30.0)
+            except Exception:  # noqa: BLE001 - 清理失败绝不能阻断 teardown
+                pass
         sbx_config._cached = None
         sbx_manager._manager = None
 
