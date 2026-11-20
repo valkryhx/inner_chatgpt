@@ -91,6 +91,7 @@ def main() -> int:
 
     started = time.time()
     last = ""
+    warned_no_runs = False
     while time.time() - started < TIMEOUT:
         time.sleep(10)
         el = int(time.time() - started)
@@ -100,7 +101,23 @@ def main() -> int:
             print(f"[{el:3d}s] team 查询 {e.code}")
             continue
         tasks = team.get("tasks") or []
-        runs = team.get("runs") or team.get("agents") or []
+        # ⚠️ `GET /team` **不返回 `runs`**（见 routers/team.py:65-78，只有
+        # team / tasks / events / messages）。第一版写的是：
+        #
+        #     runs = team.get("runs") or team.get("agents") or []
+        #
+        # 于是 `runs` 恒为空列表 —— **探针对子代理状态完全是盲的，却不报错**。
+        # 日志里只有 task 状态变化，看起来"在工作"，实际一次都没看到子代理。
+        #
+        # 这是「缺字段静默降级」的典型危害：探针看起来正常，只是什么都没测。
+        # 正确做法：字段缺失就**明确报一次**（不静默），并说明该从哪取。
+        runs = team.get("runs")
+        if runs is None:
+            runs = []
+            if not warned_no_runs:
+                print("  ⚠️ /team 不返回 runs，子代理状态本探针看不到 ——"
+                      "请另查 subagent_runs 表。后续不再重复提示。")
+                warned_no_runs = True
         bits = []
         for t in tasks:
             bits.append(f"{str(t.get('subject',''))[:12]}={t.get('status')}")
