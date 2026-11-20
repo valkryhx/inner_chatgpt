@@ -10,11 +10,16 @@
 问题不是「慢」本身，而是**慢在哪一段完全看不见**：线上只会看到「今天好像变卡了」，
 没有任何字段能定位。这个模块把前奏切成有名字的段，最后汇总成**一行结构化日志**：
 
-    chat.prelude user=u_xxx session=co_xxx gen=g_x turns=1 total_ms=241
-        add_msg=12 runtime=8 sanitize=3 soft=0 soft_called=0 hard=1
-        build_turn=214 team=2 first_frame=241 deferred=0
+    chat.prelude user=u_xxx session=co_xxx gen=g_x first_frame=241ms turn=241ms
+        add_msg=12 runtime=8 sanitize=3 soft=0 soft_n=0 hard=1
+        build_turn=214 team=2 deferred_n=0
 
 这样「首帧为什么慢」从猜测变成一个可以 grep 的数字。
+
+⚠️ **`turn_ms` 不是首帧耗时**：`emit()` 在 `_event_stream` 的 `finally` 里，
+也就是整轮结束时才输出。真正的首帧耗时看 `first_frame_ms`。
+两者在短会话里接近，在 agent team 会话里能差几百倍
+（2026-11-20 实测：`first_frame_ms` = 10.8，`turn_ms` = 1,465,098）。
 
 设计取舍
 --------
@@ -121,7 +126,15 @@ class PreludeTimer:
             fields[name] = round(ms, 1)
         for name, n in self._counts.items():
             fields[f"{name}_n"] = n
-        fields["total_ms"] = round(self.elapsed_ms(), 1)
+        # ★ 字段名必须自证，否则一定被误读（2026-11-20 实测代价：两次误判
+        # 「前奏跑了 24 分钟」并据此设计了整套无用方案）。
+        #
+        # `emit()` 在 `_event_stream` 的 finally 里执行，也就是**整轮结束**时，
+        # 所以这里量到的是整轮，不是首帧。名字必须写清楚。
+        fields["turn_ms"] = round(self.elapsed_ms(), 1)
+        # 真正的首帧时刻（第一个 message_start 之后 mark 的）。
+        # 没有 mark 过（例如在首帧之前就异常退出）时输出 -1，不要伪装成 0。
+        fields["first_frame_ms"] = round(self._marks.get("first_frame", -1.0), 1)
         if self._exc:
             fields["exc"] = "; ".join(f"{k}={v}" for k, v in self._exc.items())
         return fields
@@ -133,10 +146,11 @@ class PreludeTimer:
         try:
             logger.log(
                 level,
-                "首帧前奏 user=%s session=%s gen=%s total=%.0fms",
+                "首帧前奏 user=%s session=%s gen=%s first_frame=%.0fms turn=%.0fms",
                 self.user_id or "-",
                 self.session_id or "-",
                 (self.generation_id or "-")[:12],
+                self._marks.get("first_frame", -1.0),
                 self.elapsed_ms(),
                 extra={
                     "event": "chat.prelude",

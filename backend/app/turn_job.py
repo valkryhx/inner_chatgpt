@@ -66,6 +66,7 @@ import itertools
 import json
 import logging
 import os
+import time
 from collections import deque
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
@@ -105,6 +106,37 @@ _STREAM_END = object()
 # 0 或负数表示关闭。用注释行（`:` 开头）而非事件：SSE 客户端按规范必须跳过，
 # 不会触发任何 onEvent 分支，也不会占用 seq。
 HEARTBEAT_IDLE_S = float(os.environ.get("HLZ_TURNJOB_HEARTBEAT_IDLE_S", "15"))
+
+# ★ 看门狗：整轮**闲置**多久就判定卡死并中止（秒）。
+#
+# ## 为什么必须有（2026-11-20 真机事故）
+#
+# 会话 `co_f49ca93ebc14` 的 `_event_stream` 卡在一个永不返回的 `await` 上：
+# 租约 `active` 持续 20 分钟、消息永远 `streaming`、`finally` 里的
+# `prelude.emit()` 从未执行 —— 没有异常、没有超时、没有被取消，**静默挂死**。
+# 手动改 DB 状态也没用，生成器还挂在事件循环里。
+#
+# 后果比 507 严重：507 会报错让子代理重试；这条是用户看到一条永不结束的回复、
+# 任务永久被占用。
+#
+# ## 为什么是「闲置」而不是「总时长」
+#
+# 合法长任务确实存在：软线压缩调 LLM + MCP 冷启动实测可达 18 分钟
+# （`co_f5276a34b01b` 那次 671s+325s）。用总时长上限会把它们砍断。
+# 闲置超时的语义是：**只要还有帧产出/进展，就一直允许跑下去**；
+# 只有「连着 N 分钟一点动静都没有」才中止。这与 `HEARTBEAT_IDLE_S`
+# 的「静默计时」是同一种设计。
+#
+# ## 30 分钟怎么来的
+#
+# - 实测最慢的合法前奏：106 万 ms ≈ 17.9 分钟（`co_f5276a34b01b`）
+# - 一次 `code_run` 的上限是 10 分钟（`MAX_TIMEOUT_S`）
+# - 两者叠加仍需余量 ⇒ 取下限 30 分钟
+#
+# 太短会砍掉正常任务；太长则用户等不起（真实事故卡 20 分钟没人发现）。
+# 0 或负数表示关闭（给需要无限长任务的调用方留口子，测试也用它）。
+DEFAULT_IDLE_TIMEOUT_S = float(
+    os.environ.get("HLZ_TURNJOB_IDLE_TIMEOUT_S", "1800"))
 
 # 心跳注释帧。**不带 id:** —— 它不是真事件，不该推进续看游标。
 _HEARTBEAT_FRAME = ": keep-alive\n\n"
@@ -210,6 +242,33 @@ class TurnJob:
         # 读取**此刻** blocks 的回调，由 _event_stream 提供（持有就地 append 的那个
         # 列表引用）。sync 时用它序列化最新状态 —— 见模块头「为什么不存已落库的快照」。
         self.blocks_provider: Callable[[], list[dict]] = lambda: []
+        # ---- 看门狗 ----
+        #
+        # `_last_progress` 是「上一次有进展」的单调时钟读数。**每个 publish()
+        # 都重置它** —— 看门狗据此区分「慢但活着」与「卡死」。
+        #
+        # 为什么用 monotonic：挂钟会被 NTP 跳变影响，而这里判的是时长。
+        self._last_progress: float = time.monotonic()
+        # 是否被看门狗中止过 + 原因。**必须留痕** —— 否则「为什么这条消息是
+        # stopped」与用户主动停止在库里完全一样，无从查起。
+        self.watchdog_fired: bool = False
+        self.watchdog_reason: str = ""
+        # 真正跑生成的那个任务（看门狗 cancel 它）。
+        # 与 `self.task`（整个 job 生命周期）分开，理由见 `start_job` 里的注释。
+        self.main_task: Optional[asyncio.Task] = None
+        # ---- 工具执行中的计数（对齐 CC319 的 stall watchdog deferred）----
+        #
+        # CC 在 `m0779:7994` 明确写着：
+        #
+        #     [AsyncAgent <id>] stall watchdog deferred — N tool(s) in flight
+        #     (toolUseIds=...)
+        #
+        # 即**有工具在跑时不判卡死**，并重新排一次计时。
+        #
+        # 为什么这条对我们尤其重要：一次 `code_run` 可以跑到 10 分钟
+        # （`MAX_TIMEOUT_S`），期间**大概率零输出帧**（工具还没返回）。
+        # 只看「零帧 N 秒」会把这种合法执行砍掉 —— 而它正是子代理干活的主力形态。
+        self.tool_in_flight: int = 0
 
     # ---------------------------------------------------------------- 重放
 
@@ -295,11 +354,50 @@ class TurnJob:
 
     def publish(self, frame: str) -> None:
         """把一帧发给所有订阅者，并留进重放缓冲。没有订阅者时只进缓冲。"""
+        # ★ 心跳：每帧都算「有进展」。看门狗靠这个区分「慢但活着」与「卡死」。
+        #   放在最前面 —— 即使后面 push 出错，也确实产出过帧。
+        self._last_progress = time.monotonic()
         self.seq += 1
         frame = self._rewrite_seq(frame, self.seq)
         self._buffer(self.seq, frame)
         for sub in list(self.subscribers):
             sub.push(frame)
+
+    def idle_seconds(self) -> float:
+        """距离上一次有进展过了多久（秒）。诊断与测试用。"""
+        return time.monotonic() - self._last_progress
+
+    def set_tool_in_flight(self, n: int) -> None:
+        """设置「正在执行的工具数」。对齐 CC 的 `Fe`（`m0779:7986-7999`）。
+
+        ## 为什么这条是必需的
+
+        一次 `code_run` 可以跑十分钟，期间**零输出帧**。若看门狗只看
+        「零帧太久」，这种合法执行会被当成卡死砍掉 —— 而它恰是干活的主力形态。
+        CC 的处理是：超时触发时若 `Fe.size > 0` 就 **deferred + 重排**
+        （延迟一轮继续等），而不是判死。
+
+        ## 为什么在这里也刷新进展时刻
+
+        「工具开始」和「工具结束」都是真实的进展事件。如果只在工具结束时刷新，
+        一个持续 10 分钟的工具会在第 10 分钟才第一次刷新 —— 前面的时间全靠
+        deferred 兜着，语义上是「不知道在不在跑」而不是「知道在跑」。
+        刷新后 `idle_seconds()` 能如实反映「刚刚还有动作」。
+
+        负数钳到 0：多减一次会让保护永久失效（`test_..._clamped_at_zero`）。
+        """
+        self.tool_in_flight = max(0, int(n))
+        self._last_progress = time.monotonic()
+
+    def mark_watchdog(self, reason: str) -> None:
+        """记下「被看门狗中止」这件事。
+
+        必须在 cancel 之前调（cancel 之后协程可能在别的线程/时刻退出，
+        顺序不保证）。留痕是为了让「这条消息为什么是 stopped」可查 ——
+        否则它与用户主动停止在库里完全一样。
+        """
+        self.watchdog_fired = True
+        self.watchdog_reason = reason
 
     def set_blocks_provider(self, provider: Callable[[], list[dict]]) -> None:
         """注册「读此刻 blocks」的回调。
@@ -388,29 +486,143 @@ def has_live_job_for_session(session_id: str, user_id: Optional[str] = None) -> 
 
 
 def start_job(job: TurnJob,
-              runner: Callable[[TurnJob], Awaitable[None]]) -> TurnJob:
+              runner: Callable[[TurnJob], Awaitable[None]],
+              *, idle_timeout_s: float | None = None) -> TurnJob:
     """建 job 表项并启动任务。
 
     调用方应当**先** `attach()` 再 `start_job()`：订阅者先就位，job 的第一帧
     才不会漏（task 在下一个 await 点之前不会运行）。
+
+    Args:
+        idle_timeout_s: 整轮**闲置**超过这么久就判定卡死并中止。
+            None（默认）用 `DEFAULT_IDLE_TIMEOUT_S`；0 或负数表示关闭看门狗。
+            详见 `DEFAULT_IDLE_TIMEOUT_S` 的注释（为什么是闲置而不是总时长）。
     """
     _JOBS[_key(job.user_id, job.session_id, job.generation_id)] = job
+    if idle_timeout_s is None:
+        idle_timeout_s = DEFAULT_IDLE_TIMEOUT_S
 
     async def _wrapped() -> None:
         try:
             await runner(job)
         except asyncio.CancelledError:
-            # 停止 / 关闭：不吞掉，但要把订阅者放掉，否则它们会一直等。
+            # 停止 / 关闭 / 看门狗：不吞掉，但要把订阅者放掉，否则它们会一直等。
             raise
         except Exception:  # noqa: BLE001
             logger.warning("turn job failed", exc_info=True)
         finally:
             job.finish()
 
-    task = asyncio.create_task(_wrapped(), name=f"turnjob:{job.generation_id}")
-    job.task = task
-    _JOB_TASKS.add(task)
-    task.add_done_callback(_JOB_TASKS.discard)
+    async def _watchdog() -> None:
+        """闲置超时就把主任务 cancel 掉。
+
+        ## 为什么是独立协程而不是 `wait_for(timeout=总时长)`
+
+        `asyncio.wait_for` 包的是**总时长**。合法长任务（软线压缩 + MCP 冷启动
+        实测 17.9 分钟、`code_run` 单次上限 10 分钟）会被误杀。
+
+        这里轮询 `job.idle_seconds()` —— 每 `publish()` 一帧就重置。
+        于是「慢但一直在输出」的任务永远不被杀，只有「连着 N 分钟零帧」
+        才中止。这正是区分「卡死」与「慢」的那个判据。
+
+        ## 为什么轮询间隔是 min(30, 阈值/4)
+
+        阈值可能被测试压到 0.1s，写死 30s 就永远不触发。同时上限 30s，
+        避免长阈值时无谓地频繁唤醒。
+        """
+        if idle_timeout_s <= 0:
+            return                       # 关闭
+        interval = max(0.02, min(30.0, idle_timeout_s / 4))
+        while True:
+            await asyncio.sleep(interval)
+            target = job.main_task
+            if target is None or target.done():
+                return                   # 主任务已结束，看门狗收工
+            idle = job.idle_seconds()
+            if idle < idle_timeout_s:
+                continue
+            # ★ 对齐 CC 的 deferred 分支（`m0779:7986-7999`）：
+            #   超时触发时若仍有工具在执行，**不判死**，继续等下一轮。
+            #
+            #   为什么这是必需的：一次 `code_run` 可以跑十分钟且零输出帧。
+            #   只看「零帧太久」会把这种合法执行砍掉。
+            #   CC 的原话是 `stall watchdog deferred — N tool(s) in flight`。
+            #
+            #   注意这是「延迟」不是「取消」：下一轮循环照常判定，
+            #   所以工具返回后如果仍然没进展，仍会被中止（见
+            #   `test_watchdog_fires_after_tool_returns`）。
+            if job.tool_in_flight > 0:
+                logger.info(
+                    "turn job watchdog deferred — %d tool(s) in flight, "
+                    "idle=%.0fs threshold=%.0fs | session=%s gen=%s",
+                    job.tool_in_flight, idle, idle_timeout_s,
+                    job.session_id, job.generation_id)
+                continue
+            reason = (
+                f"整轮闲置 {idle:.0f}s 超过阈值 {idle_timeout_s:.0f}s，"
+                f"判定卡死并中止（seq={job.seq}，已有帧数证明卡住前有进展）"
+            )
+            logger.warning("turn job watchdog: %s | session=%s gen=%s",
+                          reason, job.session_id, job.generation_id)
+            job.mark_watchdog(reason)
+            target.cancel()
+            return
+
+    async def _supervised() -> None:
+        """主任务 + 看门狗：只等主任务，看门狗作为旁路。
+
+        ## ⚠️ 第一版在这里写错了一次（反向确认抓出来的）
+
+        第一版是：
+
+            done, pending = await asyncio.wait(
+                {main_task, dog}, return_when=asyncio.FIRST_COMPLETED)
+            for t in pending:
+                t.cancel()
+
+        看起来"任一先结束就收另一个"很对称，实际有两个致命后果：
+
+        1. `idle_timeout_s=0`（关闭看门狗）时，`_watchdog()` 立即 `return`，
+           `FIRST_COMPLETED` 认为狗先完成 ⇒ **把正在正常跑的 main_task 砍掉**。
+           于是「关闭看门狗」变成了「所有任务跑不完」。
+        2. 看门狗完成但没 cancel 主任务时（注入缺陷测试的形态），
+           同样会误杀主任务 —— 使「只标记不中止」这个缺陷**测不出来**，
+           反向确认两个用例假绿。
+
+        正确结构是**单向**的：只 `await main_task`，狗作为旁路，
+        主任务收尾时把狗取消。
+
+           主任务卡住 → 狗 cancel 主任务 → await 抛 CancelledError → finally 收狗
+            主任务正常 → await 返回        → finally 收狗
+            狗关闭(return) → 完全不影响主任务 ✓
+        """
+        main_task = asyncio.create_task(_wrapped(), name=f"turnjob:{job.generation_id}")
+        # `job.main_task` 是**真正跑生成**的那个任务，看门狗 cancel 它。
+        #
+        # 为什么不复用 `job.task`：`job.task` 是「整个 job 生命周期」的句柄，
+        # 既有测试用 `await asyncio.wait_for(job.task, ...)` 等 job 收口。
+        # 若把它指成内层任务，`wait_for` 会在内层结束时提前返回，
+        # 而外层监督协程可能还没收完（4 条既有测试因此变红）。
+        # 两者语义不同，必须分开：`task` = 生命周期，`main_task` = 生成。
+        job.main_task = main_task
+        _JOB_TASKS.add(main_task)
+        main_task.add_done_callback(_JOB_TASKS.discard)
+        dog = asyncio.create_task(_watchdog(), name=f"turnjob-wd:{job.generation_id}")
+        try:
+            await main_task
+        finally:
+            if not dog.done():
+                dog.cancel()
+            # 等狗真正收尾，避免「任务已返回但看门狗还挂着一帧」
+            try:
+                await dog
+            except asyncio.CancelledError:
+                pass
+
+    outer = asyncio.create_task(_supervised(), name=f"turnjob-sup:{job.generation_id}")
+    job.task = outer
+    _JOB_TASKS.add(outer)
+    outer.add_done_callback(_JOB_TASKS.discard)
     # 兜底收口：`_wrapped` 的 finally 只在「协程真的开始执行过」时才跑。
     # 实测（`tools/turn_job_verify/lifecycle_probes.py` 的 P1）任务建好后、第一个 await 点之前
     # 就被 cancel 的话，协程体一行都不执行，finally 也就不会跑 —— job 会永远留在
@@ -421,9 +633,18 @@ def start_job(job: TurnJob,
     # 所以把它作为与执行路径无关的唯一兜底。`finish()` 幂等，两条路径都调无害。
     def _reap(_t: asyncio.Task, _job: "TurnJob" = job) -> None:
         _job.finish()
-        _job.task = None   # 断开 job <-> task 的引用环，不然要靠 gc 回收
+        # 外层监督任务结束后断开引用环。
+        #
+        # ⚠️ 这里置 None 有一个副作用要注意：既有测试
+        # （`test_job_survives_subscriber_detach` 等）用 `job.task is None`
+        # 判「job 已收口」。所以**必须保留**这一句。
+        #
+        # 但它不能在 `_supervised()` 返回前生效 —— 那时 main_task 可能还在跑
+        # （看门狗误杀路径）。`_supervised()` 的 finally 保证 main_task 已结束，
+        # 所以这里置 None 是安全的。
+        _job.task = None
 
-    task.add_done_callback(_reap)
+    outer.add_done_callback(_reap)
     return job
 
 

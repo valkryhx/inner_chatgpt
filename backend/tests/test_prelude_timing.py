@@ -78,11 +78,18 @@ def test_count_appears_as_suffix():
     assert t2.as_fields()["standalone_n"] == 1
 
 
-def test_total_ms_present():
+def test_turn_ms_present():
+    """整轮耗时字段（原 `total_ms`，2026-11-20 改名）。
+
+    改名原因：它在 `finally` 里量的是**整轮**，旧名与「首帧前奏」的文案
+    矛盾，两次导致把 24.4 分钟的整轮误读成前奏耗时。
+    见 `test_prelude_field_naming.py`。
+    """
     t = PreludeTimer()
     with t.span("a"):
         pass
-    assert "total_ms" in t.as_fields()
+    assert "turn_ms" in t.as_fields()
+    assert "first_frame_ms" in t.as_fields()
 
 
 # --------------------------------------------------------------------------
@@ -215,7 +222,7 @@ def test_emit_fields_are_greppable(monkeypatch, caplog):
     assert extra["soft"] == 5000.0
     assert extra["soft_called_n"] == 1
     assert "first_frame" in extra
-    assert "total_ms" in extra
+    assert "turn_ms" in extra
 
 
 def test_generation_id_truncated_in_message_but_full_in_extra(monkeypatch):
@@ -273,4 +280,4 @@ def test_jsonl_formatter_renders_span_fields():
     assert payload["soft"] == 5000.0
     assert payload["soft_called_n"] == 1
     assert "first_frame" in payload
-    assert "total_ms" in payload
+    assert "turn_ms" in payload

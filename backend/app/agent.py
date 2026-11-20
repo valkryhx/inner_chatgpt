@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import time
 from typing import Any, Optional
 
 from . import db
@@ -22,6 +24,8 @@ from .builtin_tools import build_builtin_tools
 from .skill_store import build_skill_prompt
 from .subagent.prompts import ROOT_AGENT_HINT
 from .prompts_legacy import SYSTEM_PROMPT_LEGACY
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """你是 Hlaudz，一个中文智能 Agent，运行在多用户 Web 平台中，可以调用工具完成任务。
 
@@ -223,6 +227,11 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
         """
         name = srv.get("name") or srv.get("id") or "mcp"
         ts: MCPToolset | None = None
+        t0 = time.monotonic()
+
+        def _elapsed_ms() -> float:
+            return (time.monotonic() - t0) * 1000.0
+
         async with gate:
             try:
                 if srv.get("transport") == "builtin_demo":
@@ -242,6 +251,15 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
                 if ts.tools:
                     return name, ts, ts.status()
                 # 连上了但零工具 / 连接失败都在 ts.error 里
+                #
+                # ★ 这条必须打日志。tavily 的真实失败形态就是走到这里：
+                # 不抛异常，但 tools=0。旧实现完全静默，导致
+                # 「每轮冷启动白等 12 秒 + 少一个搜索源」长期无人发现
+                # （2026-11-20 实测 grep TimeoutError = 0）。
+                logger.warning(
+                    "MCP server 零工具 name=%s elapsed=%.0fms timeout=%.0fs err=%s",
+                    name, _elapsed_ms(), connect_timeout,
+                    ts.error or "该 server 没有暴露任何工具")
                 row = {
                     "name": name, "ok": False, "tool_count": 0,
                     "error": ts.error or "该 server 没有暴露任何工具", "tools": [],
@@ -249,6 +267,11 @@ async def build_user_toolset(user_id: str) -> MCPToolset:
                 await ts.__aexit__(None, None, None)
                 return name, None, row
             except Exception as e:  # noqa: BLE001
+                # ★ 同上：旧实现只把异常写进 manifest，不打日志。
+                # 排查「runtime 段为什么 12 秒」时这条缺失是绕远路的主因。
+                logger.warning(
+                    "MCP server 连接失败 name=%s elapsed=%.0fms timeout=%.0fs err=%s: %s",
+                    name, _elapsed_ms(), connect_timeout, type(e).__name__, e)
                 if ts is not None:
                     try:
                         await ts.__aexit__(None, None, None)

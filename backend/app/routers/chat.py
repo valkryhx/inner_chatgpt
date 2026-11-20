@@ -28,6 +28,7 @@ from ..subagent.context import AgentContext
 from ..subagent.session import build_turn_runtime, prepare_turn_team
 from ..logging_setup import team_event
 from ..prelude_timing import PreludeTimer, async_span
+from ..activity_trace import ActivityTrace
 from ..steer_queue import get_queue
 
 _SUBAGENT_EVENT_ID = "__subagent__"
@@ -371,6 +372,10 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     # 首帧前奏计时：从进入本生成器开始，到第一个 message_start 为止。
     # 只做 time.monotonic() 与一次汇总日志，不改任何行为（见 prelude_timing）。
     prelude = PreludeTimer(user_id, session_id, generation_id)
+    # 动作时间轴：每一轮「第几毫秒做了什么」落一行。
+    # 与 prelude 的区别：prelude 只回答「整轮多久」，回答不了
+    # 「这 24 分钟是活多还是卡住」—— 后者要时间轴（见 activity_trace 模块头）。
+    trace = ActivityTrace(generation_id, turn_label="root")
     # Register/capture the current streaming task at the very top.  The
     # prelude below can await runtime construction and compaction; registering
     # only after it would leave stop unable to cancel a request that is stuck
@@ -650,6 +655,10 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
 
         async for ev in events:
             et = ev["type"]
+            # ★ 时间轴：每个事件都先记一笔（含时间偏移与 50 字摘要）。
+            # 流式 text_delta / thinking_delta 会自动聚合，不会每帧一行。
+            trace.record(et, name=str(ev.get("name") or ""),
+                         detail=ev.get("input") or ev.get("text"))
             if et == "text_delta":
                 buffer.append(ev["text"])
                 _append_text(ev["text"])
@@ -691,6 +700,11 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
                 inner = ev.get("event") or {}
                 b = _sub_block(aid)
                 it = inner.get("type")
+                # ★ 子代理内部动作也要进时间轴 —— agent team 的耗时
+                # 绝大部分发生在子代理里，不记的话主时间轴只剩派单/收单两点，
+                # 中间十几分钟是空白。
+                trace.record(f"sub.{it}", name=str(inner.get("name") or aid),
+                             detail=inner.get("input") or inner.get("text"))
                 if it in ("text_delta", "thinking_delta"):
                     b["events"].append({"kind": "text" if it == "text_delta" else "reasoning",
                                         "text": inner.get("text", "")})
@@ -797,6 +811,18 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
             except Exception:  # noqa: BLE001 - 调度失败不能影响本轮结果
                 logger.warning("赛后压缩调度失败", exc_info=True)
     except asyncio.CancelledError:
+        # ★ 区分「用户主动停止」与「看门狗判定卡死中止」。
+        #
+        # 两者都是 CancelledError，但用户可见含义完全不同：
+        # - 主动停止：用户要的结果，静默即可
+        # - 看门狗中止：**异常情况**，必须留下可诊断痕迹
+        #
+        # 真机事故（`co_f49ca93ebc14`）里两者在库里长得一模一样，
+        # 排查时无法区分「是用户停的」还是「自己卡死的」。
+        if job is not None and getattr(job, "watchdog_fired", False):
+            logger.warning(
+                "本轮被看门狗中止（非用户停止）session=%s gen=%s reason=%s",
+                session_id, generation_id, job.watchdog_reason)
         terminal_status = "stopped"
         _finalize_and_persist_after_cancel(
             _finalize_sub_blocks,
@@ -812,6 +838,10 @@ async def _event_stream(user_id: str, session_id: str, text: str, generation_id:
     finally:
         # 前奏汇总日志：放在 finally 里，保证异常/取消路径也能拿到那一段的数字
         # （这些路径下「首帧为什么会慢/卡住」恰恰最需要证据）。
+        #
+        # ★ 收尾时间轴：把聚合中的正文/思考落成最后一行，
+        # 否则最后一批文字永远不会出现在日志里。
+        trace.flush()
         prelude.emit()
         # Cancellation-safe cleanup: synchronous releases happen before any
         # await, so a cancelled anyio scope cannot leak the Team quota.
