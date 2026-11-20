@@ -1,4 +1,25 @@
-"""写前必读门禁：未读拒绝、读片段拒绝、外部修改拒绝、追加放行。"""
+"""写前必读门禁（`ReadRegistry` 单元测试）。
+
+## ⚠️ 这个门禁已在 **工具层被摘除**（2026-11-20）
+
+本文件测的是 `ReadRegistry` 这个**类**的行为，它本身仍然可用、仍然正确。
+但 `file_write` / `file_patch` **不再调用 `check()`** ——
+见 `docs/20261120-删除写前必读门禁.md` 与 `tests/test_no_read_before_write.py`。
+
+摘除的理由（外部 + 真机双证据）：
+
+1. `claude-code-fable-5.2.md:133` 明确推翻了 Edit 的读前置：
+   "Edit works there without a prior Read"
+2. `DEFAULT_READ_LINES = 200` 让大文件的 `complete` 判定**恒为假**，
+   覆盖写被必然拒绝 —— 2026-11-20 跑 Agent Team 时 writer_c 实际卡在这
+
+保留文件而不删的理由：这个类仍有记录/比对能力，将来若要重做「冲突探测」
+（不是硬门禁，而是提示「你上次读之后文件被改过」）可以直接复用。
+
+两条工具级测试（`test_tool_write_without_read_is_rejected` /
+`test_tool_patch_requires_read`）已删除 —— 它们断言的正是被移除的行为，
+留着只会变成假的期望。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -98,14 +119,6 @@ def _tool(name: str, **kw):
     return {t.name: t for t in build_builtin_tools(user_id=UID, **kw)}[name]
 
 
-def test_tool_write_without_read_is_rejected(tmp_path, monkeypatch):
-    root = _ws(tmp_path, monkeypatch)
-    (root / "a.txt").write_text("old\n", encoding="utf-8")
-    out = asyncio.run(_tool("file_write").call({"path": "a.txt", "content": "new\n"}))
-    assert "file_read" in out
-    assert (root / "a.txt").read_text(encoding="utf-8") == "old\n"
-
-
 def test_tool_write_after_read_is_allowed(tmp_path, monkeypatch):
     root = _ws(tmp_path, monkeypatch)
     (root / "a.txt").write_text("old\n", encoding="utf-8")
@@ -133,9 +146,15 @@ def test_tool_new_file_does_not_require_read(tmp_path, monkeypatch):
     assert "已写入" in out
 
 
-def test_tool_patch_requires_read(tmp_path, monkeypatch):
+def test_tool_patch_allows_edit_without_prior_read(tmp_path, monkeypatch):
+    """★ 与提示词对齐：Edit 在 workspace 内不需要先读。
+
+    原测试断言的是「patch 必须 file_read」（`assert "file_read" in out`），
+    那条已被 `claude-code-fable-5.2.md:133` 推翻，改为断言反面。
+    """
     root = _ws(tmp_path, monkeypatch)
     (root / "a.txt").write_text("old\n", encoding="utf-8")
     out = asyncio.run(_tool("file_patch").call(
         {"path": "a.txt", "old_content": "old", "new_content": "new"}))
-    assert "file_read" in out
+    assert "已局部修改" in out, f"仍被门禁拦住：{out}"
+    assert (root / "a.txt").read_text(encoding="utf-8") == "new\n"

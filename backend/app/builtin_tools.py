@@ -157,8 +157,7 @@ def _with_budget(user_id: str, tool_name: str, text: str) -> str:
 
 # ---------------- file_read ----------------
 def _read_impl(user_id: str, path: str, start: int = 1, count: int = DEFAULT_READ_LINES,
-               keyword: str | None = None, show_linenos: bool = True,
-               registry: object | None = None) -> str:
+               keyword: str | None = None, show_linenos: bool = True) -> str:
     try:
         target = safe_read_path(user_id, path)
     except PathSecurityError as e:
@@ -180,8 +179,6 @@ def _read_impl(user_id: str, path: str, start: int = 1, count: int = DEFAULT_REA
             return f"未找到关键字 {keyword!r}（从第 {start} 行起）。文件共 {total} 行。"
         start = idx + 1
     end = min(total, start - 1 + count)
-    if registry is not None:
-        registry.record(target, complete=(start == 1 and not keyword and end >= total))
     chunk = all_lines[start - 1:end]
     if show_linenos:
         body = "\n".join(f"{start + i}|{line}" for i, line in enumerate(chunk))
@@ -192,7 +189,7 @@ def _read_impl(user_id: str, path: str, start: int = 1, count: int = DEFAULT_REA
 
 # ---------------- file_write ----------------
 def _write_impl(user_id: str, path: str, content: str, mode: str = "overwrite",
-                *, root: str = "", registry: object | None = None) -> str:
+                *, root: str = "") -> str:
     try:
         target = safe_workspace_path(user_id, path, root=root)
     except PathSecurityError as e:
@@ -200,10 +197,6 @@ def _write_impl(user_id: str, path: str, content: str, mode: str = "overwrite",
     mode = (mode or "overwrite").lower()
     if mode not in ("overwrite", "append", "prepend"):
         return _err(f"不支持的 mode: {mode}（overwrite/append/prepend）")
-    if mode == "overwrite" and target.exists() and registry is not None:
-        ok, reason = registry.check(target)
-        if not ok:
-            return _err(reason)
     target.parent.mkdir(parents=True, exist_ok=True)
     content = content if isinstance(content, str) else str(content)
     existing = ""
@@ -226,17 +219,13 @@ def _write_impl(user_id: str, path: str, content: str, mode: str = "overwrite",
 
 # ---------------- file_patch ----------------
 def _patch_impl(user_id: str, path: str, old_content: str, new_content: str,
-                *, root: str = "", registry: object | None = None) -> str:
+                *, root: str = "") -> str:
     try:
         target = safe_workspace_path(user_id, path, root=root)
     except PathSecurityError as e:
         return _err(str(e))
     if not target.is_file():
         return _err(f"文件不存在: {path}")
-    if registry is not None:
-        ok, reason = registry.check(target)
-        if not ok:
-            return _err(reason)
     if not old_content:
         return _err("old_content 不能为空")
     try:
@@ -424,9 +413,6 @@ def build_builtin_tools(
     from .memory_store import memory_enabled
 
     root = write_root or ""
-    from .read_registry import ReadRegistry
-
-    read_registry = ReadRegistry()
 
     async def file_read(args: dict) -> str:
         return _with_budget(user_id, "file_read", _read_impl(
@@ -436,7 +422,6 @@ def build_builtin_tools(
             count=int(args.get("count", DEFAULT_READ_LINES) or DEFAULT_READ_LINES),
             keyword=(args.get("keyword") or None),
             show_linenos=bool(args.get("show_linenos", True)),
-            registry=read_registry,
         ))
 
     async def file_write(args: dict) -> str:
@@ -449,14 +434,14 @@ def build_builtin_tools(
                 from .sandbox.manager import get_manager
                 handled, note = await get_manager().write_file(
                     user_id, str(args.get("path", "")), text,
-                    mode=mode, root=root, registry=read_registry,
+                    mode=mode, root=root,
                 )
                 if handled:
                     return note
                 # 降级（auto）：把「未隔离」标记拼在进程内结果前面，绝不静默
                 return note + "\n" + _write_impl(
                     user_id, str(args.get("path", "")), text, mode,
-                    root=root, registry=read_registry,
+                    root=root,
                 )
         except Exception as exc:  # noqa: BLE001
             # strict 下不回落进程内（否则等于没有沙箱）。返回失败结果，不向上抛
@@ -471,7 +456,6 @@ def build_builtin_tools(
             text,
             mode,
             root=root,
-            registry=read_registry,
         )
 
     async def file_patch(args: dict) -> str:
@@ -483,13 +467,13 @@ def build_builtin_tools(
                 from .sandbox.manager import get_manager
                 handled, note = await get_manager().patch_file(
                     user_id, str(args.get("path", "")), old_c, new_c,
-                    root=root, registry=read_registry,
+                    root=root,
                 )
                 if handled:
                     return note
                 return note + "\n" + _patch_impl(
                     user_id, str(args.get("path", "")), old_c, new_c,
-                    root=root, registry=read_registry,
+                    root=root,
                 )
         except Exception as exc:  # noqa: BLE001
             # strict 下不回落进程内（否则等于没有沙箱）。返回失败结果，不向上抛
@@ -504,7 +488,6 @@ def build_builtin_tools(
             old_c,
             new_c,
             root=root,
-            registry=read_registry,
         )
 
     async def list_files(args: dict) -> str:
@@ -656,7 +639,8 @@ def _build_tool_list(file_read, file_write, file_patch, list_files, code_run, lo
             "写入文件（workspace 内）。mode=overwrite(默认) | append | prepend；自动创建父目录。"
             "\n\n路径：**相对 workspace 根**直接写，如 `a.py`、`out/data.csv`，不需要也不要用"
             "绝对路径（绝对路径在沙箱内外指向不同位置，会写丢）。"
-            "\n\n覆盖已存在的文件前要先 file_read（硬门禁），否则会被拒绝。",
+            "\n\n覆盖已存在的文件**不需要**先 file_read（读前置已取消）。"
+            "但如果要保留原有内容的一部分，先读清楚再写，避免覆盖掉自己需要的东西。",
             {
                 "type": "object",
                 "properties": {
@@ -671,8 +655,8 @@ def _build_tool_list(file_read, file_write, file_patch, list_files, code_run, lo
         Tool(
             "file_patch",
             "在文件中把唯一的 old_content 替换为 new_content（必须唯一匹配；0 或多处都报错）。"
-            "\n\n使用顺序：先 file_read 看清当前内容（写入前必读是硬门禁），再给出"
-            "**足够长的、在本文件内唯一**的 old_content。太短会命中多处而被拒绝。",
+            "\n\n**不需要**先 file_read（读前置已取消）。给出**足够长的、在本文件内唯一**的 "
+            "old_content 即可；太短会命中多处而被拒绝。",
             {
                 "type": "object",
                 "properties": {

@@ -437,15 +437,19 @@ class SandboxManager:
         *,
         mode: str = "overwrite",
         root: str = "",
-        registry: object | None = None,
     ) -> tuple[bool, str]:
         """容器内写文件。返回 ``(handled, text)``。
 
         ⚠️ **所有校验仍在宿主进程做**（设计文档 §7.2）：
         - ``safe_workspace_path`` 路径越界；
-        - 写前必读门禁（``registry.check``）；
         - ``mode`` 合法性。
         容器只负责最终落盘 —— 容器内再校验是纵深，不是替代。
+
+        ⚠️ **不再有「写前必读」门禁**（2026-11-20 删除）：提示词层
+        `claude-code-fable-5.2.md:133` 明确推翻了 Edit 的读前置，
+        且 `DEFAULT_READ_LINES=200` 让大文件的 `complete` 判定必然为假
+        —— 门槛对大文件是**必然失败**，不是偶尔不便。
+        见 `docs/20261120-删除写前必读门禁.md`。
         """
         reason = await self._degrade_reason()
         if reason is not None:
@@ -461,10 +465,6 @@ class SandboxManager:
         mode = (mode or "overwrite").lower()
         if mode not in ("overwrite", "append", "prepend"):
             return True, f"错误：不支持的 mode: {mode}（overwrite/append/prepend）"
-        if mode == "overwrite" and target.exists() and registry is not None:
-            ok, why = registry.check(target)
-            if not ok:
-                return True, f"错误：{why}"
 
         # ★ backend 分发（方案 B）：service 后端把写操作交给沙箱服务。
         #
@@ -564,11 +564,11 @@ class SandboxManager:
         new_content: str,
         *,
         root: str = "",
-        registry: object | None = None,
     ) -> tuple[bool, str]:
         """容器内做 old→new 替换。返回 ``(handled, text)``。
 
-        校验全在宿主进程：路径、文件存在、写前必读门禁、唯一性判定。
+        校验全在宿主进程：路径、文件存在、唯一性判定。
+        （「写前必读」门禁已于 2026-11-20 删除，见 write_file 的说明。）
         **唯一性判定也在这里做**（不用容器内的 count），
         这样错误文案与进程内路径完全一致。
         """
@@ -584,10 +584,6 @@ class SandboxManager:
             return True, f"错误：{exc}"
         if not target.is_file():
             return True, f"错误：文件不存在: {path}"
-        if registry is not None:
-            ok, why = registry.check(target)
-            if not ok:
-                return True, f"错误：{why}"
         if not old_content:
             return True, "错误：old_content 不能为空"
         try:
