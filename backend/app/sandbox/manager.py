@@ -451,7 +451,8 @@ class SandboxManager:
         if reason is not None:
             return False, self._handle_unavailable(reason)
 
-        from ..workspace import PathSecurityError, display_path, safe_workspace_path
+        from ..workspace import (PathSecurityError, display_path, ensure_dir_shared,
+                                safe_workspace_path, user_workspace)
         try:
             target = safe_workspace_path(user_id, path, root=root)
         except PathSecurityError as exc:
@@ -476,6 +477,18 @@ class SandboxManager:
         # 服务侧会再校验一次（纵深，不是替代）。
         backend = _selected_backend()
         if backend is not None and backend.name != "inproc":
+            # ★ 父目录必须由 **app（root）** 建好并修权限，不能指望服务侧。
+            #
+            # 实测（2026-11-20 真机 hlzsbxprobe）：遗留目录是旧代码建的
+            #   755 root:1000  .subagents
+            #   755 root:root  .subagents/co_8d8bd184324a
+            # 沙箱服务跑 uid 1000，在 `755 root:root` 里：
+            #   mkdir → Permission denied
+            #   chmod → Operation not permitted   ← 连修都修不了
+            # 因为 chmod 要求「是属主或 CAP_FOWNER」，uid 1000 两者都没有。
+            # 所以「让服务侧顺手修祖先」这条思路本身不成立，必须 app 来做。
+            ensure_dir_shared(target.parent,
+                              boundary=user_workspace(user_id, create=False))
             rel = _workspace_rel(user_id, target, root)
             try:
                 handled, note = await backend.write_file(
@@ -493,7 +506,10 @@ class SandboxManager:
                 self._log_routed("file_write", user_id,
                                  f"backend {backend.name}", f"{rel}, mode={mode}")
 
-        target.parent.mkdir(parents=True, exist_ok=True)
+        # 用 ensure_dir_shared 而不是裸 mkdir：这条路径下建出来的是
+        # `.subagents/<s>/<a>/<模型自拟的更深目录>`，沙箱服务要往里面写。
+        # 裸 mkdir 在 umask 0755 下得到 drwxr-xr-x（组不可写），实测报 507。
+        ensure_dir_shared(target.parent, boundary=user_workspace(user_id, create=False))
         text = content if isinstance(content, str) else str(content)
         existing = ""
         if mode != "overwrite" and target.exists():
@@ -560,7 +576,8 @@ class SandboxManager:
         if reason is not None:
             return False, self._handle_unavailable(reason)
 
-        from ..workspace import PathSecurityError, display_path, safe_workspace_path
+        from ..workspace import (PathSecurityError, display_path, ensure_dir_shared,
+                                safe_workspace_path, user_workspace)
         try:
             target = safe_workspace_path(user_id, path, root=root)
         except PathSecurityError as exc:
@@ -592,6 +609,11 @@ class SandboxManager:
         # `old` 一定唯一 —— 服务侧的 replace(…, 1) 与这里语义一致。
         backend = _selected_backend()
         if backend is not None and backend.name != "inproc":
+            # 同 write_file：父目录必须由 app（root）建好并修权限。
+            # patch 的目标文件已存在（上面 is_file() 过了），但它的**祖先**
+            # 可能仍是遗留的 755 root:root —— 服务侧要写 tmp 文件时同样被拒。
+            ensure_dir_shared(target.parent,
+                              boundary=user_workspace(user_id, create=False))
             rel = _workspace_rel(user_id, target, root)
             try:
                 handled, note = await backend.patch_file(
@@ -663,6 +685,9 @@ def _write_py(remote: str, content: str) -> str:
     """
     import base64
     payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    # ⚠️ 这里的 mkdir 在**容器内**执行（inproc/Docker 路径），不适用
+    # `ensure_dir_shared`：容器里是 root，没有「另一容器 uid 不同」的问题。
+    # service 后端的写入走 /v1/write，那边用的是服务侧的路径解析。
     return f'''
 import base64, pathlib
 target = pathlib.Path({remote!r})

@@ -92,6 +92,116 @@ def user_workspace(user_id: str, *, create: bool = False) -> Path:
     return root
 
 
+def ensure_dir_shared(path: Path, *, boundary: Path | None = None) -> None:
+    """从 `boundary`（默认该用户 workspace 根）**逐级向下**建好 `path`，
+    并让每一层都 `g+w` + setgid。
+
+    ## 为什么必须「先修父级、再建子级」
+
+    第一版是「先 `mkdir(parents=True)` 再向上 chmod」，在**遗留目录**上会失败：
+
+        实测（2026-11-20 真机）：
+        .subagents                 755 root:UNKNOWN   ← 旧代码建的，组不是 1000
+        .subagents/co_8d8bd184324a 755 root:root
+        .subagents/.../writer/trump   ← 要在这里写，但父级不可写
+
+    uid 1000 在 755 root:root 的目录里**连 mkdir 都不允许**，
+    所以 `mkdir(parents=True)` 直接抛 PermissionError —— 还没跑到 chmod 就死了。
+
+    正确顺序：从边界往下，**每层先 chmod 到可写，再建下一层**。
+    这样遗留目录会被顺手修好（不需要单独的数据修复脚本）。
+
+    ## boundary 的作用
+
+    不能无脑往上 chmod —— 一直往上会改到系统目录。边界是该用户的
+    workspace 根（那是我们自己的），再往上不属于本服务的职责。
+
+    Args:
+        path: 要确保存在的目录。
+        boundary: 停止上溯的位置；None 时用 `workspaces_root` 推不出来，
+                  只修正 `path` 本身及其下（不修祖先）—— 调用方应尽量传。
+    """
+    path = Path(path)
+    if boundary is None:
+        # 没有边界时退化成"只处理自己"，不碰祖先（保守）
+        _mkdir_and_fix(path, None)
+        return
+
+    boundary = Path(boundary)
+    try:
+        rel = path.resolve().relative_to(boundary.resolve())
+    except (ValueError, OSError):
+        # path 不在 boundary 内：交给调用方的路径校验处理，这里只建自己
+        _mkdir_and_fix(path, None)
+        return
+
+    # 共享组取**边界自己**的组（部署里是 sandbox-perms chgrp 过的那一层）。
+    # 不能取父目录：遗留目录的父级本身可能就不对，会一路传染。
+    gid = None
+    try:
+        gid = boundary.stat().st_gid
+    except OSError:
+        pass
+
+    # 从 boundary 往下逐级：每一层先确保权限，再建下一层
+    current = boundary
+    _mkdir_and_fix(current, gid)
+    for part in rel.parts:
+        current = current / part
+        _mkdir_and_fix(current, gid)
+
+
+def _stat_mode(p: Path) -> tuple[int, int]:
+    """返回 `(st_mode, st_gid)`；抽成一层便于测试注入（见 app 侧同名函数）。"""
+    st = p.stat()
+    return st.st_mode, st.st_gid
+
+
+def _mkdir_and_fix(p: Path, gid: int | None = None) -> None:
+    """建这一层（容错），把它 chgrp 到共享组并 chmod 成 `g+w` + setgid。
+
+    ## 为什么服务侧也要 chgrp（虽然它多半 chgrp 不了）
+
+    uid 1000 只能 chgrp 到自己所属的组、chmod 自己拥有的目录。对
+    `755 root:root` 的遗留目录，这两步都会 `Operation not permitted` ——
+    实测确认过。所以**真正的修复责任在 app（root）**，
+    见 `app/sandbox/manager.py::write_file` 里为什么要在分发前先建目录。
+
+    这里仍写一遍的理由：app 已修好的目录在这层是**幂等**的（一次 stat
+    判等就跳过），而万一 app 侧漏了、或将来有别的调用方直连，
+    服务侧至少能修自己能修的部分，而不是直接硬失败。
+
+    `mkdir` 失败时**不抛**：可能是并发已建（exist_ok）、也可能是别的进程
+    正在建。真正的失败会在后面写文件时暴露成明确的 507，比在这里吞掉
+    更难排查 —— 但那属于调用方的错误映射职责，这里只负责尽力而为。
+    """
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    chown = getattr(os, "chown", None)
+    if gid is not None and chown is not None:
+        try:
+            _, cur_gid = _stat_mode(p)
+            if cur_gid != gid:
+                chown(p, -1, gid)          # -1 = 不动属主
+        except OSError:
+            pass
+
+    try:
+        cur_mode, _ = _stat_mode(p)
+    except OSError:
+        return
+    current = cur_mode & 0o7777
+    want = current | 0o2000 | 0o020       # setgid + g+w，保留其余位
+    if current != want:
+        try:
+            p.chmod(want)
+        except OSError:
+            pass
+
+
 def resolve_in_workspace(user_id: str, rel_path: str) -> Path:
     """把相对路径解析到该用户 workspace 内，越界抛 `PathSecurityError`。
 

@@ -29,7 +29,13 @@ from pydantic import BaseModel, Field
 from .archive import VolBackend, pack_dir, unpack_dir
 from .executor import ExecResult, get_executor
 from .pool import SlotBusy, SlotPool
-from .workspace import PathSecurityError, make_resolver, resolve_in_workspace
+from .workspace import (
+    PathSecurityError,
+    ensure_dir_shared,
+    make_resolver,
+    resolve_in_workspace,
+    workspaces_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -559,7 +565,10 @@ async def write_file(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        # 用 ensure_dir_shared 而不是裸 mkdir：模型会写到
+        # .subagents/<s>/<a>/<自拟子目录>，那几层都是这里建的，
+        # 裸 mkdir 给 0755（组不可写），app 侧下次就写不进去。
+        ensure_dir_shared(target.parent, boundary=workspaces_root(user_id))
         existing = ""
         if mode != "overwrite" and target.exists():
             existing = target.read_text(encoding="utf-8", errors="replace")

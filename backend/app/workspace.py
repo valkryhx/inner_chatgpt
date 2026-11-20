@@ -12,6 +12,7 @@ Layout:
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -149,7 +150,8 @@ def user_workspace(user_id: str, *, create: bool = True) -> Path:
     """
     root = workspaces_root(user_id)
     if create:
-        ensure_dir_shared(root)
+        # boundary = WORKSPACES_DIR：从这一层往下修，不碰更上层（系统目录）
+        ensure_dir_shared(root, boundary=WORKSPACES_DIR)
     return root
 
 
@@ -170,35 +172,123 @@ def shared_skills_root() -> Path:
     return SHARED_SKILLS_DIR
 
 
-def ensure_dir_shared(path: Path) -> None:
-    """创建目录（含父级），并确保它 `g+w` + 对**目录**设 setgid。
+def ensure_dir_shared(path: Path, *, boundary: Path | None = None) -> None:
+    """从边界**逐级向下**建好 `path`，让每一层都 `g+w` + setgid。
 
-    ## 为什么所有建目录的地方都要用它
+    ## 为什么必须「先修父级、再建子级」
 
-    workspace 目录由 app（root）创建、但还要被沙箱服务（uid 1000 = hlz 组）
-    写入。普通 `mkdir` 在 umask 0755 下得到：
+    第一版是「先 `mkdir(parents=True)` 再向上 chmod」，在**遗留目录**上会失败：
 
-        drwxr-sr-x  root hlz     ← 组有 r-x，**没有 w**
+        .subagents                 755 root:UNKNOWN   ← 旧代码建的，组不是 1000
+        .subagents/co_8d8bd184324a 755 root:root
 
-    实测（2026-11-20）：顶层 `workspaces/` 靠 `sandbox-perms` 设了 2775
-    所以能写；但 `.subagents/<s>/<a>` 这类**子目录**是运行时新建的，
-    `sandbox-perms` 追不上，于是子代理的 file_write 报 507 / PermissionError。
+    沙箱服务（uid 1000）在 755 root:root 的目录里连 `mkdir` 都不允许，
+    所以 `mkdir(parents=True)` 直接抛 PermissionError —— 还没到 chmod 就死了。
 
-    ## 为什么只给目录设 setgid，不给文件
+    正确顺序：从边界往下，每层**先 chmod 到组可写，再建下一层**。
+    这样历史遗留目录会被顺手修好，不需要单独的数据修复脚本。
 
-    文件上的 setgid 位在某些系统上会改变执行语义（对目录才是「继承组」）。
-    文件靠**父目录的 setgid** 自动继承组，不需要自己带。
+    ## 为什么需要 boundary
+
+    不能无脑往上 chmod（会改到系统目录）。边界必须是"我们自己的"那一层 ——
+    通常是该用户的 workspace 根。不传时退化成只处理 `path` 本身（保守）。
+
+    Args:
+        path: 要确保存在的目录。
+        boundary: 逐级修权限的起点（含）。None = 只处理 `path`，不碰祖先。
     """
     path = Path(path)
-    path.mkdir(parents=True, exist_ok=True)
+    if boundary is None:
+        _mkdir_and_fix(path, None)
+        return
+
+    boundary = Path(boundary)
     try:
-        current = path.stat().st_mode & 0o7777
-        want = current | 0o2000 | 0o020      # setgid + g+w（保留原有其它位）
-        if current != want:
-            path.chmod(want)
+        rel = path.resolve().relative_to(boundary.resolve())
+    except (ValueError, OSError):
+        _mkdir_and_fix(path, None)
+        return
+
+    gid = _shared_gid(boundary)
+    current = boundary
+    _mkdir_and_fix(current, gid)
+    for part in rel.parts:
+        current = current / part
+        _mkdir_and_fix(current, gid)
+
+
+def _shared_gid(boundary: Path) -> int | None:
+    """这套目录该归属哪个组 —— 取**边界自己**的组。
+
+    部署里边界是 `workspaces/` 或用户 workspace 根，由 `sandbox-perms`
+    `chgrp 1000` 过；setgid 让后代自动继承同一个组。
+
+    ⚠️ **不能取父目录的组**：遗留目录的父级本身可能就是坏的
+    （`.subagents` 是 `root:1000`，但它下面的 `co_x` 是 `root:root`），
+    照抄父级只会把错误一路传染下去。锚点必须是「我们自己设定的那一层」。
+
+    拿不到就返回 None（非 POSIX / 无权限），调用方退化成只改 mode。
+    """
+    try:
+        return boundary.stat().st_gid
     except OSError:
-        # chmod 失败不该让建目录整个失败（只读挂载 / 非 POSIX 文件系统）
+        return None
+
+
+def _stat_mode(p: Path) -> tuple[int, int]:
+    """返回 `(st_mode, st_gid)`。
+
+    ## 为什么单独抽一层
+
+    「属组是不是该改」「权限位是不是该补」这两个判断都要 stat。抽成函数后
+    测试可以用 mock 注入任意 (mode, gid)，**在 Windows 上也能验证
+    「属组不同时必须调 chown」** —— 否则那条断言只能靠 POSIX 用例，
+    而 POSIX 用例在开发机（Windows）被 skip，反向确认会变成假绿。
+    """
+    st = p.stat()
+    return st.st_mode, st.st_gid
+
+
+def _mkdir_and_fix(p: Path, gid: int | None = None) -> None:
+    """建这一层（容错），把它 chgrp 到共享组并 chmod 成 `g+w` + setgid。
+
+    ## 为什么 chgrp 和 chmod 缺一不可
+
+    实测（2026-11-20 真机）：遗留目录是 `755 root:root`。只 `chmod 2775`
+    得到 `drwxrwsr-x root root` —— 属组还是 root，uid 1000 仍不在组里，
+    照样写不进去。**chmod 只能改权限位，改不了属组**，必须先 chown/chgrp。
+
+    ## 为什么这几步都容错不抛
+
+    可能并发已建、可能是只读挂载、也可能本机根本没有 POSIX 语义
+    （Windows 上 `os.chown` 不存在）。真正的写失败会在写入时以明确错误
+    暴露 —— 那是调用方（HTTP 层的 507）的错误映射职责，不在这里。
+    """
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError:
         pass
+
+    chown = getattr(os, "chown", None)
+    if gid is not None and chown is not None:
+        try:
+            _, cur_gid = _stat_mode(p)
+            if cur_gid != gid:
+                chown(p, -1, gid)          # -1 = 不动属主
+        except OSError:
+            pass
+
+    try:
+        cur_mode, _ = _stat_mode(p)
+    except OSError:
+        return
+    current = cur_mode & 0o7777
+    want = current | 0o2000 | 0o020       # setgid + g+w，保留其余位
+    if current != want:
+        try:
+            p.chmod(want)
+        except OSError:
+            pass
 
 
 def write_root_for(user_id: str, root: str = "") -> Path:
@@ -215,7 +305,7 @@ def write_root_for(user_id: str, root: str = "") -> Path:
     if not (root or "").strip():
         return base
     target = _resolve_under(base, base / root.strip())
-    ensure_dir_shared(target)
+    ensure_dir_shared(target, boundary=base)
     return target
 
 
