@@ -243,10 +243,17 @@ class ServiceBackend:
         new: str,
         *,
         root: str = "",
+        replace_all: bool = False,
     ) -> tuple[bool, str]:
-        """替换文件里的第一处 `old`。"""
+        """替换文件里的 `old`。
+
+        ⚠️ 这里的 `old` 必须是**文件里真实存在的原文**，不是模型发来的
+        `old_content` —— 宿主侧已经做过降级匹配（引号/转义），
+        服务侧只做 replace 不做匹配，用模型的原文会再次找不到。
+        """
         rel = _join_root(root, path)
-        payload = {"path": rel, "old": old, "new": new}
+        payload = {"path": rel, "old": old, "new": new,
+                   "replace_all": bool(replace_all)}
         return await self._post_file("/v1/patch", user_id, payload)
 
     async def _post_file(

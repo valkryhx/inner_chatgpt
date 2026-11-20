@@ -564,6 +564,7 @@ class SandboxManager:
         new_content: str,
         *,
         root: str = "",
+        replace_all: bool = False,
     ) -> tuple[bool, str]:
         """容器内做 old→new 替换。返回 ``(handled, text)``。
 
@@ -590,19 +591,37 @@ class SandboxManager:
             full = target.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             return True, f"错误：读取失败: {exc}"
-        occurrences = full.count(old_content)
-        if occurrences == 0:
-            return True, "错误：未找到匹配的旧文本块。请先用 file_read 确认当前内容，再分小段 patch。"
-        if occurrences > 1:
-            return True, (f"错误：找到 {occurrences} 处匹配，无法确定唯一位置。"
-                          "请提供更长、更具体的上下文。")
+        if old_content == new_content:
+            return True, ("错误：old_content 与 new_content 完全相同，"
+                          "没有任何改动，无需重试。")
 
-        updated = full.replace(old_content, new_content, 1)
+        # ★ 降级匹配（对齐 CC319 的 Edit，见 `app/edit_match.py`）。
+        #   必须在**宿主侧**做，且替换用的必须是 `actual`（文件里的原文），
+        #   不是模型发来的 old_content —— 模型可能抄错引号或转义。
+        from .. import edit_match
+        actual = edit_match.find_actual(old_content, full)
+        if actual is None:
+            return True, "错误：" + edit_match.describe_failure(old_content, full)
+
+        occurrences = full.count(actual)
+        if occurrences > 1 and not replace_all:
+            return True, (f"错误：找到 {occurrences} 处匹配，但 replace_all=false，"
+                          f"无法确定替换哪一处。要全部替换请传 replace_all=true；"
+                          f"只替换一处请提供更长、能唯一定位的 old_content"
+                          f"（当前匹配到的原文：{actual[:80]!r}）。")
+
+        if replace_all:
+            updated = full.replace(actual, new_content)
+        else:
+            updated = full.replace(actual, new_content, 1)
 
         # ★ backend 分发（与 write_file 同一处缺口，见那边的注释）。
         #
         # 唯一性判定已经在上面做完（occurrences 检查），所以这里发过去的
         # `old` 一定唯一 —— 服务侧的 replace(…, 1) 与这里语义一致。
+        # ★ 发给服务侧的必须是 `actual`（文件里的原文），不是模型发来的
+        # `old_content` —— 降级匹配可能已经改写了它（引号/转义不同）。
+        # 服务侧只做 replace 不做匹配，用 old_content 会再次找不到。
         backend = _selected_backend()
         if backend is not None and backend.name != "inproc":
             # 同 write_file：父目录必须由 app（root）建好并修权限。
@@ -613,7 +632,8 @@ class SandboxManager:
             rel = _workspace_rel(user_id, target, root)
             try:
                 handled, note = await backend.patch_file(
-                    user_id, rel, old_content, new_content, root="",
+                    user_id, rel, actual, new_content, root="",
+                    replace_all=replace_all,
                 )
                 if handled:
                     return True, note

@@ -108,11 +108,14 @@ class _FakeService:
             target.write_text(content, encoding="utf-8")
         return True, f"已写入 {path}（沙箱）"
 
-    async def patch_file(self, user_id, path, old, new, *, root=""):
+    async def patch_file(self, user_id, path, old, new, *, root="", replace_all=False):
         self.patches.append((user_id, path, old))
         target = self.root / user_id / path
         text = target.read_text(encoding="utf-8")
-        target.write_text(text.replace(old, new, 1), encoding="utf-8")
+        if replace_all:
+            target.write_text(text.replace(old, new), encoding="utf-8")
+        else:
+            target.write_text(text.replace(old, new, 1), encoding="utf-8")
         return True, f"已修改 {path}（沙箱）"
 
 

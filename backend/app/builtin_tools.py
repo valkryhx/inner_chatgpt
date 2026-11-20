@@ -22,6 +22,7 @@ from typing import Any
 from .run_guard import WORKSPACE_PYTHON_GUARD, protected_code_reason, workspace_env
 from .skill_store import load_skill_content
 from .file_search import file_glob as _file_glob, file_grep as _file_grep
+from . import edit_match
 from .tools import Tool
 from .workspace import (
     PathSecurityError,
@@ -282,7 +283,7 @@ def _write_impl(user_id: str, path: str, content: str, mode: str = "overwrite",
 
 # ---------------- file_patch ----------------
 def _patch_impl(user_id: str, path: str, old_content: str, new_content: str,
-                *, root: str = "") -> str:
+                *, root: str = "", replace_all: bool = False) -> str:
     try:
         target = safe_workspace_path(user_id, path, root=root)
     except PathSecurityError as e:
@@ -295,15 +296,41 @@ def _patch_impl(user_id: str, path: str, old_content: str, new_content: str,
         full = target.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return _err(f"读取失败: {e}")
-    occurrences = full.count(old_content)
-    if occurrences == 0:
-        return _err("未找到匹配的旧文本块。请先用 file_read 确认当前内容，再分小段 patch。")
-    if occurrences > 1:
-        return _err(f"找到 {occurrences} 处匹配，无法确定唯一位置。请提供更长、更具体的上下文。")
-    updated = full.replace(old_content, new_content, 1)
+    if old_content == new_content:
+        # 对齐 CC：`No changes to make: old_string and new_string are exactly the same.`
+        # 这是模型常见的无效调用（以为改了其实没改），直接告诉它不用重试。
+        return _err("old_content 与 new_content 完全相同，没有任何改动，无需重试。")
+
+    # ★ 降级匹配（对齐 CC319 的 Edit，见 app/edit_match.py）。
+    #   精确匹配失败时依次尝试：引号归一化 → \uXXXX 还原 → 转义形态匹配。
+    #   返回的是**文件里真实存在的文本**，所以替换用的是原文，
+    #   模型抄错的引号/转义不会被写进文件。
+    actual = edit_match.find_actual(old_content, full)
+    if actual is None:
+        return _err(edit_match.describe_failure(old_content, full))
+
+    occurrences = full.count(actual)
+    if occurrences > 1 and not replace_all:
+        return _err(
+            f"找到 {occurrences} 处匹配，但 replace_all=false，无法确定替换哪一处。"
+            f"要全部替换请传 replace_all=true；只替换一处请提供更长、"
+            f"能唯一定位的 old_content（当前匹配到的原文：{actual[:80]!r}）。")
+
+    if replace_all:
+        updated = full.replace(actual, new_content)
+        rewritten = True
+    else:
+        updated = full.replace(actual, new_content, 1)
+        rewritten = actual != old_content
+
     with open(target, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(updated)
-    return f"已局部修改 {display_path(user_id, target)}（替换 1 处）"
+    note = ""
+    if rewritten and not replace_all:
+        # 降级匹配生效时明确告知，便于模型理解「为什么我抄的不一样也成功了」
+        note = "（old_content 与原文不完全一致，已按文件中的实际文本匹配替换）"
+    count = occurrences if replace_all else 1
+    return f"已局部修改 {display_path(user_id, target)}（替换 {count} 处）{note}"
 
 
 # ---------------- list_files ----------------
@@ -524,19 +551,20 @@ def build_builtin_tools(
     async def file_patch(args: dict) -> str:
         old_c = str(args.get("old_content", ""))
         new_c = str(args.get("new_content", ""))
+        replace_all = bool(args.get("replace_all", False))
         try:
             from .sandbox import policy as sbx_policy
             if sbx_policy.should_use_sandbox("file_patch", user_id):
                 from .sandbox.manager import get_manager
                 handled, note = await get_manager().patch_file(
                     user_id, str(args.get("path", "")), old_c, new_c,
-                    root=root,
+                    root=root, replace_all=replace_all,
                 )
                 if handled:
                     return note
                 return note + "\n" + _patch_impl(
                     user_id, str(args.get("path", "")), old_c, new_c,
-                    root=root,
+                    root=root, replace_all=replace_all,
                 )
         except Exception as exc:  # noqa: BLE001
             # strict 下不回落进程内（否则等于没有沙箱）。返回失败结果，不向上抛
@@ -551,6 +579,7 @@ def build_builtin_tools(
             old_c,
             new_c,
             root=root,
+            replace_all=replace_all,
         )
 
     async def list_files(args: dict) -> str:
@@ -723,15 +752,23 @@ def _build_tool_list(file_read, file_write, file_patch, list_files, code_run, lo
         ),
         Tool(
             "file_patch",
-            "在文件中把唯一的 old_content 替换为 new_content（必须唯一匹配；0 或多处都报错）。"
-            "\n\n**不需要**先 file_read（读前置已取消）。给出**足够长的、在本文件内唯一**的 "
-            "old_content 即可；太短会命中多处而被拒绝。",
+            "在文件中把 old_content 替换为 new_content。**只发差异，不要发整个文件**"
+            "——改大文件时这是唯一可行的方式。"
+            "\n\n**不需要**先 file_read（读前置已取消）。"
+            "\n\n匹配是**宽容**的：除了精确匹配，还会自动兼容智能引号（“” / ‘’）"
+            "与 ASCII 引号的差异、以及 \\uXXXX 转义与实际中文的差异。"
+            "所以抄得不够准通常也能成功；若仍失败，说明差异在别处，请重读文件后逐字复制。"
+            "\n\n默认只替换**唯一**的一处：0 处或多处都会失败。"
+            "确有需要全部替换时传 `replace_all=true`。"
+            "\n\n参数：`old_content` 保持最小（够唯一即可，通常 1–3 行）——"
+            "包含过多上下文浪费 token。",
             {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "文件路径，相对 workspace 根，如 `a.py` 或 `out/data.csv`"},
-                    "old_content": {"type": "string", "description": "要被替换的原文（必须全文唯一）"},
-                    "new_content": {"type": "string", "description": "替换后的新内容"},
+                    "old_content": {"type": "string", "description": "要被替换的原文（需要在文件内唯一；1–3 行通常够）"},
+                    "new_content": {"type": "string", "description": "替换后的新内容（必须与 old_content 不同）"},
+                    "replace_all": {"type": "boolean", "description": "是否替换全部匹配，默认 false（只替换唯一一处）"},
                 },
                 "required": ["path", "old_content", "new_content"],
             },

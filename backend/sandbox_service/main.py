@@ -399,6 +399,9 @@ class PatchBody(BaseModel):
     old: str
     new: str
     user_id: str | None = None
+    # 默认 false 保持旧语义（只替换第一处）；true 时全部替换。
+    # 由宿主侧的 file_patch 透传，宿主已做完降级匹配与唯一性判定。
+    replace_all: bool = False
 
 
 # ---------------------------------------------------------------- 路由
@@ -630,7 +633,10 @@ async def patch_file(
             detail="要替换的内容不存在（file_patch 只替换第一处，找不到即失败）",
         )
 
-    updated = text.replace(body.old, body.new, 1)
+    if body.replace_all:
+        updated = text.replace(body.old, body.new)
+    else:
+        updated = text.replace(body.old, body.new, 1)
     try:
         tmp = target.with_name(target.name + ".hlz-tmp")
         tmp.write_text(updated, encoding="utf-8")
